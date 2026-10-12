@@ -284,7 +284,7 @@ describe('ledgerAppend', () => {
     )
 
     expect(answer.isError).toBeUndefined()
-    expect(answer.result).toBe('已记录 #L1。')
+    expect(answer.result).toBe('已记录 #L1。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
     await session.flush()
     const entries = readLedger(box)
     expect(entries).toHaveLength(1)
@@ -349,12 +349,12 @@ describe('ledgerAppend', () => {
     const done = { task_id: 'login-btn', title: '登录页按钮改蓝', status: 'done' as const, text: '改完了', evidence: [2] }
 
     const early = await session.ledgerAppend(done, env(10_000))
-    expect(early.result).toBe('已记录 #L1。')
+    expect(early.result).toBe('已记录 #L1。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
     expect(early.result).not.toContain('建议调用 context 工具')
 
     // The suggestion waits for 75% of the limit: a finished task alone is no reason to switch.
     const middle = await session.ledgerAppend({ ...done, task_id: 'login-btn-2' }, env(74_000))
-    expect(middle.result).toBe('已记录 #L2。')
+    expect(middle.result).toBe('已记录 #L2。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
 
     const late = await session.ledgerAppend({ ...done, task_id: 'login-btn-3' }, env(75_000))
     expect(late.result).toContain('当前没有进行中的任务，上下文已用 75k。')
@@ -723,6 +723,19 @@ describe('looksLikePerson', () => {
     expect(looksLikePerson('ctx-mod：已换到新的上下文窗口。')).toBe(false)
   })
 
+  test('a project thread’s wake is the person’s only when a human wrote the message behind it', () => {
+    const wake = (from: string, lead = ''): string =>
+      `${lead}<wake reason="mention" current-time="2026-10-12T03:41:31Z">\n  <project id="chan_1" type="project">\n    <thread ts="cmsg_1">\n      <message trigger="true" from="${from}" trust="principal" id="cmsg_2" mention="true">删a吧</message>\n    </thread>\n  </project>\n</wake>`
+    expect(looksLikePerson(wake('human'), true)).toBe(true)
+    // An attached file's mention comes first when the message carried one.
+    expect(looksLikePerson(wake('human', '@"C:\\uploads\\handoff.md" '), true)).toBe(true)
+    expect(looksLikePerson(wake('agent'), true)).toBe(false)
+    expect(looksLikePerson(wake('agent', '@"C:\\uploads\\handoff.md" '), true)).toBe(false)
+    // An earlier message in the thread is context; the one that triggered the wake decides.
+    const quoted = wake('agent').replace('<thread ts="cmsg_1">', '<thread ts="cmsg_1">\n      <message from="human" id="cmsg_0">先看看</message>')
+    expect(looksLikePerson(quoted, true)).toBe(false)
+  })
+
   test('without a confirmed source any opening `<` is doubted, as before', () => {
     expect(looksLikePerson('<task>修一下登录页</task>')).toBe(false)
     expect(looksLikePerson('<task>修一下登录页</task>', false)).toBe(false)
@@ -796,6 +809,85 @@ describe('the tool input summary', () => {
     expect((await session.historyTool({ action: 'search', query: 'old body' })).result).toContain('#1 w1 tool [Read] [a.ts]')
     const handoff = await session.buildHandoff({ isMidTurn: false })
     expect(handoff).toContain('- #1 Read a.ts：old body')
+  })
+})
+
+describe('a session a coordinator started', () => {
+  const RELAY = '<relay from="coordinator" reason="spawn">先盘点可清理的东西，列清单等确认</relay>'
+  const entry = {
+    task_id: 'cleanup',
+    title: '清理项目',
+    status: 'in_progress' as const,
+    text: '盘点了一半',
+    next_step: '列出清单',
+  }
+
+  test('books before any person has spoken, pointing at the hand-off', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    // As the engine files it on the person's own machine: an origin it cannot name.
+    await session.record({ uuid: 'r1', role: 'user', origin: 'unclassified', text: RELAY })
+    await session.record({ uuid: 't1', role: 'tool', tool: 'Glob', text: 'files' })
+
+    expect(session.latestPersonSeq()).toBeNull()
+    expect(session.latestRelaySeq()).toBe(1)
+    const answer = await session.ledgerAppend(entry, env(10_000))
+    expect(answer.isError).toBeUndefined()
+    // The receipt says which row the entry was bound to, and that it was a default.
+    expect(answer.result).toBe('已记录 #L1。对应请求 #1（转交，省略 request_ref 时取最近一条）。')
+    // The hand-off may be named outright too; a tool result still may not.
+    expect((await session.ledgerAppend({ ...entry, text: '继续盘点', request_ref: 1 }, env(10_000))).result).toBe('已记录 #L2。对应请求 #1（转交）。')
+    expect((await session.ledgerAppend({ ...entry, request_ref: 2 }, env(10_000))).result).toContain('不是真人请求')
+    await session.flush()
+    expect(readLedger(box).map(one => one.request_ref)).toEqual([1, 1])
+  })
+
+  test('books with nothing to point at, and a person’s later request takes over the default', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    // No origin the engine can name and no hand-off's opening: neither a person's nor a task's source.
+    await session.record({ uuid: 'r1', role: 'user', origin: 'unclassified', text: '来路不明的一行' })
+
+    expect((await session.ledgerAppend(entry, env(10_000))).result).toBe('已记录 #L1。没有可对应的请求（request_ref 记为 0）。')
+    await session.record({ uuid: 'r2', role: 'user', origin: 'coordinator', text: RELAY })
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, origin: 'composer', text: '删 a 吧' })
+    expect((await session.ledgerAppend({ ...entry, text: '删了 a' }, env(10_000))).result).toContain('对应请求 #3（用户消息')
+    // New work handed over after the person spoke is the latest request in its turn.
+    await session.record({ uuid: 'r3', role: 'user', origin: 'coordinator', text: RELAY })
+    expect((await session.ledgerAppend({ ...entry, text: '接了新活' }, env(10_000))).result).toContain('对应请求 #4（转交')
+    await session.flush()
+    expect(readLedger(box).map(one => one.request_ref)).toEqual([0, 3, 4])
+  })
+
+  test('the handoff carries the hand-off while its task is open or nobody has spoken', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'r1', role: 'user', origin: 'coordinator', text: RELAY })
+
+    const bare = await session.buildHandoff({ isMidTurn: false })
+    expect(bare).toContain('## 最近的用户请求\n无')
+    expect(bare).toContain('## 派发来的任务')
+    expect(bare).toContain('先盘点可清理的东西')
+
+    await session.ledgerAppend(entry, env(10_000))
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '删 a 吧' })
+    const open = await session.buildHandoff({ isMidTurn: false })
+    expect(open).toContain('删 a 吧')
+    expect(open).toContain('先盘点可清理的东西')
+
+    await session.record({ uuid: 't1', role: 'tool', tool: 'Bash', text: 'removed' })
+    await session.ledgerAppend({ ...entry, status: 'done', text: '清完了', evidence: [3], next_step: '' }, env(10_000))
+    const closed = await session.buildHandoff({ isMidTurn: false })
+    expect(closed).not.toContain('派发来的任务')
+  })
+
+  test('a person’s session never shows a hand-off section', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    await session.record({ uuid: 'n1', role: 'user', origin: 'task-notification', text: '<task-notification>done</task-notification>' })
+
+    expect(session.latestRelaySeq()).toBeNull()
+    expect(await session.buildHandoff({ isMidTurn: false })).not.toContain('派发来的任务')
   })
 })
 

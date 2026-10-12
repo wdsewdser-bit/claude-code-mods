@@ -107,6 +107,45 @@ export const parseJsonl = <T>(text: string): T[] => {
 
 export type Role = 'user' | 'assistant' | 'tool'
 
+/**
+ * Origins that hand a session work nobody typed into it: a coordinating
+ * session's hand-off or delivery, a scheduled prompt, a channel's message.
+ */
+const RELAY_ORIGINS: ReadonlySet<string> = new Set([
+  'coordinator',
+  'projects-relay',
+  'scheduled-trigger',
+  'channel',
+  'slack-ping',
+])
+
+/**
+ * How a coordinating session's hand-off opens, past any reminder the engine put
+ * before it. The attributes after `from` vary (`session`, `reason`, a time).
+ */
+const COORDINATOR_RELAY = /^(?:\s*<system-reminder>[\s\S]*?<\/system-reminder>)*\s*<relay\b[^>]*\bfrom="coordinator"/
+
+/**
+ * Whether a row is such a hand-off: where a task came from, though never a
+ * person's own request.
+ *
+ * The origin tells it when the engine names one. A coordinator's hand-off to a
+ * thread on the person's own machine arrives with none it can name
+ * (`unclassified`, seen on 2.1.296), and an imported row has no origin at all,
+ * so there the opening tag decides — but only on a prompt row no other origin
+ * vouches for, so a notification or a plugin quoting the tag is not taken for one.
+ */
+export const isRelay = (row: HistoryRecord): boolean => {
+  if (row.role !== 'user' || row.isPerson === true) return false
+  if (row.origin !== undefined && RELAY_ORIGINS.has(row.origin)) return true
+
+  return (
+    row.door === undefined &&
+    (row.origin === undefined || row.origin === 'unclassified') &&
+    COORDINATOR_RELAY.test(row.text)
+  )
+}
+
 /** One row of the conversation as ctx-mod keeps it on disk. */
 export type HistoryRecord = {
   /** Counts up from 1 across the whole session, never reused. */
@@ -120,6 +159,11 @@ export type HistoryRecord = {
   role: Role
   /** True on a prompt a person typed (never a plugin's or a notification). */
   isPerson?: true
+  /**
+   * The engine's origin kind of a prompt row (`composer`, `coordinator`,
+   * `task-notification`, ...). Rows written before this field have none.
+   */
+  origin?: string
   /** The tool's name, on a tool call's result. */
   tool?: string
   /** The file a Read, Edit, Write or search was about. */

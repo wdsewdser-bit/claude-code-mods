@@ -16,7 +16,7 @@ import type {
   Role,
   TaskStatus,
 } from './types.ts'
-import { estimateTokens, parseJsonl, toJsonl } from './types.ts'
+import { estimateTokens, isRelay, parseJsonl, toJsonl } from './types.ts'
 import {
   appendRecord,
   byteLength,
@@ -76,6 +76,8 @@ export type RecordInput = {
   uuid: string
   role: Role
   isPerson?: true
+  /** The engine's origin kind of a prompt row, when the caller has it. */
+  origin?: string
   tool?: string
   path?: string
   /** A one-line summary of the tool call's input, when the caller has one. */
@@ -156,6 +158,20 @@ const ENVELOPE_OPENINGS = [
   '<system-reminder>',
 ] as const
 
+/** A project thread's wake, up to the tag of the message that triggered it: that tag says who wrote it. */
+const WAKE_TRIGGER = /<wake\b[^>]*>[\s\S]*?(<message\b[^>]*\btrigger="true"[^>]*>)/
+
+/**
+ * Whether a text is a wake some agent's message triggered, not a person's. A
+ * wake arrives from the same origin whoever wrote the message, so only the
+ * `from` on the triggering message tells the two apart.
+ */
+const isAgentWake = (text: string): boolean => {
+  const trigger = WAKE_TRIGGER.exec(text)?.[1]
+
+  return trigger !== undefined && !/\bfrom="human"/.test(trigger)
+}
+
 /**
  * Whether a user row came from a person. The engine files its own notices —
  * system reminders, command envelopes, task notifications, the continuation
@@ -168,6 +184,7 @@ export const looksLikePerson = (text: string, isConfirmed = false): boolean => {
 
   return !(
     (isConfirmed ? ENVELOPE_OPENINGS.some(opening => head.startsWith(opening)) : head.startsWith('<')) ||
+    isAgentWake(head) ||
     head.startsWith('This session is being continued from a previous conversation') ||
     head.startsWith('Caveat:') ||
     head.startsWith('ctx-mod：') ||
@@ -362,6 +379,8 @@ export type Session = {
   release: (id: number) => Promise<void>
   /** The latest person prompt's seq; `await ready()` first. */
   latestPersonSeq: () => number | null
+  /** The latest hand-off's seq (a coordinator's or a schedule's, never a person's); `await ready()` first. */
+  latestRelaySeq: () => number | null
   /** Whether the ledger gained an entry after the latest person prompt of this window; `await ready()` first. */
   isLedgerFresh: () => boolean
   /** Whether a compaction may skip the engine's summary: a fresh ledger with a short unrecorded tail; `await ready()` first. */
@@ -659,6 +678,19 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return best
   }
 
+  /** The latest hand-off among the loaded rows: a task's source in a session no person started. */
+  const latestRelayRow = (): HistoryRecord | null => {
+    let best: HistoryRecord | null = null
+    for (const shard of shards.values()) {
+      for (const row of shard.rows) {
+        if (!isRelay(row)) continue
+        if (best === null || row.seq > best.seq) best = row
+      }
+    }
+
+    return best
+  }
+
   const latestAssistantRow = (): HistoryRecord | null => {
     let best: HistoryRecord | null = null
     for (const shard of shards.values()) {
@@ -867,6 +899,25 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     }
   }
 
+  /**
+   * The hand-off the open work came from, for the home page: the one an open
+   * task points at, else, in a session no person has spoken in, the latest one.
+   */
+  const relayForHome = async (): Promise<HistoryRecord | undefined> => {
+    const refs = tasksOf(state.page)
+      .filter(task => task.status === 'in_progress' || task.status === 'blocked')
+      .flatMap(task => task.entries.map(entry => entry.request_ref))
+    await ensureHistory(refs)
+    let best: HistoryRecord | undefined
+    for (const seq of refs) {
+      const row = bySeq(seq)
+      if (row !== undefined && isRelay(row) && (best === undefined || row.seq > best.seq)) best = row
+    }
+    if (best === undefined && latestPersonRow() === null) best = latestRelayRow() ?? undefined
+
+    return best === undefined ? undefined : displayRequests([best])[0]
+  }
+
   /** The last thing the model said, cut to its tail when it is too long to carry. */
   const lastReplyOf = (): string | null => {
     const row = latestAssistantRow()
@@ -891,6 +942,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       text: row.text,
     }
     if (row.isPerson === true) full.isPerson = true
+    if (row.origin !== undefined) full.origin = row.origin
     if (row.tool !== undefined) full.tool = row.tool
     if (row.path !== undefined) full.path = row.path
     if (row.input !== undefined) full.input = row.input
@@ -1218,10 +1270,12 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
 
     const latest = latestPersonRow()
     const latestPersonSeq = latest === null ? null : latest.seq
+    const latestRelaySeq = latestRelayRow()?.seq ?? null
     const problems = validate(candidate, {
       entries: state.page,
       history: seq => bySeq(seq),
       latestPersonSeq,
+      latestRelaySeq,
       checkAnchor,
       config,
     })
@@ -1231,14 +1285,29 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
 
     // An omitted next_step or anchors is stored as omitted: tasksOf reads it as "unchanged" and says which entry it came from.
     const seq = state.ledgerSeq + 1
-    const entry = stamp(candidate, { seq, ts: io.now(), window: state.window, latestPersonSeq, through: state.seq })
+    const entry = stamp(candidate, {
+      seq,
+      ts: io.now(),
+      window: state.window,
+      latestPersonSeq,
+      latestRelaySeq,
+      through: state.seq,
+    })
     state.ledgerSeq = seq
     state.page.push(entry)
     const ledgerWrite = queue.push(pathIn('ledger.jsonl'), toJsonl(state.page))
     saveMeta()
     const isWritten = await ledgerWrite
 
+    // The row it was bound to is said back, so a default that picked the wrong request is seen at once.
+    const bound = entry.request_ref > 0 ? bySeq(entry.request_ref) : undefined
+    const boundKind = bound === undefined ? '' : bound.isPerson === true ? '用户消息' : '转交'
+    const isDefault = candidate.request_ref === undefined
     let result = `已记录 #L${seq}。`
+    result +=
+      bound === undefined
+        ? '没有可对应的请求（request_ref 记为 0）。'
+        : `对应请求 #${bound.seq}（${boundKind}${isDefault ? '，省略 request_ref 时取最近一条' : ''}）。`
     // Not an error: the entry is in memory, and an error would make the model record it twice.
     if (!isWritten) {
       result += '\n注意：账本这次没能写进磁盘（内存里有，本会话内仍然有效）；下次记账会重写整个文件。'
@@ -1301,6 +1370,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     if (view === 'home') {
       await ensureRequests()
       await ensureAnswered()
+      const relay = await relayForHome()
       const rows = allRows()
       const requests = personRequests(rows, config.recentRequests)
 
@@ -1310,6 +1380,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
             window: state.window,
             entries: state.page,
             requests: displayRequests(requests),
+            ...(relay === undefined ? {} : { relay }),
             answered: repliesAnswered(rows, requests),
             archive: state.archive,
           },
@@ -1657,12 +1728,16 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     await ensureRequests()
     await ensureReplies()
     await ensureAnswered()
+    const relay = await relayForHome()
     const rows = allRows()
     const requests = displayRequests(personRequests(rows, config.recentRequests))
     const answered = repliesAnswered(rows, requests)
     const window = state.window + 1
     const agents = renderAgents(agentsForHandoff(opts.agents ?? [], state.roster))
-    const home = renderHome({ window, entries: state.page, requests, answered, archive: state.archive }, config)
+    const home = renderHome(
+      { window, entries: state.page, requests, ...(relay === undefined ? {} : { relay }), answered, archive: state.archive },
+      config,
+    )
     // A running task is already spelled out in the home page: repeating the last
     // reply beside it would only spend the handoff's budget twice on the same turn.
     const running = tasksOf(state.page).some(task => task.status === 'in_progress')
@@ -1836,6 +1911,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return latest === null ? null : latest.seq
   }
 
+  const latestRelaySeq = (): number | null => latestRelayRow()?.seq ?? null
+
   return {
     record,
     activity,
@@ -1865,6 +1942,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     heldItems,
     release,
     latestPersonSeq,
+    latestRelaySeq,
     isLedgerFresh,
     canSkipSummary,
     lastRequestAt: () => state.lastRequestAt,

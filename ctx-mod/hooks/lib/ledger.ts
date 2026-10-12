@@ -10,7 +10,7 @@ import type {
   LedgerInput,
   TaskStatus,
 } from './types.ts'
-import { estimateTokens, toJsonl } from './types.ts'
+import { estimateTokens, isRelay, toJsonl } from './types.ts'
 
 /** Why an anchor cannot be used: absent, not found, or not unique. */
 export type AnchorCheck = 'ok' | 'missing-file' | 'no-match' | 'ambiguous'
@@ -19,6 +19,8 @@ export type ValidateContext = {
   entries: readonly LedgerEntry[]
   history: (seq: number) => HistoryRecord | undefined
   latestPersonSeq: number | null
+  /** The latest hand-off row (see `isRelay`): what an entry answers when no person has asked for anything. */
+  latestRelaySeq?: number | null
   checkAnchor: (anchor: Anchor) => AnchorCheck
   config: Config
 }
@@ -139,14 +141,14 @@ export const validate = (input: LedgerInput, context: ValidateContext): string[]
     const record = context.history(refSeq)
     if (record === undefined) {
       problems.push(`request_ref #${refSeq} 在历史里不存在，请用 history 查一个真实的历史编号。`)
-    } else if (record.isPerson !== true) {
+    } else if (record.isPerson !== true && !isRelay(record)) {
       problems.push(
-        `request_ref #${refSeq} 的 role 是 ${record.role}，不是真人请求，请指向用户亲口提的那条消息。`,
+        `request_ref #${refSeq} 的 role 是 ${record.role}，不是真人请求，也不是派发任务的转交，请指向用户亲口提的那条消息或派发这个任务的那条转交；都没有就省略 request_ref。`,
       )
     }
-  } else if (context.latestPersonSeq === null) {
-    problems.push('省略了 request_ref，但本会话到目前还没有真人请求，请显式给出 request_ref。')
   }
+  // An omitted request_ref is never refused: a session a coordinator started has no person's
+  // request for a while, and that stretch must still be booked (see `defaultRequestSeq` for what it gets).
 
   const evidenceGiven = raw.evidence !== undefined
   const evidence = Array.isArray(raw.evidence) ? raw.evidence : []
@@ -166,7 +168,7 @@ export const validate = (input: LedgerInput, context: ValidateContext): string[]
     if (seqs.length === 0) {
       problems.push('status 是 done，必须给出 evidence：至少一个能证明做完的历史编号。')
     }
-    const startTs = taskStartTs(taskId, refSeq, context)
+    const start = taskStart(taskId, refSeq, context)
     for (const seq of seqs) {
       const record = context.history(seq)
       if (record === undefined) {
@@ -175,8 +177,10 @@ export const validate = (input: LedgerInput, context: ValidateContext): string[]
         problems.push(`evidence #${seq} 的 role 是 ${record.role}，不是 tool，完成的证据要是工具结果。`)
       } else if (record.isError === true) {
         problems.push(`evidence #${seq} 是一次报错的工具结果，不能当作完成的证据，请换成成功的工具结果。`)
-      } else if (startTs !== null && record.ts < startTs) {
-        problems.push(`evidence #${seq} 的时间早于这个任务的起点，请换成任务开始之后的工具结果。`)
+      } else if (start !== null && record.ts < start.ts) {
+        problems.push(
+          `evidence #${seq} 的时间早于这个任务的起点（${start.from}），请换成任务开始之后的工具结果。`,
+        )
       }
     }
   }
@@ -246,20 +250,53 @@ export const validate = (input: LedgerInput, context: ValidateContext): string[]
   return problems
 }
 
-/** The earliest moment a task could have started: its own first entry, else its request. */
-const taskStartTs = (
+/**
+ * The request an entry answers when it names none: whichever came last, the
+ * person's latest prompt or the latest hand-off. Neither outranks the other —
+ * a person may speak after a hand-off, and a coordinator may hand over new work
+ * after the person spoke.
+ */
+export const defaultRequestSeq = (
+  personSeq: number | null | undefined,
+  relaySeq: number | null | undefined,
+): number | null => {
+  const person = personSeq ?? null
+  const relay = relaySeq ?? null
+  if (person === null) return relay
+  if (relay === null) return person
+
+  return Math.max(person, relay)
+}
+
+/**
+ * The earliest moment a task could have started: its own first entry, else its
+ * request. `from` names that starting point for the model, so a refusal says
+ * which row the evidence was measured against.
+ */
+const taskStart = (
   taskId: unknown,
   refSeq: number | undefined,
   context: ValidateContext,
-): number | null => {
+): { ts: number; from: string } | null => {
   const first = context.entries.find(entry => entry.task_id === taskId)
-  if (first !== undefined) return asInt(first.ts) ?? null
+  if (first !== undefined) {
+    const ts = asInt(first.ts)
 
-  const seq = refSeq ?? context.latestPersonSeq
-  if (seq === null || seq === undefined) return null
+    return ts === undefined ? null : { ts, from: `这个任务的第一条记录 #L${first.seq}` }
+  }
+
+  const seq = refSeq ?? defaultRequestSeq(context.latestPersonSeq, context.latestRelaySeq)
+  if (seq === null) return null
   const record = context.history(seq)
+  if (record === undefined) return null
 
-  return record === undefined ? null : record.ts
+  return {
+    ts: record.ts,
+    from:
+      refSeq === undefined
+        ? `省略 request_ref 时默认对应的请求 #${seq}；任务其实来自更早的请求，就用 request_ref 指明`
+        : `request_ref 指向的 #${seq}`,
+  }
 }
 
 /** Keeps exactly the three string fields an anchor is, nothing else. */
@@ -297,13 +334,21 @@ const intsOf = (value: unknown): number[] | undefined => {
 
 /**
  * Turns a checked input into the row that is stored: seq, time and window come
- * from the caller, and an omitted request_ref falls back to the latest person
- * prompt so every entry points at a real request. Whatever the model sent, only
+ * from the caller, and an omitted request_ref falls back to the latest request
+ * (see `defaultRequestSeq`), else to 0: nothing asked for it that the history
+ * can name. Whatever the model sent, only
  * values of the right type are written — a bad field is dropped, not copied on.
  */
 export const stamp = (
   input: LedgerInput,
-  meta: { seq: number; ts: number; window: number; latestPersonSeq: number | null; through?: number },
+  meta: {
+    seq: number
+    ts: number
+    window: number
+    latestPersonSeq: number | null
+    latestRelaySeq?: number | null
+    through?: number
+  },
 ): LedgerEntry => {
   const raw: Record<string, unknown> = isRecord(input) ? input : {}
   const entry: LedgerEntry = {
@@ -314,7 +359,7 @@ export const stamp = (
     seq: meta.seq,
     ts: meta.ts,
     window: meta.window,
-    request_ref: asInt(raw.request_ref) ?? meta.latestPersonSeq ?? 0,
+    request_ref: asInt(raw.request_ref) ?? defaultRequestSeq(meta.latestPersonSeq, meta.latestRelaySeq) ?? 0,
   }
   if (typeof raw.next_step === 'string') entry.next_step = raw.next_step
   const anchors = anchorsOf(raw.anchors)
@@ -501,6 +546,8 @@ export const renderHome = (
     window: number
     entries: readonly LedgerEntry[]
     requests: readonly HistoryRecord[]
+    /** The hand-off the open work came from, when it was not a person's request (see `isRelay`). */
+    relay?: HistoryRecord
     /** The model's reply each request came after, by the request's seq. */
     answered?: ReadonlyMap<number, HistoryRecord>
     archive: readonly ArchivePage[]
@@ -534,6 +581,12 @@ export const renderHome = (
     head.push(`- [#${record.seq}] ${new Date(record.ts).toISOString()} ${midTurn}${clipRequest(record.text, record.seq)}`)
     const reply = record.text.length <= SHORT_REQUEST_CHARS ? input.answered?.get(record.seq) : undefined
     if (reply !== undefined) head.push(`  - 回复的是助手 [#${reply.seq}]：${clipAnswered(reply.text)}`)
+  }
+  if (input.relay !== undefined) {
+    const relay = input.relay
+    // Kept apart from the requests: it says what the work is, but no person said it.
+    head.push('', '## 派发来的任务（协调者等转交的，不是用户亲口说的）')
+    head.push(`- [#${relay.seq}] ${new Date(relay.ts).toISOString()} ${clipRequest(relay.text, relay.seq)}`)
   }
   head.push('', '## 进行中 / 受阻的任务')
   if (active.length === 0) {

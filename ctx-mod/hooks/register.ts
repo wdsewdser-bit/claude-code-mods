@@ -450,7 +450,8 @@ const AGENT_ONLY = { result: '这个工具只能由主会话调用。', isError:
  * the person types.
  */
 const manualSwitch = ($: EngineInterface, session: Session): CommandRunResult => {
-  if (session.latestPersonSeq() === null) {
+  // A session a coordinator started has work to hand over before any person has spoken in it.
+  if (session.latestPersonSeq() === null && session.latestRelaySeq() === null) {
     return { text: 'ctx-mod：还没有可交接的内容，不换窗口。' }
   }
   $.clock.after(300, () => {
@@ -543,7 +544,8 @@ const TOOLS = [
         superseded_by: { type: 'string', description: '取代它的任务 id（status 为 superseded 时填写）。' },
         request_ref: {
           type: 'number',
-          description: '这条记录回应的真人请求的历史编号；省略时用最近一条。',
+          description:
+            '这条记录回应的请求的历史编号：用户亲口提的那条消息，或派发这个任务的那条转交（协调者、定时任务）。省略时用这两类里最近的一条，回执会写明对应到了哪一条。',
         },
       },
       required: ['task_id', 'title', 'status', 'text'],
@@ -787,6 +789,8 @@ export const register: Register = (on, options) => {
           uuid: e.uuid,
           role: 'user',
           ...(isPerson ? { isPerson: true as const } : {}),
+          // Kept as the engine stamped it: a coordinator's hand-off is told by this, not by its words.
+          origin: e.origin.kind,
           // The handoff a switch answers with comes back through this door, not `compaction`;
           // naming it lets a search by that door find what each window opened with.
           ...(isHandoffText(said) ? { door: 'compaction' } : {}),

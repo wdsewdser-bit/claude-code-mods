@@ -477,8 +477,17 @@ test('armed, a prompt row that was never submitted is not a person request', asy
     $,
     ledger({ tool_use_id: 'ledger-stray', task_id: 't1', title: '解析器', status: 'in_progress', text: '开始改', next_step: '接着做' }),
   )
-  expect(booked.isError).toBe(true)
-  expect(textOf(booked)).toContain('校验')
+  // Booked all the same, pointing at no request; naming the stray row as one is what is refused.
+  expect(booked.isError).not.toBe(true)
+  await w.clock.settle()
+  expect(requestRefs(w)).toEqual([0])
+  expect(fileAt(w, 'history-w001.jsonl') ?? '').not.toContain('isPerson')
+  const named = await callTool(
+    $,
+    ledger({ tool_use_id: 'ledger-stray-2', task_id: 't1', title: '解析器', status: 'in_progress', text: '继续', next_step: '接着做', request_ref: 1 }),
+  )
+  expect(named.isError).toBe(true)
+  expect(textOf(named)).toContain('不是真人请求')
 })
 
 test('armed, history filters by tool_name and never by the envelope tool', async ($, on) => {
@@ -704,7 +713,7 @@ test('armed, a subagent request is passed through and never measured as the main
 })
 
 test('armed, a prompt that is only the engine’s reminder is nobody’s request', async ($, on) => {
-  world(on, 's-injected', { CTX_MOD: '1' })
+  const w = world(on, 's-injected', { CTX_MOD: '1' })
   await boot($)
   await append($, {
     message: {
@@ -719,18 +728,29 @@ test('armed, a prompt that is only the engine’s reminder is nobody’s request
     $,
     ledger({ tool_use_id: 'l1', task_id: 't1', title: '工作', status: 'in_progress', text: '开始', next_step: '接着做' }),
   )
-  expect(booked.isError).toBe(true)
-  expect(textOf(booked)).toContain('校验')
+  // The entry is still booked, pointing at nothing: a session with no request on record must not lose its ledger.
+  expect(booked.isError).not.toBe(true)
+  await w.clock.settle()
+  expect(requestRefs(w)).toEqual([0])
 })
 
-/** Whether a ledger entry could be booked after this one prompt: it only can once a person's request is on record. */
-const bookable = async ($: Engine, id: string): Promise<boolean> => {
+/** The request each booked entry points at, oldest first; 0 is "nothing on record". */
+const requestRefs = (w: World): number[] =>
+  (fileAt(w, 'ledger.jsonl') ?? '')
+    .split('\n')
+    .filter(line => line.trim() !== '')
+    .map(line => (JSON.parse(line) as { request_ref: number }).request_ref)
+
+/** Whether the one prompt before it was taken as a person's request: an entry booked now points at it. */
+const bookable = async ($: Engine, w: World, id: string): Promise<boolean> => {
   const booked = await callTool(
     $,
     ledger({ tool_use_id: `l-${id}`, task_id: 't1', title: '工作', status: 'in_progress', text: '开始', next_step: '接着做' }),
   )
+  expect(booked.isError).not.toBe(true)
+  await w.clock.settle()
 
-  return booked.isError !== true
+  return (requestRefs(w).at(-1) ?? 0) !== 0 && (fileAt(w, 'history-w001.jsonl') ?? '').includes('"isPerson":true')
 }
 
 const promptFrom = async ($: Engine, text: string, id: string, origin: { kind: string }): Promise<void> => {
@@ -743,31 +763,120 @@ const promptFrom = async ($: Engine, text: string, id: string, origin: { kind: s
 }
 
 test('armed, a composer prompt that opens with a tag is still the person’s request', async ($, on) => {
-  world(on, 's-tag-person', { CTX_MOD: '1' })
+  const w = world(on, 's-tag-person', { CTX_MOD: '1' })
   await boot($)
   await promptFrom($, '<task>把登录页的按钮改成蓝色</task>', 'row-tag', { kind: 'composer' })
-  expect(await bookable($, 'tag')).toBe(true)
+  expect(await bookable($, w, 'tag')).toBe(true)
 })
 
 test('armed, a slash command typed in the composer is not a request', async ($, on) => {
-  world(on, 's-tag-command', { CTX_MOD: '1' })
+  const w = world(on, 's-tag-command', { CTX_MOD: '1' })
   await boot($)
   await promptFrom($, '<command-name>/compact</command-name>', 'row-cmd', { kind: 'composer' })
-  expect(await bookable($, 'cmd')).toBe(false)
+  expect(await bookable($, w, 'cmd')).toBe(false)
 })
 
 test('armed, a tag-led prompt with no confirmed origin (an import) is not a request', async ($, on) => {
-  world(on, 's-tag-stray', { CTX_MOD: '1' })
+  const w = world(on, 's-tag-stray', { CTX_MOD: '1' })
   await boot($)
   await strayPrompt($, '<task>把登录页的按钮改成蓝色</task>', 'row-stray')
-  expect(await bookable($, 'stray')).toBe(false)
+  expect(await bookable($, w, 'stray')).toBe(false)
 })
 
 test('armed, the mod’s own continuation note is not a request even from a confirmed origin', async ($, on) => {
-  world(on, 's-tag-own', { CTX_MOD: '1' })
+  const w = world(on, 's-tag-own', { CTX_MOD: '1' })
   await boot($)
   await promptFrom($, 'ctx-mod：已换到新的上下文窗口，请继续。', 'row-own', { kind: 'composer' })
-  expect(await bookable($, 'own')).toBe(false)
+  expect(await bookable($, w, 'own')).toBe(false)
+})
+
+const SPAWN = '<relay from="coordinator" session="session_1" reason="spawn">\n  <note>先盘点可清理的东西，列清单等确认</note>\n</relay>'
+
+test('armed, a coordinator’s hand-off is a task’s source but nobody’s request', async ($, on) => {
+  const w = world(on, 's-relay', { CTX_MOD: '1' })
+  await boot($)
+  // The engine cannot name where a hand-off came from: it arrives `unclassified`, as a stray row does.
+  await promptFrom($, SPAWN, 'row-relay', { kind: 'unclassified' })
+  await callTool($, { tool: 'Glob', tool_use_id: 'tu-glob', pattern: '**/*.bak' })
+  await toolResult($, 'tu-glob', 'row-glob', 'a.bak')
+
+  // Booked before any person has spoken, by default and by name; a tool result is still refused.
+  const first = await callTool(
+    $,
+    ledger({ tool_use_id: 'l-relay-1', task_id: 'cleanup', title: '清理', status: 'in_progress', text: '盘点中', next_step: '列清单' }),
+  )
+  expect(first.isError).not.toBe(true)
+  const named = await callTool(
+    $,
+    ledger({ tool_use_id: 'l-relay-2', task_id: 'cleanup', title: '清理', status: 'in_progress', text: '盘点完', next_step: '列清单', request_ref: 1 }),
+  )
+  expect(named.isError).not.toBe(true)
+  const wrong = await callTool(
+    $,
+    ledger({ tool_use_id: 'l-relay-3', task_id: 'cleanup', title: '清理', status: 'in_progress', text: 'x', next_step: '列清单', request_ref: 2 }),
+  )
+  expect(wrong.isError).toBe(true)
+  expect(textOf(wrong)).toContain('不是真人请求')
+
+  await w.clock.settle()
+  expect(requestRefs(w)).toEqual([1, 1])
+  const shard = fileAt(w, 'history-w001.jsonl') ?? ''
+  expect(shard).toContain('"origin":"unclassified"')
+  expect(shard).not.toContain('"isPerson":true')
+
+  const handoff = await handoffOf($)
+  expect(handoff).toContain('## 最近的用户请求\n无')
+  expect(handoff).toContain('## 派发来的任务')
+  expect(handoff).toContain('先盘点可清理的东西')
+})
+
+test('armed, /ctx-mod switch works in a session only a coordinator has spoken in', async ($, on) => {
+  const w = world(on, 's-relay-switch', { CTX_MOD: '1' })
+  await boot($)
+  await promptFrom($, SPAWN, 'row-relay', { kind: 'projects-relay' })
+
+  expect(await runCommand($, 'switch')).toContain('正在换到新窗口')
+  await w.clock.advance(300)
+  expect(w.runs).toContain('compact')
+})
+
+test('armed, a task notification filed as a prompt is neither a request nor a hand-off', async ($, on) => {
+  const w = world(on, 's-notify-prompt', { CTX_MOD: '1' })
+  await boot($)
+  // As the engine files one with no delivery mark: the prompt door, its own origin.
+  await promptFrom($, '<task-notification>\n<task-id>b0</task-id>\n<status>completed</status>\n</task-notification>', 'row-note', {
+    kind: 'task-notification',
+  })
+  expect(await bookable($, w, 'note')).toBe(false)
+  expect(requestRefs(w)).toEqual([0])
+  const named = await callTool(
+    $,
+    ledger({ tool_use_id: 'l-note-2', task_id: 't1', title: '工作', status: 'in_progress', text: '继续', next_step: '接着做', request_ref: 1 }),
+  )
+  expect(named.isError).toBe(true)
+  expect(await runCommand($, 'switch')).toContain('还没有可交接的内容')
+})
+
+test('armed, a thread’s wake is the person’s request only when a human wrote it', async ($, on) => {
+  const wake = (from: string): string =>
+    `<wake reason="mention">\n  <project id="chan_1" type="project">\n    <message trigger="true" from="${from}" trust="principal" id="cmsg_1" mention="true">删a吧</message>\n  </project>\n</wake>`
+
+  const human = world(on, 's-wake-human', { CTX_MOD: '1' })
+  await boot($)
+  await promptFrom($, wake('human'), 'row-wake-h', { kind: 'bridge' })
+  expect(await bookable($, human, 'wake-h')).toBe(true)
+})
+
+test('armed, a wake an agent’s message triggered is not a request', async ($, on) => {
+  const w = world(on, 's-wake-agent', { CTX_MOD: '1' })
+  await boot($)
+  await promptFrom(
+    $,
+    '<wake reason="mention">\n  <project id="chan_1" type="project">\n    <message trigger="true" from="agent" id="cmsg_1" mention="true">进度如何</message>\n  </project>\n</wake>',
+    'row-wake-a',
+    { kind: 'bridge' },
+  )
+  expect(await bookable($, w, 'wake-a')).toBe(false)
 })
 
 test('armed, the handoff a window opens with is found by the compaction door', async ($, on) => {
@@ -798,7 +907,7 @@ test('armed, a queued_command typed mid-turn that opens with a tag is the person
   )
   await w.clock.settle()
   expect(fileAt(w, 'history-w001.jsonl') ?? '').toContain('"isPerson":true')
-  expect(await bookable($, 'qt')).toBe(true)
+  expect(await bookable($, w, 'qt')).toBe(true)
 })
 
 test('armed, a person’s prompt survives an injected head and the handoff drops it', async ($, on) => {
@@ -1408,7 +1517,9 @@ test('armed, a queued_command that matches no submitted words is an ordinary row
     $,
     ledger({ tool_use_id: 'ledger-n', task_id: 't1', title: '工作', status: 'in_progress', text: '开始', next_step: '接着做' }),
   )
-  expect(booked.isError).toBe(true)
+  expect(booked.isError).not.toBe(true)
+  await w.clock.settle()
+  expect(requestRefs(w)).toEqual([0])
 })
 
 test('armed, an Agent task and a long command are kept whole and read back with field input', async ($, on) => {

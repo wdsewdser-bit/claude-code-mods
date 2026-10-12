@@ -166,12 +166,54 @@ describe('validate', () => {
     ).toContain('不能是任务自己')
   })
 
-  test('request_ref must be a real person prompt, and must fall back to one when omitted', () => {
-    const rows = [person(), person({ seq: 2, uuid: 'u-2', role: 'assistant', isPerson: undefined })]
+  test('request_ref must be a person prompt or the hand-off that gave the task', () => {
+    const rows = [
+      person(),
+      person({ seq: 2, uuid: 'u-2', role: 'assistant', isPerson: undefined }),
+      person({ seq: 3, uuid: 'u-3', isPerson: undefined, origin: 'coordinator', text: '<relay from="coordinator">清理项目</relay>' }),
+      person({ seq: 4, uuid: 'u-4', isPerson: undefined, origin: 'task-notification', text: '<task-notification>done</task-notification>' }),
+      // As the engine files a hand-off on the person's machine: no origin it can name, told by its opening.
+      person({ seq: 5, uuid: 'u-5', isPerson: undefined, origin: 'unclassified', text: '<relay from="coordinator" reason="spawn">清理项目</relay>' }),
+      // An imported row carries no origin at all, and a reminder may sit before the tag.
+      person({ seq: 6, uuid: 'u-6', isPerson: undefined, text: '<system-reminder>开场</system-reminder>\n<relay session="s1" from="coordinator">清理项目</relay>' }),
+      // Unnamed origin, other words: nobody's task.
+      person({ seq: 7, uuid: 'u-7', isPerson: undefined, origin: 'unclassified', text: '来路不明的一行' }),
+      // The tag quoted by a row another origin vouches for, or outside the prompt door, is not a hand-off.
+      person({ seq: 8, uuid: 'u-8', isPerson: undefined, origin: 'peer', text: '<relay from="coordinator">清理项目</relay>' }),
+      person({ seq: 9, uuid: 'u-9', isPerson: undefined, door: 'attachment', text: '<relay from="coordinator">清理项目</relay>' }),
+    ]
     expect(validate(input({ request_ref: 2 }), context({ history: from(rows) }))[0]).toContain('不是真人')
-    expect(validate(input({ request_ref: 9 }), context({ history: from(rows) }))[0]).toContain('不存在')
+    expect(validate(input({ request_ref: 99 }), context({ history: from(rows) }))[0]).toContain('不存在')
     expect(validate(input({ request_ref: 1 }), context({ history: from(rows) }))).toEqual([])
-    expect(validate(input(), context({ latestPersonSeq: null }))[0]).toContain('真人请求')
+    expect(validate(input({ request_ref: 3 }), context({ history: from(rows) }))).toEqual([])
+    expect(validate(input({ request_ref: 4 }), context({ history: from(rows) }))[0]).toContain('不是真人')
+    expect(validate(input({ request_ref: 5 }), context({ history: from(rows) }))).toEqual([])
+    expect(validate(input({ request_ref: 6 }), context({ history: from(rows) }))).toEqual([])
+    for (const seq of [7, 8, 9]) {
+      expect(validate(input({ request_ref: seq }), context({ history: from(rows) }))[0]).toContain('不是真人')
+    }
+  })
+
+  test('an omitted request_ref is never refused, whatever the session has seen', () => {
+    expect(validate(input(), context({ latestPersonSeq: null }))).toEqual([])
+    expect(validate(input(), context({ latestPersonSeq: null, latestRelaySeq: 3 }))).toEqual([])
+  })
+
+  test('evidence is dated against the hand-off when no person has asked', () => {
+    const rows = [
+      person({ seq: 1, isPerson: undefined, origin: 'coordinator', ts: 5_000 }),
+      tool({ seq: 11, ts: 4_000 }),
+      tool({ seq: 12, ts: 6_000 }),
+    ]
+    const relayOnly = { history: from(rows), latestPersonSeq: null, latestRelaySeq: 1 }
+    const early = validate(input({ status: 'done', evidence: [11] }), context(relayOnly))[0]
+    expect(early).toContain('早于')
+    // The refusal names the row the evidence was measured against, and how to point elsewhere.
+    expect(early).toContain('默认对应的请求 #1')
+    expect(validate(input({ status: 'done', evidence: [11], request_ref: 1 }), context(relayOnly))[0]).toContain('request_ref 指向的 #1')
+    const booked = context({ ...relayOnly, entries: [entry({ seq: 3, ts: 4_500 })] })
+    expect(validate(input({ status: 'done', evidence: [11] }), booked)[0]).toContain('第一条记录 #L3')
+    expect(validate(input({ status: 'done', evidence: [12] }), context(relayOnly))).toEqual([])
   })
 
   test('anchors are capped, kept non-empty, and checked against the file', () => {
@@ -212,6 +254,14 @@ describe('stamp', () => {
   test('an explicit request_ref wins, and a missing person prompt falls back to 0', () => {
     expect(stamp(input({ request_ref: 3 }), { seq: 1, ts: 1, window: 1, latestPersonSeq: 5 }).request_ref).toBe(3)
     expect(stamp(input(), { seq: 1, ts: 1, window: 1, latestPersonSeq: null }).request_ref).toBe(0)
+  })
+
+  test('an omitted request_ref takes whichever came last, the person’s prompt or the hand-off', () => {
+    const at = { seq: 1, ts: 1, window: 1 }
+    expect(stamp(input(), { ...at, latestPersonSeq: null, latestRelaySeq: 4 }).request_ref).toBe(4)
+    expect(stamp(input(), { ...at, latestPersonSeq: 2, latestRelaySeq: 4 }).request_ref).toBe(4)
+    expect(stamp(input(), { ...at, latestPersonSeq: 6, latestRelaySeq: 4 }).request_ref).toBe(6)
+    expect(stamp(input(), { ...at, latestPersonSeq: null, latestRelaySeq: null }).request_ref).toBe(0)
   })
 
   test('optional fields left out are absent, never undefined', () => {
@@ -283,6 +333,18 @@ describe('renderHome', () => {
     const text = renderHome({ window: 1, entries: [], requests, archive: [] }, DEFAULTS)
     expect(text).toContain('当前是第 1 个窗口')
     expect(text).not.toContain('上一个')
+  })
+
+  test('a hand-off is shown apart from the requests, and only when one is given', () => {
+    const relay = person({ seq: 7, ts: 2_000, isPerson: undefined, origin: 'coordinator', text: '协调者：先盘点再清理' })
+    const text = renderHome({ window: 2, entries: [], requests: [], relay, archive: [] }, DEFAULTS)
+    expect(text).toContain('## 最近的用户请求\n无')
+    expect(text).toContain('## 派发来的任务')
+    expect(text).toContain('[#7]')
+    expect(text).toContain('协调者：先盘点再清理')
+    expect(text.indexOf('## 派发来的任务')).toBeLessThan(text.indexOf('## 进行中 / 受阻的任务'))
+
+    expect(renderHome({ window: 2, entries: [], requests, archive: [] }, DEFAULTS)).not.toContain('派发来的任务')
   })
 
   test('an over-long request is cut and tells the model where to read the rest', () => {
