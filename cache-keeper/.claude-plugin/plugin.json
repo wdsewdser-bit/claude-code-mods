@@ -1,0 +1,107 @@
+{
+  "name": "cache-keeper",
+  "version": "0.5.0",
+  "description": "Observes prompt-cache usage, keeps the session's and its finished subagents' caches warm, and runs 5m/1h TTL A/B experiments.",
+  "author": {
+    "name": "yadaz"
+  },
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Keeper on by default",
+      "description": "Keep every session warm unless /cache-keeper stop turns it off there. Off: only /cache-keeper start turns it on.",
+      "default": true
+    },
+    "dataDir": {
+      "type": "string",
+      "title": "Data directory",
+      "description": "Where events, run records and reports are written: absolute, under ~ (the home directory), or relative to the session's working directory.",
+      "default": "~/.claude/cache-keeper"
+    },
+    "minCacheReadTokens": {
+      "type": "number",
+      "title": "Minimum cached prefix (tokens)",
+      "description": "The keeper only refreshes a cached prefix at least this large.",
+      "default": 40000
+    },
+    "ttl5mKeepaliveAtSec": {
+      "type": "number",
+      "title": "5m keepalive after (seconds)",
+      "description": "Idle seconds since the last request started before a 5-minute cache is refreshed.",
+      "default": 245
+    },
+    "ttl1hKeepaliveAtSec": {
+      "type": "number",
+      "title": "1h keepalive after (seconds)",
+      "description": "Idle seconds since the last request started before a 1-hour cache is refreshed.",
+      "default": 3120
+    },
+    "maxRateLimitPercent": {
+      "type": "number",
+      "title": "Stop at usage percent",
+      "description": "The keeper stops once any rate-limit window reaches this percent.",
+      "default": 90
+    },
+    "maxConsecutiveProbeFailures": {
+      "type": "number",
+      "title": "Stop after failed probes",
+      "description": "Consecutive failed or missed keepalives before the keeper stops.",
+      "default": 2
+    },
+    "maxIdleKeepalives": {
+      "type": "number",
+      "title": "Keepalives per idle stretch",
+      "description": "Keepalives allowed between two real requests (3 covers about four idle hours at a 1-hour TTL). 0 = the API-price break-even against one cache rewrite.",
+      "default": 3
+    },
+    "subagentKeepalives": {
+      "type": "number",
+      "title": "Keepalives per finished subagent",
+      "description": "Times a finished subagent's cache is refreshed in case it is sent another message (2 covers about 2.7 hours at a 1-hour subagent TTL). 0 = never.",
+      "default": 2
+    },
+    "probePrompt": {
+      "type": "string",
+      "title": "Probe prompt",
+      "description": "The one user message a keepalive or benchmark probe sends.",
+      "default": "Reply with OK only."
+    },
+    "writeCsv": {
+      "type": "boolean",
+      "title": "Write cache-events.csv",
+      "description": "Have /cache-keeper report write the CSV.",
+      "default": true
+    },
+    "writeJson": {
+      "type": "boolean",
+      "title": "Write experiment-summary.json",
+      "description": "Have /cache-keeper report write the JSON summary.",
+      "default": true
+    },
+    "showStatus": {
+      "type": "boolean",
+      "title": "Status line entry",
+      "description": "Show the keeper's state in the status line.",
+      "default": true
+    },
+    "bridgeEnabled": {
+      "type": "boolean",
+      "title": "Quota bridge",
+      "description": "At bridgeAtPercent of the 5-hour window, tell the main session to wrap up, keep its cache warm until the reset, then tell it to continue. Only sessions with a user or assistant message within the cache TTL, or with background tasks still out; never subagents.",
+      "default": true
+    },
+    "bridgeAtPercent": {
+      "type": "number",
+      "title": "Bridge at 5h percent",
+      "description": "5-hour usage percent that sends the wrap-up message.",
+      "default": 90
+    },
+    "weeklyHandoffAtPercent": {
+      "type": "number",
+      "title": "Handoff at weekly percent",
+      "description": "Weekly usage percent that asks the main session, once per weekly window, to write a handoff document for a new conversation to pick up after the reset. Only sessions with a user or assistant message in the last ten minutes, or with background tasks still out. 0 = never.",
+      "default": 98
+    }
+  },
+  "types": "./types/index.d.ts"
+}

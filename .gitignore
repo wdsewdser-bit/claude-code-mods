@@ -1,0 +1,6 @@
+# Written by the engine when it loads a mod.
+.claude-plugin/types/
+node_modules/
+*.bak-*
+# Local tooling.
+/sync-from-local.ps1

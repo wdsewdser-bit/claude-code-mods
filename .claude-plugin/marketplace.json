@@ -1,0 +1,8 @@
+{
+  "name": "claude-code-mods",
+  "owner": { "name": "yadaz" },
+  "plugins": [
+    { "name": "cache-keeper", "source": "./cache-keeper" },
+    { "name": "ctx-mod", "source": "./ctx-mod" }
+  ]
+}

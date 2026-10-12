@@ -1,0 +1,7 @@
+{
+  "name": "ctx-mod",
+  "version": "0.1.0",
+  "description": "Proactive context management: a task ledger, a searchable history and zero-summary window switches.",
+  "author": { "name": "yadaz" },
+  "dependencies": ["cache-keeper"]
+}
