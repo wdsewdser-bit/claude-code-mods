@@ -301,6 +301,8 @@ const sessionOf = async ($: EngineInterface): Promise<Session | undefined> => {
   const io: Io = {
     read: path => $.fs.read(path),
     write: (path, text) => $.fs.write(path, text),
+    exists: path => $.fs.exists(path),
+    cwd: () => $.session.cwd(),
     now: () => Date.now(),
     onWriteError: (path, error) => logError($, `write ${path}`, error),
   }
