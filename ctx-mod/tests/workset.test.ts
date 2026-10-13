@@ -8,6 +8,7 @@ import {
   locate,
   pathKey,
   pathsToRead,
+  relativePath,
   renderWorkset,
   snippetsOf,
 } from '../hooks/lib/workset.ts'
@@ -537,6 +538,33 @@ describe('renderWorkset', () => {
     ])
     expect(text).toContain('- 任务 T1 · C:\\repo\\a.ts · 改这里 · 需重读：文件太大，没有取片段')
     expect(text).not.toContain('上次读取见')
+  })
+
+  test('with a working directory the paths inside it are shown relative, and the row data is not touched', () => {
+    const before = JSON.stringify([rows, snippets])
+    const text = renderWorkset(rows, snippets, new Map(), 'c:/Repo/')
+    expect(text).toContain('路径相对工作目录 c:/Repo/')
+    expect(text).toContain('\na.ts · 读 2 次/改 1 次 · 最后活动 #12 · 改后未重读')
+    expect(text).toContain('- 任务 T1 · a.ts:40 · 改这里')
+    expect(text).toContain('- 任务 T2 · b.ts · 写下一步 · 需重读：在文件里找不到锚点原文')
+    expect(text).not.toContain('C:\\repo\\')
+    expect(JSON.stringify([rows, snippets])).toBe(before)
+  })
+
+  test('a path outside the directory, or no directory at all, keeps the absolute path', () => {
+    expect(renderWorkset(rows, snippets, new Map(), 'D:\\other')).toContain('C:\\repo\\a.ts · 读 2 次')
+    expect(renderWorkset(rows, snippets, new Map(), 'D:\\other')).not.toContain('路径相对工作目录')
+    expect(renderWorkset(rows, snippets)).toContain('C:\\repo\\a.ts · 读 2 次')
+  })
+
+  test('relativePath cuts only at a directory boundary and keeps case on POSIX', () => {
+    expect(relativePath('/work/src/a.ts', '/work')).toBe('src/a.ts')
+    expect(relativePath('/workshop/a.ts', '/work')).toBe('/workshop/a.ts')
+    expect(relativePath('/work', '/work')).toBe('/work')
+    expect(relativePath('/Work/a.ts', '/work')).toBe('/Work/a.ts')
+    expect(relativePath('C:\\Repo\\src\\a.ts', 'c:\\repo')).toBe('src\\a.ts')
+    expect(relativePath('src/a.ts', '/work')).toBe('src/a.ts')
+    expect(relativePath('/work/a.ts', undefined)).toBe('/work/a.ts')
   })
 
   test('only thirty files are listed, the rest are counted', () => {

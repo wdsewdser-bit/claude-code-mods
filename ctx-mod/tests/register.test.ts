@@ -59,6 +59,8 @@ type World = {
   resubmits: string[]
   /** The texts the bottom saw from anyone, in order. */
   submits: string[]
+  /** Commands run and plugin re-submissions in the one order they happened, as `run:<command>` and `resubmit:<text>`. */
+  timeline: string[]
   /** What cache-keeper's published state reads as; none until a test sets it. */
   keeper: Record<string, unknown> | null
 }
@@ -112,6 +114,7 @@ const world = (
     notices: [],
     resubmits: [],
     submits: [],
+    timeline: [],
     keeper: null,
   }
   mock.env(on, { USERPROFILE: HOME, ...env })
@@ -161,6 +164,7 @@ const world = (
     w.submits.push(e.text)
     if ((e.origin as { kind: string }).kind === 'plugin') {
       w.resubmits.push(e.text)
+      w.timeline.push(`resubmit:${e.text}`)
       if (w.resubmit === 'drop') return { drop: 'another plugin refused it' }
       if (w.resubmit === 'throw') throw new Error('submit failed')
     }
@@ -192,6 +196,7 @@ const world = (
   })
   on('command.run', async ($, e) => {
     w.runs.push(e.command)
+    w.timeline.push(`run:${e.command}`)
     if (w.runError !== undefined) throw w.runError
     if (e.command === 'compact' && w.compactsOnRun) {
       // The engine's own `/compact`: what core raises once the command returns.
@@ -1325,6 +1330,67 @@ test('a second message while the switch runs queues behind it: one compaction, t
   expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
   expect(w.resubmits).toEqual(['第一句', '第二句'])
   expect(heldLeft(w)).toEqual([])
+})
+
+test('a held message is not let in while the cache is cold: the compaction runs first, then it goes in once, in order', async ($, on) => {
+  const w = world(on, 's-cold-order', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  const submitsBefore = w.submits.length
+
+  expect(isDropped(await sayWhileCold($, '先压缩再说'))).toBe(true)
+  // Held: the bottom has not seen the words, and nothing has been compacted yet.
+  expect(w.submits).toHaveLength(submitsBefore)
+  expect(w.timeline).toEqual([])
+  expect(heldLeft(w)).toEqual(['先压缩再说'])
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  // The compaction came first; the words went in afterwards, as the person's own, once.
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:先压缩再说'])
+  expect(w.submits.filter(text => text === '先压缩再说')).toHaveLength(1)
+  expect(heldLeft(w)).toEqual([])
+})
+
+test('two cold prompts in a row ask for one compaction and are delivered in the order they were typed', async ($, on) => {
+  const w = world(on, 's-cold-two', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  const first = await sayWhileCold($, '第一条')
+  const second = await sayWhileCold($, '第二条')
+
+  expect(String((first as { drop?: unknown }).drop)).toContain('缓存已过期')
+  expect(String((second as { drop?: unknown }).drop)).toContain('排在后面')
+  expect(heldLeft(w)).toEqual(['第一条', '第二条'])
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:第一条', 'resubmit:第二条'])
+  expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
+  // The queue is free again: a cold prompt after the flow ended starts a new compaction of its own.
+  expect(isDropped(await sayWhileCold($, '第三条'))).toBe(true)
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.timeline.slice(3)).toEqual(['run:compact', 'resubmit:第三条'])
+})
+
+test('when every re-submission is dropped each message comes back as a notice with its own words, in order, none lost', async ($, on) => {
+  const w = world(on, 's-cold-drop-all', { CTX_MOD: '1' })
+  w.resubmit = 'drop'
+  await boot($)
+  await goCold($, w)
+  await sayWhileCold($, '甲：别丢')
+  await sayWhileCold($, '乙：也别丢')
+  await w.clock.advance(300)
+  await w.clock.settle()
+
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:甲：别丢', 'resubmit:乙：也别丢'])
+  expect(w.notices).toEqual([
+    'ctx-mod：换窗口后没能重新提交你的消息，请重发：甲：别丢',
+    'ctx-mod：换窗口后没能重新提交你的消息，请重发：乙：也别丢',
+  ])
+  expect(heldLeft(w)).toEqual([])
+  expect(w.logs.join('\n')).toContain('the re-submitted prompt was dropped')
 })
 
 test('a held message that cannot be written down goes in as usual and no switch is asked for', async ($, on) => {
