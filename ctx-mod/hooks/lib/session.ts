@@ -42,7 +42,7 @@ import {
 import type { LoadedTool, SearchHit, Shard } from './history.ts'
 import { archiveName, hasFreshEntry, pageOf, renderHome, stamp, tasksOf, turnPage, validate } from './ledger.ts'
 import type { AnchorCheck, ArchivePage, TaskState } from './ledger.ts'
-import { activityOf, filesOf, locate, pathKey, pathsToRead, renderWorkset, snippetsOf } from './workset.ts'
+import { activityOf, filesOf, locate, pathKey, pathsToRead, relativePath, renderWorkset, snippetsOf } from './workset.ts'
 import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
@@ -54,6 +54,27 @@ export type Io = {
   now: () => number
   /** Told about every failed write, so the caller can log what the queue would otherwise swallow. */
   onWriteError?: (path: string, error: unknown) => void
+  /**
+   * The optional file operations the cross-session table (costly.json) can use to be written
+   * safely. Each is a no-op fallback when left out: without `claim` the lock is a weaker
+   * write-and-read-back check, without `rename` the table is written in place, without
+   * `exists` a failed read is told from a missing file by its error text.
+   */
+  /** Whether the path exists; lets a failed read be told from an absent file. */
+  exists?: (path: string) => Promise<boolean>
+  /** Creates the file only if it is absent (like open 'wx'): true when this call created it. */
+  claim?: (path: string, text: string) => Promise<boolean>
+  /** Moves `from` over `to` in one step. */
+  rename?: (from: string, to: string) => Promise<void>
+  /** Deletes the file; a missing file is not an error. */
+  remove?: (path: string) => Promise<void>
+  /**
+   * The session's working directory. Only the handoff text uses it, to show paths inside it
+   * relative to it; what is stored on disk keeps the absolute paths. Left out, paths stay as they are.
+   */
+  cwd?: () => string | undefined | Promise<string | undefined>
+  /** Waits roughly `ms` milliseconds; without it a real timer is used when there is one. */
+  sleep?: (ms: number) => Promise<void>
 }
 
 export type Env = {
@@ -521,6 +542,21 @@ const sharedFrom = (text: string | null, now: number): Record<string, SharedCost
 }
 
 /** The table as the file holds it: the version the format is read by. */
+/** The lock file sits beside the table; a holder that died leaves it, so it goes stale. */
+const SHARED_LOCK_SUFFIX = '.lock'
+const SHARED_LOCK_STALE_MS = 10_000
+const SHARED_LOCK_TRIES = 8
+const SHARED_LOCK_PAUSE_MS = 40
+
+/** Whether a failed read says the file is simply not there (as opposed to unreadable). */
+const isMissingError = (error: unknown): boolean => {
+  if (typeof error !== 'object' || error === null) return false
+  const { code, message } = error as { code?: unknown; message?: unknown }
+  if (code === 'ENOENT' || code === 'ENOTDIR') return true
+
+  return typeof message === 'string' && /ENOENT|no such file|not found|does not exist/i.test(message)
+}
+
 const sharedJson = (table: Record<string, SharedCost>): string => JSON.stringify({ version: 1, groups: table })
 
 /** A tool use's arguments, as the activity reader and the path reader both want them. */
@@ -1048,10 +1084,134 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
    */
   const recordShared = async (group: string, write: number, context: number): Promise<void> => {
     if (sharedFile === null) return
-    const now = io.now()
-    const table = { ...sharedFrom(await readText(sharedFile), now), [group]: { write, context, at: now } }
-    sharedCostly = table
-    void queue.push(sharedFile, sharedJson(table))
+    const file = sharedFile
+    const lockPath = `${file}${SHARED_LOCK_SUFFIX}`
+    const report = (problem: unknown): void => {
+      try {
+        io.onWriteError?.(file, problem)
+      } catch {
+        // A reporter that throws must not change how the write fails.
+      }
+    }
+    const pause = async (): Promise<void> => {
+      if (io.sleep !== undefined) return await io.sleep(SHARED_LOCK_PAUSE_MS)
+      const timer = (globalThis as { setTimeout?: (run: () => void, ms: number) => unknown }).setTimeout
+      if (typeof timer === 'function') {
+        await new Promise<void>(resolve => {
+          timer(resolve, SHARED_LOCK_PAUSE_MS)
+        })
+      }
+    }
+    /** The lock file's holder time: null when it is absent, -Infinity when it is damaged, undefined when unreadable. */
+    const lockTime = async (): Promise<number | null | undefined> => {
+      let text: string
+      try {
+        text = await io.read(lockPath)
+      } catch (problem) {
+        const isGone = io.exists === undefined ? isMissingError(problem) : !(await io.exists(lockPath).catch(() => true))
+
+        return isGone ? null : undefined
+      }
+      if (text === '') return Number.NEGATIVE_INFINITY
+      try {
+        const at = (JSON.parse(text) as { at?: unknown }).at
+
+        return typeof at === 'number' && Number.isFinite(at) ? at : Number.NEGATIVE_INFINITY
+      } catch {
+        return Number.NEGATIVE_INFINITY
+      }
+    }
+    /** Takes the lock, or gives up after a few tries: a measure is never worth waiting long for. */
+    const acquire = async (token: string): Promise<boolean> => {
+      for (let attempt = 0; attempt < SHARED_LOCK_TRIES; attempt += 1) {
+        const body = JSON.stringify({ token, at: io.now() })
+        const held = await lockTime()
+        if (held === undefined) {
+          await pause()
+          continue
+        }
+        const isFree = held === null || io.now() - held > SHARED_LOCK_STALE_MS
+        if (io.claim !== undefined) {
+          if (held !== null && isFree) await io.remove?.(lockPath)
+          if ((held === null || isFree) && (await io.claim(lockPath, body))) return true
+        } else if (isFree) {
+          // No exclusive create here: write, then read back, so the loser of a close race usually notices.
+          await io.write(lockPath, body)
+          if ((await readText(lockPath)) === body) return true
+        }
+        await pause()
+      }
+
+      return false
+    }
+    const release = async (token: string): Promise<void> => {
+      try {
+        const text = await readText(lockPath)
+        if (text === null || (JSON.parse(text) as { token?: unknown }).token !== token) return
+        if (io.remove !== undefined) await io.remove(lockPath)
+        else await io.write(lockPath, '')
+      } catch {
+        // A lock that cannot be released goes stale by itself.
+      }
+    }
+    /** The table as the file holds it: {} when there is no file, null when it is there but cannot be trusted. */
+    const readCurrent = async (): Promise<Record<string, SharedCost> | null> => {
+      let text: string
+      try {
+        text = await io.read(file)
+      } catch (problem) {
+        const isGone = io.exists === undefined ? isMissingError(problem) : !(await io.exists(file).catch(() => true))
+
+        return isGone ? {} : null
+      }
+      try {
+        const parsed: unknown = JSON.parse(text)
+        const groups = typeof parsed === 'object' && parsed !== null ? (parsed as { groups?: unknown }).groups : undefined
+        if (typeof groups !== 'object' || groups === null || Array.isArray(groups)) return null
+      } catch {
+        return null
+      }
+
+      return sharedFrom(text, io.now())
+    }
+
+    const token = `${io.now()}-${Math.random().toString(36).slice(2)}`
+    let isLocked = false
+    try {
+      isLocked = await acquire(token)
+      if (!isLocked) {
+        report(new Error('costly.json is locked by another session: this measure was not recorded'))
+
+        return
+      }
+      const current = await readCurrent()
+      if (current === null) {
+        // Written over, a table that merely failed to read would lose every other session's groups.
+        report(new Error('costly.json could not be read or parsed: left as it is, this measure was not recorded'))
+
+        return
+      }
+      const now = io.now()
+      const table = { ...current, [group]: { write, context, at: now } }
+      const text = sharedJson(table)
+      if (io.rename === undefined) {
+        await io.write(file, text)
+      } else {
+        const temp = `${file}.${token}.tmp`
+        await io.write(temp, text)
+        try {
+          await io.rename(temp, file)
+        } catch (problem) {
+          await io.remove?.(temp).catch(() => undefined)
+          throw problem
+        }
+      }
+      sharedCostly = table
+    } catch (problem) {
+      report(problem)
+    } finally {
+      if (isLocked) await release(token)
+    }
   }
 
   const noteStep = async (usage: { input: number; read: number; write: number }): Promise<void> => {
@@ -1766,10 +1926,21 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       { tasks, files, activities: state.activities, window: state.window },
       config,
     )
-    const workset = renderWorkset(filesOf(state.activities, state.window), snippets, inherited)
+    // Only the text the model reads is shortened: the activities, meta and shards keep absolute paths.
+    let base: string | undefined
+    try {
+      base = (await io.cwd?.()) || undefined
+    } catch {
+      // No working directory known: the paths are shown as they are.
+    }
+    const workset = renderWorkset(filesOf(state.activities, state.window), snippets, inherited, base)
     const tail = tailOf()
     // The whole uncovered stretch is listed (up to a cap), since the ledger holds nothing of it.
-    const actions = recentActions(rows, state.window, Math.max(config.recentActions, Math.min(MAX_TAIL_ACTIONS, tail.steps)))
+    const actions = recentActions(
+      rows,
+      state.window,
+      Math.max(config.recentActions, Math.min(MAX_TAIL_ACTIONS, tail.steps)),
+    ).map(action => (action.path === undefined ? action : { ...action, path: relativePath(action.path, base) }))
     const coverage = renderCoverage(tail)
     const tools = renderTools(costlyToolsOf(loadedTools(rows, state.window), costlyGroups()))
     const loadReason = renderLoadReason(state.gateWanted)

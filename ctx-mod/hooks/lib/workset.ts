@@ -396,24 +396,58 @@ export const snippetsOf = (
   return out
 }
 
+/**
+ * A path shown relative to the working directory, for text the model reads. A path outside
+ * the directory, one that is already relative, or no directory at all leaves it as it was;
+ * what is stored on disk is never passed through here.
+ */
+export const relativePath = (path: string, base: string | undefined): string => {
+  if (base === undefined) return path
+  const root = base.replace(/[\\/]+$/, '')
+  if (root === '') return path
+  // Windows folds case, and a drive-letter or backslash root marks it; a POSIX path keeps its case.
+  const isWindows = /^[A-Za-z]:/.test(root) || root.includes('\\')
+  const fold = (text: string): string => {
+    const slashed = text.replace(/\\/g, '/')
+
+    return isWindows ? slashed.toLowerCase() : slashed
+  }
+  const prefix = `${fold(root)}/`
+  const full = fold(path)
+  // Backslash and slash are the same length, so the cut in the folded text is the cut in the original.
+  if (!full.startsWith(prefix) || full.length === prefix.length) return path
+
+  return path.slice(prefix.length)
+}
+
 /** How many working-set rows the model is shown before the rest are only counted. */
 export const MAX_LISTED_FILES = 30
 
-/** The block a brand-new window reads first: what was worked in, and the exact places to carry on from. */
+/**
+ * The block a brand-new window reads first: what was worked in, and the exact places to carry on from.
+ * With a `base` (the working directory) the paths shown are relative to it where they lie inside it.
+ */
 export const renderWorkset = (
   files: readonly FileState[],
   snippets: readonly Snippet[],
   /** Tasks whose anchors were carried over from an earlier entry, by the entry's seq. */
   inherited: ReadonlyMap<string, number> = new Map(),
+  base?: string,
 ): string => {
   const lines: string[] = ['【文件工作集】']
+  const shown = (path: string): string => relativePath(path, base)
+  const isShortened =
+    base !== undefined &&
+    (files.slice(0, MAX_LISTED_FILES).some(file => shown(file.path) !== file.path) ||
+      snippets.some(snippet => shown(snippet.path) !== snippet.path))
+  if (isShortened) lines.push(`路径相对工作目录 ${base}`)
   if (files.length === 0) {
     lines.push('本窗口没有读写过文件')
   } else {
     for (const file of files.slice(0, MAX_LISTED_FILES)) {
       const edited = file.isEditedSinceRead ? ' · 改后未重读' : ''
       lines.push(
-        `${file.path} · 读 ${file.reads} 次/改 ${file.edits} 次 · 最后活动 #${file.lastSeq}${edited}`,
+        `${shown(file.path)} · 读 ${file.reads} 次/改 ${file.edits} 次 · 最后活动 #${file.lastSeq}${edited}`,
       )
     }
     if (files.length > MAX_LISTED_FILES) lines.push(`另有 ${files.length - MAX_LISTED_FILES} 个`)
@@ -432,11 +466,11 @@ export const renderWorkset = (
         const seen =
           snippet.lastSeq === undefined ? '' : `（上次读取见 #${snippet.lastSeq}）`
         lines.push(
-          `- 任务 ${snippet.taskId}${mark} · ${snippet.path} · ${snippet.note} · 需重读：${snippet.needsRead}${seen}`,
+          `- 任务 ${snippet.taskId}${mark} · ${shown(snippet.path)} · ${snippet.note} · 需重读：${snippet.needsRead}${seen}`,
         )
         continue
       }
-      lines.push(`- 任务 ${snippet.taskId}${mark} · ${snippet.path}:${snippet.startLine} · ${snippet.note}`)
+      lines.push(`- 任务 ${snippet.taskId}${mark} · ${shown(snippet.path)}:${snippet.startLine} · ${snippet.note}`)
       lines.push('```')
       lines.push(snippet.text)
       lines.push('```')
