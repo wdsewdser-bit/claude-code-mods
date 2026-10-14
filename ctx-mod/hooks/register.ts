@@ -304,6 +304,8 @@ const sessionOf = async ($: EngineInterface): Promise<Session | undefined> => {
     exists: path => $.fs.exists(path),
     cwd: () => $.session.cwd(),
     now: () => Date.now(),
+    // The names in a directory, for the cross-session measures: each session's own file is one of them.
+    list: async path => (await $.fs.list(path)).filter(entry => entry.kind === 'file').map(entry => entry.name),
     onWriteError: (path, error) => logError($, `write ${path}`, error),
   }
   const session = createSession(dir, io, DEFAULTS)
@@ -951,10 +953,7 @@ export const register: Register = (on, options) => {
         const session = await sessionOf($)
         // One step is one model request, whether or not it called a tool; a retried
         // or replayed step carries the same turn and index and is not a second one.
-        if (session !== undefined && (lastStep === null || lastStep.turnId !== e.turnId || lastStep.index !== e.index)) {
-          lastStep = { turnId: e.turnId, index: e.index }
-          session.noteRequest()
-        }
+        const isNewStep = session !== undefined && (lastStep === null || lastStep.turnId !== e.turnId || lastStep.index !== e.index)
         if (usage !== null) {
           const measured = {
             input: typeof usage.input_tokens === 'number' ? usage.input_tokens : 0,
@@ -967,6 +966,11 @@ export const register: Register = (on, options) => {
             session.notePrefix(measured.input + measured.read + measured.write)
             awaitingPrefix = false
           }
+        }
+        // Refreshed only after noteStep, which judges the previous request's age and must still see it.
+        if (session !== undefined && isNewStep) {
+          lastStep = { turnId: e.turnId, index: e.index }
+          session.noteRequest()
         }
       }
     } catch (error) {
