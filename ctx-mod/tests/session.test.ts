@@ -31,6 +31,11 @@ const makeIo = (start = 1_000_000): Box => {
       files.set(path, text)
     },
     now: () => clock,
+    list: async dir => {
+      const prefix = `${dir}/`
+
+      return [...files.keys()].filter(path => path.startsWith(prefix) && !path.slice(prefix.length).includes('/')).map(path => path.slice(prefix.length))
+    },
   }
 
   return { files, io, advance: ms => (clock += ms) }
@@ -1286,6 +1291,18 @@ describe('isLedgerFresh and lastRequestAt', () => {
     session.noteRequest()
     expect(session.lastRequestAt()).toBe(1_002_500)
   })
+
+  test('the time of the last request survives a reload, so a reopened session still sees its cache go cold', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.ready()
+    session.noteRequest()
+    await session.flush()
+
+    const reopened = createSession(DIR, box.io, DEFAULTS)
+    await reopened.ready()
+    expect(reopened.lastRequestAt()).toBe(1_000_000)
+  })
 })
 
 describe('a write that never lands', () => {
@@ -1534,56 +1551,58 @@ const SHARED_PATH = '/costly.json'
 const groupsOf = (box: Box): Record<string, Record<string, number>> =>
   (JSON.parse(box.files.get(SHARED_PATH) ?? '{"groups":{}}') as { groups: Record<string, Record<string, number>> }).groups
 
+/** The file a session writes its own cross-session measures to: one per session, beside the older table. */
+const ownPath = (name: string): string => `/costly/${name}.json`
+
+/** The groups in one session's own file, or none when it has not written one. */
+const measuresOf = (box: Box, name: string): Record<string, unknown> =>
+  (JSON.parse(box.files.get(ownPath(name)) ?? '{"groups":{}}') as { groups: Record<string, unknown> }).groups
+
+const COMPUTER_READ = { input: 0, read: 234_264, write: 0 }
+const COMPUTER_AFTER = { input: 0, read: 50_621, write: 202_702 }
+
 describe('the cross-session costly table', () => {
   test('a group measured in one session is known to another under the same mod directory', async () => {
     const box = makeIo()
     const first = createSession(DIR, box.io, DEFAULTS)
-    await judgeLoad(
-      first,
-      { input: 0, read: 234_264, write: 0 },
-      ['mcp__computer-use__screenshot'],
-      { input: 0, read: 50_621, write: 202_702 },
-    )
+    await judgeLoad(first, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
     await first.flush()
-    expect(JSON.parse(box.files.get(SHARED_PATH) ?? '{}')).toEqual({
+    expect(JSON.parse(box.files.get(ownPath('ctx')) ?? '{}')).toEqual({
       version: 1,
       groups: { 'mcp__computer-use__*': { write: 202_702, context: 234_264, at: 1_000_000 } },
     })
 
-    // '/other' and '/ctx' both have the parent '/', so they share '/costly.json'.
+    // '/other' and '/ctx' both have the parent '/', so they read the same measures.
     const second = createSession('/other', box.io, DEFAULTS)
     await second.ready()
     expect(second.costlyGroups()).toEqual({ 'mcp__computer-use__*': 202_702 })
   })
 
-  test('a session’s own measure wins over the table for the same group', async () => {
+  test('the newest measure of a group wins, whichever session wrote it, and a session keeps its own until it measures again', async () => {
     const box = makeIo()
     const first = createSession(DIR, box.io, DEFAULTS)
-    await judgeLoad(
-      first,
-      { input: 0, read: 234_264, write: 0 },
-      ['mcp__computer-use__screenshot'],
-      { input: 0, read: 50_621, write: 202_702 },
-    )
+    await judgeLoad(first, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
     await first.flush()
-    // Another session later measures the same group lower; this session's own figure is still its own.
+    // Another session measured the same group later, with a lower rewrite.
     box.files.set(
-      SHARED_PATH,
-      JSON.stringify({ version: 1, groups: { 'mcp__computer-use__*': { write: 100_000, context: 150_000, at: 1_000_000 } } }),
+      ownPath('other'),
+      JSON.stringify({ version: 1, groups: { 'mcp__computer-use__*': { write: 100_000, context: 150_000, at: 1_005_000 } } }),
     )
+    // A session that measured nothing itself sees the newer figure.
+    const third = createSession('/third', box.io, DEFAULTS)
+    await third.ready()
+    expect(third.costlyGroups()).toEqual({ 'mcp__computer-use__*': 100_000 })
+    // The measuring session keeps its own figure: its meta.json carries it across a reload.
     const reloaded = createSession(DIR, box.io, DEFAULTS)
     await reloaded.ready()
     expect(reloaded.costlyGroups()).toEqual({ 'mcp__computer-use__*': 202_702 })
-    // A session that never measured the group sees the table's figure, the later one.
-    const other = createSession('/other', box.io, DEFAULTS)
-    await other.ready()
-    expect(other.costlyGroups()).toEqual({ 'mcp__computer-use__*': 100_000 })
+    expect(first.costlyGroups()).toEqual({ 'mcp__computer-use__*': 202_702 })
   })
 
   test('a measure older than thirty days is ignored, and a rebuild that happens again is recorded again', async () => {
     const box = makeIo()
     box.files.set(
-      SHARED_PATH,
+      ownPath('other'),
       JSON.stringify({
         version: 1,
         groups: {
@@ -1597,96 +1616,77 @@ describe('the cross-session costly table', () => {
     // Exactly thirty days is still inside the window; one millisecond past it is not.
     expect(session.costlyGroups()).toEqual({ WebFetch: 60_000 })
 
-    await judgeLoad(
-      session,
-      { input: 0, read: 234_264, write: 0 },
-      ['mcp__computer-use__screenshot'],
-      { input: 0, read: 50_621, write: 202_702 },
-    )
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
     await session.flush()
     expect(session.costlyGroups()).toEqual({ WebFetch: 60_000, 'mcp__computer-use__*': 202_702 })
-    expect(groupsOf(box)['mcp__computer-use__*']).toEqual({ write: 202_702, context: 234_264, at: 1_000_000 })
+    expect(measuresOf(box, 'ctx')['mcp__computer-use__*']).toEqual({ write: 202_702, context: 234_264, at: 1_000_000 })
   })
 
-  test('a table that is not JSON leaves the session usable with an empty table, and is NOT overwritten by the next measure', async () => {
+  test('a session that runs past thirty days drops its own stale measure when it writes again', async () => {
     const box = makeIo()
-    box.files.set(SHARED_PATH, '{ not json')
+    box.files.set(ownPath('ctx'), JSON.stringify({ version: 1, groups: { WebFetch: { write: 60_000, context: 150_000, at: 1_000_000 } } }))
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.ready()
+    box.advance(30 * DAY_MS + 1)
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
+    await session.flush()
+    expect(Object.keys(measuresOf(box, 'ctx'))).toEqual(['mcp__computer-use__*'])
+  })
+
+  test('a session file that is not JSON is left as it is, the failure is reported, and the session still counts its own measure', async () => {
+    const box = makeIo()
+    box.files.set(ownPath('ctx'), '{ not json')
     const reported: string[] = []
     const session = createSession(DIR, { ...box.io, onWriteError: path => reported.push(path) }, DEFAULTS)
     await session.ready()
     expect(session.costlyGroups()).toEqual({})
     expect((await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '你好' })).seq).toBe(1)
 
-    await judgeLoad(
-      session,
-      { input: 0, read: 234_264, write: 0 },
-      ['mcp__computer-use__screenshot'],
-      { input: 0, read: 50_621, write: 202_702 },
-    )
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
     await session.flush()
     // The file could not be trusted, so it is left byte for byte as it was; the failure is reported, not thrown.
-    expect(box.files.get(SHARED_PATH)).toBe('{ not json')
-    expect(reported).toContain(SHARED_PATH)
-    // The session's own measure still counts for this session.
+    expect(box.files.get(ownPath('ctx'))).toBe('{ not json')
+    expect(reported).toContain(ownPath('ctx'))
     expect(session.costlyGroups()).toEqual({ 'mcp__computer-use__*': 202_702 })
     expect(session.unsaved()).toEqual([])
   })
 
-  test('recording a group keeps the groups already in the table, including one another session wrote meanwhile', async () => {
+  test('the older shared table is only read: a damaged one is skipped and never written', async () => {
     const box = makeIo()
-    box.files.set(
-      SHARED_PATH,
-      JSON.stringify({ version: 1, groups: { WebSearch: { write: 28_616, context: 90_000, at: 1_000_000 } } }),
-    )
+    box.files.set(SHARED_PATH, '{ not json')
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.ready()
+    expect(session.costlyGroups()).toEqual({})
+
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
+    await session.flush()
+    expect(box.files.get(SHARED_PATH)).toBe('{ not json')
+    expect(session.costlyGroups()).toEqual({ 'mcp__computer-use__*': 202_702 })
+  })
+
+  test('recording a group writes only this session’s file, so another session’s measures stay as they are', async () => {
+    const box = makeIo()
     const first = createSession(DIR, box.io, DEFAULTS)
     await first.ready()
-    // Written after `first` loaded the table: only a fresh read of the file can see it.
+    // Written after `first` loaded: only a read of the directory can see it, and only this session’s file is written by `first`.
     const other = createSession('/other', box.io, DEFAULTS)
     await judgeLoad(other, { input: 0, read: 100_000, write: 0 }, ['WebFetch'], { input: 0, read: 40_000, write: 60_000 })
     await other.flush()
 
-    await judgeLoad(
-      first,
-      { input: 0, read: 234_264, write: 0 },
-      ['mcp__computer-use__screenshot'],
-      { input: 0, read: 50_621, write: 202_702 },
-    )
+    await judgeLoad(first, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
     await first.flush()
-    expect(Object.keys(groupsOf(box)).sort()).toEqual(['WebFetch', 'WebSearch', 'mcp__computer-use__*'])
-    expect(first.costlyGroups()).toEqual({ WebFetch: 60_000, WebSearch: 28_616, 'mcp__computer-use__*': 202_702 })
+    expect(measuresOf(box, 'other')).toEqual({ WebFetch: { write: 60_000, context: 100_000, at: 1_000_000 } })
+    expect(Object.keys(measuresOf(box, 'ctx'))).toEqual(['mcp__computer-use__*'])
   })
 })
 
-describe('the costly table under concurrent writers and failed reads', () => {
-  const SHOT = { input: 0, read: 234_264, write: 0 }
-  const SHOT_AFTER = { input: 0, read: 50_621, write: 202_702 }
-  const LOCK_PATH = `${SHARED_PATH}.lock`
-
-  /** Yields to the other tasks `turns` times, so two sessions can interleave in one process. */
-  const yieldTurns = async (turns: number): Promise<void> => {
-    for (let turn = 0; turn < turns; turn += 1) await Promise.resolve()
-  }
-
-  /** A box with the exclusive-create, rename, remove and sleep an engine could give; reads are slowed so writers overlap. */
-  const lockingBox = () => {
+describe('the cross-session measures under concurrent sessions and failed reads', () => {
+  /** A box whose engine can rename, as a temp file written and renamed over the session file needs. */
+  const renamingBox = () => {
     const box = makeIo()
-    const calls = { renamed: [] as string[], claimed: [] as string[] }
+    const calls = { renamed: [] as string[] }
     const io: Io = {
       ...box.io,
-      read: async path => {
-        await yieldTurns(5)
-
-        return await box.io.read(path)
-      },
-      exists: async path => box.files.has(path),
-      claim: async (path, text) => {
-        await yieldTurns(2)
-        calls.claimed.push(path)
-        if (box.files.has(path)) return false
-        box.files.set(path, text)
-
-        return true
-      },
       rename: async (from, to) => {
         calls.renamed.push(`${from} -> ${to}`)
         const text = box.files.get(from)
@@ -1697,148 +1697,114 @@ describe('the costly table under concurrent writers and failed reads', () => {
       remove: async path => {
         box.files.delete(path)
       },
-      sleep: async () => {
-        await yieldTurns(200)
-      },
     }
 
     return { box, io, calls }
   }
 
-  test('two sessions measuring different groups at the same time both land in the table', async () => {
-    const { box, io } = lockingBox()
-    const first = createSession(DIR, io, DEFAULTS)
-    const second = createSession('/other', io, DEFAULTS)
+  test('two sessions measuring different groups at the same time both land, each in its own file', async () => {
+    const box = makeIo()
+    const first = createSession(DIR, box.io, DEFAULTS)
+    const second = createSession('/other', box.io, DEFAULTS)
     await Promise.all([
-      judgeLoad(first, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER),
+      judgeLoad(first, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER),
       judgeLoad(second, { input: 0, read: 100_000, write: 0 }, ['WebFetch'], { input: 0, read: 40_000, write: 60_000 }),
     ])
     await Promise.all([first.flush(), second.flush()])
 
-    expect(Object.keys(groupsOf(box)).sort()).toEqual(['WebFetch', 'mcp__computer-use__*'])
-    // The lock is released and no temp file is left behind.
-    expect(box.files.has(LOCK_PATH)).toBe(false)
-    expect([...box.files.keys()].filter(path => path.endsWith('.tmp'))).toEqual([])
+    expect(Object.keys(measuresOf(box, 'ctx'))).toEqual(['mcp__computer-use__*'])
+    expect(Object.keys(measuresOf(box, 'other'))).toEqual(['WebFetch'])
+    const reloaded = createSession(DIR, box.io, DEFAULTS)
+    await reloaded.ready()
+    expect(reloaded.costlyGroups()).toEqual({ 'mcp__computer-use__*': 202_702, WebFetch: 60_000 })
   })
 
-  test('the table is written to a temp file and renamed over, never half-written in place', async () => {
-    const { box, io, calls } = lockingBox()
+  test('a session file is written through a temp file renamed over it, and no temp file is left behind', async () => {
+    const { box, io, calls } = renamingBox()
     const session = createSession(DIR, io, DEFAULTS)
-    await judgeLoad(session, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER)
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
+    await session.flush()
 
-    expect(calls.claimed).toEqual([LOCK_PATH])
     expect(calls.renamed).toHaveLength(1)
-    expect(calls.renamed[0]).toMatch(/^\/costly\.json\..+\.tmp -> \/costly\.json$/)
-    expect(groupsOf(box)['mcp__computer-use__*']?.write).toBe(202_702)
+    expect(calls.renamed[0]).toMatch(/^\/costly\/ctx\.json\..+\.tmp -> \/costly\/ctx\.json$/)
+    expect(Object.keys(measuresOf(box, 'ctx'))).toEqual(['mcp__computer-use__*'])
+    expect([...box.files.keys()].some(path => path.endsWith('.tmp'))).toBe(false)
   })
 
-  test('without exclusive create the lock is still taken and released, and two writers both land', async () => {
+  test('a session file that fails to read is not an empty one: it stays as it was, the failure is reported, the measure is not recorded', async () => {
     const box = makeIo()
-    const io: Io = {
+    box.files.set(ownPath('ctx'), JSON.stringify({ version: 1, groups: { WebFetch: { write: 60_000, context: 100_000, at: 999_000 } } }))
+    const original = box.files.get(ownPath('ctx'))
+    const reported: string[] = []
+    const failing: Io = {
       ...box.io,
       read: async path => {
-        await yieldTurns(5)
+        if (path === ownPath('ctx')) throw new Error('EBUSY: resource busy or locked')
 
-        return await box.io.read(path)
+        return box.io.read(path)
       },
-      sleep: async () => {
-        await yieldTurns(200)
-      },
+      exists: async () => true,
+      onWriteError: path => reported.push(path),
     }
-    const first = createSession(DIR, io, DEFAULTS)
-    const second = createSession('/other', io, DEFAULTS)
-    await Promise.all([
-      judgeLoad(first, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER),
-      judgeLoad(second, { input: 0, read: 100_000, write: 0 }, ['WebFetch'], { input: 0, read: 40_000, write: 60_000 }),
-    ])
+    const session = createSession(DIR, failing, DEFAULTS)
+    await session.ready()
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
+    await session.flush()
 
-    expect(Object.keys(groupsOf(box)).sort()).toEqual(['WebFetch', 'mcp__computer-use__*'])
-    // Released: empty text, which counts as no lock.
-    expect(box.files.get(LOCK_PATH) ?? '').toBe('')
+    expect(box.files.get(ownPath('ctx'))).toBe(original)
+    expect(reported).toContain(ownPath('ctx'))
+    // The session still counts its own measure; the file simply does not carry it.
+    expect(session.costlyGroups()).toEqual({ 'mcp__computer-use__*': 202_702 })
   })
 
-  test('a read that fails is not an empty table: the file stays as it was, the failure is reported, the switch is not blocked', async () => {
+  test('a read that fails and that the engine says is a missing file is written as a new file', async () => {
     const box = makeIo()
-    const original = JSON.stringify({ version: 1, groups: { WebSearch: { write: 28_616, context: 90_000, at: 1_000_000 } } })
-    box.files.set(SHARED_PATH, original)
+    const failing: Io = {
+      ...box.io,
+      read: async () => {
+        throw new Error('ENOENT: no such file')
+      },
+      exists: async () => false,
+    }
+    const session = createSession(DIR, failing, DEFAULTS)
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
+    await session.flush()
+
+    expect(box.files.get(ownPath('ctx'))).toContain('mcp__computer-use__*')
+  })
+
+  test('a session writes without any lock file, so it never waits on another session', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
+    await session.flush()
+
+    expect([...box.files.keys()].filter(path => path.includes('.lock'))).toEqual([])
+  })
+
+  test('a write that fails after the temp file is written leaves the session file alone, and the temp file is removed', async () => {
+    const box = makeIo()
+    const original = JSON.stringify({ version: 1, groups: { WebFetch: { write: 60_000, context: 100_000, at: 999_000 } } })
+    box.files.set(ownPath('ctx'), original)
     const reported: string[] = []
     const io: Io = {
       ...box.io,
-      read: async path => {
-        if (path === SHARED_PATH) throw new Error('EBUSY: resource busy or locked')
-
-        return await box.io.read(path)
+      rename: async () => {
+        throw new Error('EPERM: operation not permitted')
+      },
+      remove: async path => {
+        box.files.delete(path)
       },
       onWriteError: path => reported.push(path),
     }
     const session = createSession(DIR, io, DEFAULTS)
-    await judgeLoad(session, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER)
+    await session.ready()
+    await judgeLoad(session, COMPUTER_READ, ['mcp__computer-use__screenshot'], COMPUTER_AFTER)
     await session.flush()
 
-    expect(box.files.get(SHARED_PATH)).toBe(original)
-    expect(reported).toContain(SHARED_PATH)
-    expect(session.unsaved()).toEqual([])
-    expect(readMeta(box).costlyLoads).toEqual({ 'mcp__computer-use__*': 202_702 })
-  })
-
-  test('a failed read is told from a missing file by exists when the engine gives it', async () => {
-    const { box, io } = lockingBox()
-    const session = createSession(DIR, io, DEFAULTS)
-    // The file is absent and read says only "failed": exists settles it as absent, so the table is created.
-    const odd: Io = {
-      ...io,
-      read: async path => {
-        if (path === SHARED_PATH) throw new Error('unreadable')
-
-        return await io.read(path)
-      },
-    }
-    const other = createSession(DIR, odd, DEFAULTS)
-    await judgeLoad(other, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER)
-    expect(groupsOf(box)['mcp__computer-use__*']?.write).toBe(202_702)
-    expect(session.unsaved()).toEqual([])
-  })
-
-  test('a lock held by someone else makes this writer give up without touching the table', async () => {
-    const { box, io } = lockingBox()
-    box.files.set(LOCK_PATH, JSON.stringify({ token: 'other', at: 1_000_000 }))
-    const reported: string[] = []
-    const session = createSession(DIR, { ...io, onWriteError: path => reported.push(path) }, DEFAULTS)
-    await judgeLoad(session, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER)
-
-    expect(box.files.has(SHARED_PATH)).toBe(false)
-    // Someone else's lock is not ours to remove.
-    expect(box.files.get(LOCK_PATH)).toBe(JSON.stringify({ token: 'other', at: 1_000_000 }))
-    expect(reported).toContain(SHARED_PATH)
-    expect(readMeta(box).costlyLoads).toEqual({ 'mcp__computer-use__*': 202_702 })
-  })
-
-  test('a lock left by a dead holder is cleared once it is stale, and the write goes through', async () => {
-    const { box, io } = lockingBox()
-    box.files.set(LOCK_PATH, JSON.stringify({ token: 'dead', at: 1_000_000 - 60_000 }))
-    const session = createSession(DIR, io, DEFAULTS)
-    await judgeLoad(session, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER)
-
-    expect(groupsOf(box)['mcp__computer-use__*']?.write).toBe(202_702)
-    expect(box.files.has(LOCK_PATH)).toBe(false)
-  })
-
-  test('a write that fails after the lock is taken still releases the lock and leaves the table alone', async () => {
-    const { box, io } = lockingBox()
-    const original = JSON.stringify({ version: 1, groups: { WebSearch: { write: 28_616, context: 90_000, at: 1_000_000 } } })
-    box.files.set(SHARED_PATH, original)
-    const failing: Io = {
-      ...io,
-      rename: async () => {
-        throw new Error('EPERM')
-      },
-    }
-    const session = createSession(DIR, failing, DEFAULTS)
-    await judgeLoad(session, SHOT, ['mcp__computer-use__screenshot'], SHOT_AFTER)
-
-    expect(box.files.get(SHARED_PATH)).toBe(original)
-    expect(box.files.has(LOCK_PATH)).toBe(false)
-    expect([...box.files.keys()].filter(path => path.endsWith('.tmp'))).toEqual([])
+    expect(box.files.get(ownPath('ctx'))).toBe(original)
+    expect([...box.files.keys()].some(path => path.endsWith('.tmp'))).toBe(false)
+    expect(reported).toContain(ownPath('ctx'))
   })
 })
 
@@ -2003,8 +1969,8 @@ describe('writes that fail', () => {
     expect(box.files.size).toBe(0)
   })
 
-  test('the cross-session table failing to write is reported but is not one of the session files', async () => {
-    const { control, io } = flaky(path => path === '/costly.json')
+  test('the cross-session file failing to write is reported but is not one of the session files', async () => {
+    const { control, io } = flaky(path => path === '/costly/ctx.json')
     const session = createSession(DIR, io, DEFAULTS)
     await session.noteStep({ input: 6, read: 150_000, write: 0 })
     await session.record({
@@ -2017,7 +1983,7 @@ describe('writes that fail', () => {
     await session.noteStep({ input: 6, read: 50_714, write: 117_386 })
     await session.flush()
 
-    expect(control.reported).toContain('/costly.json')
+    expect(control.reported).toContain('/costly/ctx.json')
     // The table is not what a new window is rebuilt from, so it never blocks a switch.
     expect(session.unsaved()).toEqual([])
   })

@@ -101,6 +101,8 @@ const reasonOf = (
   return `每次请求省约 ${saving} token 当量，切换一次约 ${cost}，需 ${breakEvenRequests.toFixed(1)} 次请求回本（含 ${config.breakEvenSafety} 倍余量为 ${(breakEvenRequests * config.breakEvenSafety).toFixed(1)} 次），剩余 ${input.remainingRequests} 次不够。`
 }
 
+const FIVE_MINUTES_SEC = 300
+
 /**
  * Whether the cached prefix is certainly gone: an explicit expiry settles it,
  * and otherwise the last request decides — an unknown last request counts as
@@ -114,8 +116,10 @@ export const isCold = (
     return input.now >= input.cache.expiresAt
   }
   if (input.lastRequestAt === null) return false
+  // A cache that says it lives five minutes (overage) must not be held to the hour.
+  const lifetimeSec = input.cache?.ttl === '5m' ? FIVE_MINUTES_SEC : config.cacheTtlSec
 
-  return input.now - input.lastRequestAt >= config.cacheTtlSec * 1000
+  return input.now - input.lastRequestAt >= lifetimeSec * 1000
 }
 
 export type Gate = { isAllowed: true } | { isAllowed: false; reason: string }
