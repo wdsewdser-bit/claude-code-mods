@@ -1,0 +1,95 @@
+import type { On } from 'claude-code'
+import { expect, mock, test } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
+
+type World = { files: Map<string, string>; coreCompactions: number; clock: MockClock }
+
+const world = (on: On): World => {
+  const w: World = {
+    files: new Map(),
+    coreCompactions: 0,
+    clock: mock.clock(on, { now: Date.parse('2026-10-10T00:00:00.000Z') }),
+  }
+  mock.env(on, { USERPROFILE: 'C:\\Users\\someone' })
+  on('fs.write', (_$, e) => {
+    w.files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.read', (_$, e) => ({ deny: `ENOENT: ${e.path}` }))
+  on('session.id', () => ({ value: 'aaaaaaaa-1111' }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 1_000_000, tokens: 120_000 }, rateLimits: [] },
+  }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('tool.register', (_$, e) => ({ value: { tool: e.name } }) as never)
+  on('ui.log', () => ({ value: undefined }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('session.compact', () => {
+    w.coreCompactions += 1
+    return { messages: [{ role: 'user', text: 'a summary', toolUses: [] }] }
+  })
+
+  return w
+}
+
+const run = async ($: Engine, args: string): Promise<string> => {
+  const ran = await $.command.run({
+    command: 'ctx-probe',
+    args,
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 100 },
+  } as never)
+
+  return ran.text ?? ''
+}
+
+const logged = (w: World): Record<string, unknown>[] =>
+  [...w.files.values()].flatMap(text =>
+    text
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line) as Record<string, unknown>),
+  )
+
+test('acts on nothing until armed: a compaction passes through to core', { options: { probe: true } }, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/work', surface: null, isInteractive: true })
+  const result = await $.session.compact({} as never)
+  expect(w.coreCompactions).toBe(1)
+  expect('messages' in result && result.messages?.[0]?.text).toBe('a summary')
+})
+
+const compactions = (w: World): Record<string, unknown>[] =>
+  logged(w).filter(row => row.test === 'compact')
+
+test('a compaction asked from a timer after the command goes through core and is logged', { options: { probe: true } }, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/work', surface: null, isInteractive: true })
+  expect(await run($, 'compact summary')).toContain('300 ms')
+  await w.clock.advance(400)
+  expect(compactions(w)).toHaveLength(1)
+  expect(compactions(w)[0]).toMatchObject({ where: 'timer after command.run', isZero: false })
+  expect([...w.files.keys()][0]).toMatch(/ctx-mod[\\/]probe-aaaaaaaa-1111\.jsonl$/)
+})
+
+test('armed for the turn end, it tries there and says how the engine answered', { options: { probe: true } }, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/work', surface: null, isInteractive: true })
+  await run($, 'arm turn-end zero')
+  await $.turn.complete({
+    answer: 'OK',
+    durationMs: 1,
+    isAborted: false,
+    turnId: 't1',
+    reason: 'answer',
+  })
+  await w.clock.advance(400)
+  const rows = compactions(w)
+  expect(rows[0]).toMatchObject({ where: 'turn.complete after next', isZero: true })
+  // A zero-summary compaction is answered by this mod or by core, never both.
+  const stood = rows.find(row => row.outcome === 'resolved')
+  if (stood !== undefined) {
+    expect(w.coreCompactions).toBe(stood.ownHookRan === true ? 0 : 1)
+  }
+})

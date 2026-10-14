@@ -1,0 +1,559 @@
+import type { EngineInterface, Register, SessionCompactResult } from 'claude-code'
+
+// Phase 0 of proactive-context-plan-v2.md: nothing here acts unless /ctx-probe
+// arms it. Every observation is one JSON line in the probe log.
+
+const COMMAND = 'ctx-probe'
+const TOOL = 'ctx_probe_ping'
+const TOOL_FULL = 'mcp__ctx-mod__ctx_probe_ping'
+const KEEPER_CACHE = { plugin: 'cache-keeper', key: 'cache' } as const
+const HANDOFF =
+  'ctx-probe: this message stands in for the whole earlier conversation (a zero-summary window switch test). Reply with the words HANDOFF-SEEN and nothing else.'
+const MARKER =
+  'ctx-probe marker appended mid-turn. Include the word MARKER-SEEN in your next message.'
+
+type Armed = {
+  /** The next compaction of the main conversation is answered here, without core. */
+  zero: boolean
+  compactAtTurnEnd: boolean
+  commandAtTurnEnd: boolean
+  /** The whole switch: /compact answered here, then a prompt so the model carries on. */
+  switchAtTurnEnd: boolean
+  commandAtSubmit: boolean
+  /** Hold the next prompt back, compact, then submit it again as the user's. */
+  dropAtSubmit: boolean
+  /** The next automatic compaction of the main conversation is answered here. */
+  zeroAuto: boolean
+  compactAtSubmit: boolean
+  appendAtToolCall: boolean
+  /** Main-thread tool calls still to log the context fill after. */
+  watch: number
+}
+
+let armed: Armed
+let lines: string[]
+let logPath: string | undefined
+let writing: Promise<void>
+let compactHookSeen: boolean
+
+const messageOf = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error)
+
+const attempt = async <T>(run: () => Promise<T>, fallback: T): Promise<T> => {
+  try {
+    return await run()
+  } catch {
+    return fallback
+  }
+}
+
+const homeOf = async ($: EngineInterface): Promise<string | undefined> =>
+  (await attempt(() => $.env.get('USERPROFILE'), undefined)) ??
+  (await attempt(() => $.env.get('HOME'), undefined))
+
+const pathOf = async ($: EngineInterface): Promise<string> => {
+  if (logPath !== undefined) return logPath
+  const home = (await homeOf($))?.replace(/[\\/]+$/, '')
+  const id = await attempt(() => $.session.id(), 'unknown')
+  const dir = home === undefined ? '.ctx-mod' : `${home}/.claude/ctx-mod`
+  logPath = `${dir}/probe-${id}.jsonl`
+  const held = await attempt(() => $.fs.read(logPath ?? ''), '')
+  if (lines.length === 0 && held !== '') lines = held.split('\n').filter(Boolean)
+
+  return logPath
+}
+
+const log = async (
+  $: EngineInterface,
+  test: string,
+  fields: Record<string, unknown>,
+): Promise<void> => {
+  const path = await pathOf($)
+  const at = new Date(await attempt(() => $.clock.now(), 0)).toISOString()
+  lines.push(JSON.stringify({ at, test, ...fields }))
+  // $.fs.write replaces the file: one write at a time, each the whole log.
+  writing = writing
+    .then(() => $.fs.write(path, `${lines.join('\n')}\n`))
+    .catch(error => $.ui.log(`probe log not written: ${messageOf(error)}`, { to: 'debug' }))
+  await writing
+}
+
+const fillOf = async ($: EngineInterface): Promise<number | null> =>
+  (await attempt(() => $.session.usage(), undefined))?.context.tokens ?? null
+
+const summaryOf = (result: SessionCompactResult): Record<string, unknown> =>
+  'skip' in result && result.skip !== undefined
+    ? { skip: result.skip }
+    : {
+        messages: result.messages?.length ?? 0,
+        tokensBefore: result.tokensBefore ?? null,
+        tokensAfter: result.tokensAfter ?? null,
+        hadSummarizerRequest: result.usage !== undefined,
+        heads: (result.messages ?? [])
+          .slice(0, 6)
+          .map(message => `${message.role}: ${message.text.slice(0, 80)}`),
+      }
+
+/** One `$.session.compact` from `where`, logged whether it stood or was refused. */
+const tryCompact = async (
+  $: EngineInterface,
+  where: string,
+  isZero: boolean,
+): Promise<string> => {
+  armed.zero = isZero
+  compactHookSeen = false
+  const before = await fillOf($)
+  try {
+    const result = await $.session.compact(
+      isZero ? undefined : { instructions: 'ctx-probe: keep it to one sentence.' },
+    )
+    const fields = {
+      where,
+      isZero,
+      outcome: 'resolved',
+      ownHookRan: compactHookSeen,
+      fillBefore: before,
+      fillAfter: await fillOf($),
+      ...summaryOf(result),
+    }
+    await log($, 'compact', fields)
+
+    return JSON.stringify(fields, null, 2)
+  } catch (error) {
+    await log($, 'compact', { where, isZero, outcome: 'rejected', error: messageOf(error) })
+
+    return `rejected: ${messageOf(error)}`
+  } finally {
+    armed.zero = false
+  }
+}
+
+/** One `/compact` run as a command from `where`, logged whether it ran or was refused. */
+const tryCommand = async ($: EngineInterface, where: string): Promise<boolean> => {
+  compactHookSeen = false
+  const before = await fillOf($)
+  try {
+    const ran = await $.command.run({ command: 'compact' })
+    await log($, 'cmd-compact', {
+      where,
+      outcome: 'resolved',
+      ownHookRan: compactHookSeen,
+      fillBefore: before,
+      fillAfter: await fillOf($),
+      text: (ran.text ?? '').slice(0, 200),
+    })
+
+    return true
+  } catch (error) {
+    await log($, 'cmd-compact', { where, outcome: 'rejected', error: messageOf(error) })
+
+    return false
+  }
+}
+
+const HELP = [
+  'Usage: /ctx-probe <test>',
+  '  usage              T6   compaction window, auto-compact threshold, fill',
+  '  fs                 T11  whether $.fs expands ~',
+  '  keeper             T16  cache-keeper state as another mod reads it',
+  '  submit [user]      T12  $.prompt.submit, framed or as the user',
+  '  compact zero       T1/T4  compact from a timer; this mod answers with one handoff message',
+  '  compact summary    T1   compact from a timer through core, with instructions',
+  '  arm turn-end [zero]  T2  compact inside the next turn.complete, then 300 ms later',
+  '  arm submit [zero]    T3  compact inside the next prompt.submit, before it enters',
+  '  cmd-compact [zero]   run /compact as a command from a timer (headless and desktop sessions)',
+  '  arm turn-end-cmd [zero]  the same, inside the next turn.complete',
+  '  arm zero           answer the next manual or plugin compaction here, whoever asks',
+  '  arm append         T8  append a user row after the next main tool call',
+  '  watch [n]          T7   log the context fill after the next n main tool calls',
+  '  log [n]            the last n lines of the probe log (default 30)',
+  'Always logged: session.start/end, classic.SessionStart (T10), prompt origins,',
+  'compactions and their boundary rows (T17), model.fork (T15, T18), ping tool calls (T9).',
+].join('\n')
+
+const runCommand = async ($: EngineInterface, args: string): Promise<string> => {
+  const [sub, ...words] = args.trim().split(/\s+/)
+  if (sub === 'usage') {
+    const usage = await $.session.usage({ breakdown: 'summary' })
+    const b = usage.context.breakdown
+    const fields = {
+      model: await attempt(() => $.session.model(), 'unknown'),
+      window: usage.context.window,
+      tokens: usage.context.tokens ?? null,
+      percent: usage.context.percent ?? null,
+      rawMaxTokens: b?.rawMaxTokens ?? null,
+      autocompactSource: b?.autocompactSource ?? null,
+      autoCompactThreshold: b?.autoCompactThreshold ?? null,
+      isAutoCompactEnabled: b?.isAutoCompactEnabled ?? null,
+      breakdownTotal: b?.totalTokens ?? null,
+      envWindow: await attempt(() => $.env.get('CLAUDE_CODE_AUTO_COMPACT_WINDOW'), undefined),
+      rateLimits: usage.rateLimits.map(limit => `${limit.kind} ${limit.percentUsed}%`),
+    }
+    await log($, 'usage', fields)
+
+    return JSON.stringify(fields, null, 2)
+  }
+  if (sub === 'fs') {
+    const home = (await homeOf($))?.replace(/[\\/]+$/, '')
+    const wrote = await attempt(
+      async () => (await $.fs.write('~/.claude/ctx-mod/tilde-test.txt', 'x'), 'written'),
+      'rejected',
+    )
+    const isUnderHome =
+      home !== undefined && (await attempt(() => $.fs.exists(`${home}/.claude/ctx-mod/tilde-test.txt`), false))
+    const fields = { home: home ?? null, tildeWrite: wrote, landedUnderHome: isUnderHome }
+    await log($, 'fs', fields)
+
+    return JSON.stringify(fields, null, 2)
+  }
+  if (sub === 'keeper') {
+    const held = await attempt(() => $.state.get(KEEPER_CACHE), undefined)
+    const now = await $.clock.now()
+    const fields = {
+      readable: held !== undefined,
+      version: held?.version ?? null,
+      value: held?.value ?? null,
+      msToExpiry:
+        held?.value?.expiresAt === null || held?.value?.expiresAt === undefined
+          ? null
+          : held.value.expiresAt - now,
+    }
+    await log($, 'keeper', fields)
+
+    return JSON.stringify(fields, null, 2)
+  }
+  if (sub === 'submit') {
+    const isUser = words[0] === 'user'
+    const text = 'ctx-probe submit test. Reply with OK only.'
+    // The engine refuses a submit made inside command.run: a timer makes it.
+    $.clock.after(300, () => {
+      void $.prompt
+        .submit(isUser ? { text, asUser: true } : { text })
+        .then(result => log($, 'submit', { isUser, result }))
+        .catch(error => log($, 'submit', { isUser, error: messageOf(error) }))
+    })
+
+    return `submitting ${isUser ? 'as the user' : 'framed'} in 300 ms; see how the transcript shows it, then /ctx-probe log`
+  }
+  if (sub === 'compact') {
+    if (words[0] !== 'zero' && words[0] !== 'summary') return HELP
+
+    // The engine refuses a compaction asked for inside command.run (it would
+    // compact under the turn the hook holds), so a timer asks once it returned.
+    const isZero = words[0] === 'zero'
+    $.clock.after(300, () => void tryCompact($, 'timer after command.run', isZero))
+
+    return 'compacting in 300 ms; then /ctx-probe log'
+  }
+  if (sub === 'cmd-compact') {
+    // $.session.compact is refused in a headless or desktop session: there a
+    // compaction is a /compact turn, which a mod asks for as a command.
+    armed.zero = words[0] === 'zero'
+    $.clock.after(300, () => void tryCommand($, 'timer after command.run'))
+
+    return 'running /compact as a command in 300 ms; then /ctx-probe log'
+  }
+  if (sub === 'arm') {
+    const isZero = words[1] === 'zero'
+    if (words[0] === 'turn-end') armed.compactAtTurnEnd = true
+    else if (words[0] === 'turn-end-cmd') armed.commandAtTurnEnd = true
+    else if (words[0] === 'turn-end-switch') {
+      armed.switchAtTurnEnd = true
+      armed.zero = true
+
+      return 'armed: /compact answered here when the next turn ends, then a prompt to carry on'
+    } else if (words[0] === 'submit-cmd') armed.commandAtSubmit = true
+    else if (words[0] === 'submit-drop') armed.dropAtSubmit = true
+    else if (words[0] === 'zero-auto') {
+      armed.zeroAuto = true
+
+      return 'armed: the next automatic compaction is answered here'
+    }
+    else if (words[0] === 'submit') armed.compactAtSubmit = true
+    else if (words[0] === 'append') armed.appendAtToolCall = true
+    else if (words[0] === 'zero') {
+      // Another mod asks for the compaction; this one only answers it.
+      armed.zero = true
+
+      return 'armed: the next plugin-triggered compaction is answered here'
+    } else return HELP
+    armed.zero = isZero
+
+    return `armed: ${words[0]}${isZero ? ' (zero-summary)' : ''}`
+  }
+  if (sub === 'watch') {
+    armed.watch = Number(words[0]) > 0 ? Number(words[0]) : 20
+
+    return `logging the context fill after the next ${armed.watch} main tool calls`
+  }
+  if (sub === 'log') {
+    await pathOf($)
+    const count = Number(words[0]) > 0 ? Number(words[0]) : 30
+
+    return [`${logPath} (${lines.length} lines)`, ...lines.slice(-count)].join('\n')
+  }
+
+  return HELP
+}
+
+export const probeHooks: Register = on => {
+  armed = {
+    zero: false,
+    compactAtTurnEnd: false,
+    commandAtTurnEnd: false,
+    switchAtTurnEnd: false,
+    commandAtSubmit: false,
+    dropAtSubmit: false,
+    zeroAuto: false,
+    compactAtSubmit: false,
+    appendAtToolCall: false,
+    watch: 0,
+  }
+  lines = []
+  logPath = undefined
+  writing = Promise.resolve()
+  compactHookSeen = false
+
+  on('session.start', async ($, e, next) => {
+    try {
+      await $.command.register({
+        name: COMMAND,
+        description: 'ctx-mod phase 0: probes of the Mods API',
+        argumentHint: 'usage|fs|keeper|submit|compact|arm|watch|log',
+      })
+      await $.tool.register({
+        name: TOOL,
+        description:
+          'A test tool of the ctx-mod plugin. Call it only when asked to by name; it answers who called it.',
+        inputSchema: { type: 'object', properties: {} },
+        isDeferred: false,
+      })
+      await log($, 'session.start', { isInteractive: e.isInteractive, surface: e.surface })
+    } catch (error) {
+      $.ui.log(`ctx-probe: ${messageOf(error)}`, { to: 'debug' })
+    }
+
+    return next(e)
+  })
+
+  on('command.run', { command: COMMAND }, async ($, e) => {
+    try {
+      return { text: await runCommand($, e.args) }
+    } catch (error) {
+      return { text: `ctx-probe: ${messageOf(error)}` }
+    }
+  })
+
+  on('tool.call', { tool: TOOL_FULL }, async ($, e) => {
+    const caller = e.agentId === undefined ? 'the main conversation' : `subagent ${e.agentId}`
+    await attempt(() => log($, 'tool.ping', { agentId: e.agentId ?? null }), undefined)
+
+    return { result: `ctx_probe_ping: called from ${caller}` }
+  })
+
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      if (e.agentId === undefined && String(e.tool) !== TOOL_FULL) {
+        if (armed.watch > 0) {
+          armed.watch -= 1
+          await log($, 'tool.fill', { tool: String(e.tool), fill: await fillOf($) })
+        }
+        if (armed.appendAtToolCall) {
+          armed.appendAtToolCall = false
+          const stored = await $.session.append({
+            message: { type: 'user', content: [{ type: 'text', text: MARKER }] },
+          })
+          await log($, 'append', {
+            after: String(e.tool),
+            deny: stored.deny ?? null,
+            uuid: stored.uuid ?? null,
+          })
+        }
+      }
+    } catch (error) {
+      await attempt(() => log($, 'tool.error', { error: messageOf(error) }), undefined)
+    }
+
+    return result
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    try {
+      await log($, 'prompt.submit', {
+        origin: e.origin,
+        sessionId: await attempt(() => $.session.id(), 'unknown'),
+        head: e.text.slice(0, 60),
+      })
+      const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'sdk'
+      if (armed.compactAtSubmit && isPerson) {
+        armed.compactAtSubmit = false
+        await tryCompact($, 'prompt.submit before next', armed.zero)
+      }
+      if (armed.commandAtSubmit && isPerson) {
+        armed.commandAtSubmit = false
+        await tryCommand($, 'prompt.submit before next')
+      }
+      if (armed.dropAtSubmit && isPerson) {
+        armed.dropAtSubmit = false
+        const held = e.text
+        $.clock.after(300, () => {
+          void tryCommand($, 'timer after a dropped prompt')
+            .then(() => $.prompt.submit({ text: held, asUser: true }))
+            .then(result => log($, 'resubmit', { result }))
+            .catch(error => log($, 'resubmit', { error: messageOf(error) }))
+        })
+
+        return { drop: 'ctx-probe: switching the window before this prompt' }
+      }
+    } catch (error) {
+      await attempt(() => log($, 'submit.error', { error: messageOf(error) }), undefined)
+    }
+
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      if (e.agentId === undefined && armed.switchAtTurnEnd) {
+        armed.switchAtTurnEnd = false
+        await tryCommand($, 'switch at turn.complete')
+        const sent = await attempt(
+          async () =>
+            JSON.stringify(
+              await $.prompt.submit({
+                text: 'ctx-probe: carry on. Reply with the words HANDOFF-CONTINUED and nothing else.',
+              }),
+            ),
+          'rejected inside turn.complete',
+        )
+        await log($, 'switch.continue', { sent })
+        if (sent.startsWith('rejected')) {
+          $.clock.after(300, () => {
+            void $.prompt
+              .submit({
+                text: 'ctx-probe: carry on. Reply with the words HANDOFF-CONTINUED and nothing else.',
+              })
+              .then(result => log($, 'switch.continue', { where: 'timer', result }))
+              .catch(error => log($, 'switch.continue', { where: 'timer', error: messageOf(error) }))
+          })
+        }
+      }
+      if (e.agentId === undefined && armed.commandAtTurnEnd) {
+        armed.commandAtTurnEnd = false
+        if (!(await tryCommand($, 'turn.complete after next'))) {
+          $.clock.after(300, () => void tryCommand($, 'turn.complete + 300 ms'))
+        }
+      }
+      if (e.agentId === undefined && armed.compactAtTurnEnd) {
+        armed.compactAtTurnEnd = false
+        const isZero = armed.zero
+        const inside = await tryCompact($, 'turn.complete after next', isZero)
+        if (inside.startsWith('rejected')) {
+          $.clock.after(300, () => void tryCompact($, 'turn.complete + 300 ms', isZero))
+        }
+      }
+    } catch (error) {
+      await attempt(() => log($, 'turn.error', { error: messageOf(error) }), undefined)
+    }
+
+    return result
+  })
+
+  on('session.compact', async ($, e, next) => {
+    const isMain = e.agentId === undefined
+    const seen = {
+      trigger: e.trigger,
+      agentId: e.agentId ?? null,
+      messages: e.messages.length,
+      withHandle: e.messages.filter(message => message.handle !== undefined).length,
+      instructions: e.instructions ?? null,
+    }
+    if (isMain && e.trigger !== 'precompute') compactHookSeen = true
+    const isAsked = armed.zero && (e.trigger === 'plugin' || e.trigger === 'manual')
+    if (isMain && (isAsked || (armed.zeroAuto && e.trigger === 'auto'))) {
+      if (e.trigger === 'auto') armed.zeroAuto = false
+      else armed.zero = false
+      await attempt(() => log($, 'session.compact', { ...seen, answeredHere: true }), undefined)
+
+      return { messages: [{ role: 'user', text: HANDOFF, toolUses: [] }] }
+    }
+    const result = await next(e)
+    await attempt(
+      () => log($, 'session.compact', { ...seen, answeredHere: false, ...summaryOf(result) }),
+      undefined,
+    )
+
+    return result
+  })
+
+  on('session.append', async ($, e, next) => {
+    try {
+      const isPluginPrompt = e.door === 'prompt' && e.origin.kind === 'plugin'
+      if (e.door === 'compaction' || e.door === 'note' || isPluginPrompt) {
+        await log($, 'session.append', {
+          door: e.door,
+          origin: e.origin,
+          agentId: e.agentId ?? null,
+          type: e.message.type,
+          name: e.message.name ?? null,
+          isMeta: e.message.isMeta ?? false,
+          head: e.message.content
+            .map(block => (typeof block.text === 'string' ? block.text.slice(0, 160) : `[${block.type}]`))
+            .join(' | '),
+        })
+      }
+    } catch (error) {
+      $.ui.log(`ctx-probe: ${messageOf(error)}`, { to: 'debug' })
+    }
+
+    return next(e)
+  })
+
+  on('model.fork', async ($, e, next) => {
+    const before = await fillOf($)
+    const result = await next(e)
+    await attempt(
+      async () =>
+        log($, 'model.fork', {
+          prompt: e.prompt.slice(0, 60),
+          fillBefore: before,
+          fillAfter: await fillOf($),
+          result: JSON.stringify(result).slice(0, 300),
+          keeper: (await attempt(() => $.state.get(KEEPER_CACHE), undefined))?.value ?? null,
+        }),
+      undefined,
+    )
+
+    return result
+  })
+
+  on('classic.SessionStart', async ($, e, next) => {
+    await attempt(
+      async () =>
+        log($, 'classic.SessionStart', {
+          source: e.source,
+          sessionId: await attempt(() => $.session.id(), 'unknown'),
+          secondsSinceLastResponse: e.seconds_since_last_response ?? null,
+          contextTokens: e.context_tokens ?? null,
+          cacheLikelyExpired: e.prompt_cache_likely_expired ?? null,
+        }),
+      undefined,
+    )
+
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    await attempt(
+      () => log($, 'session.end', { reason: e.reason, sessionId: e.sessionId }),
+      undefined,
+    )
+    // After a /clear or a resume the process goes on under another id: another log.
+    logPath = undefined
+    lines = []
+
+    return next(e)
+  })
+}
