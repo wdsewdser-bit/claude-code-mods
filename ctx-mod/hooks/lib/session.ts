@@ -46,7 +46,7 @@ import { activityOf, filesOf, locate, pathKey, pathsToRead, relativePath, render
 import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
-import { describeFill, gateSwitch, judgeSwitch, levelOf, percentOf } from './usage.ts'
+import { describeFill, gateSwitch, isCold, judgeSwitch, levelOf, percentOf } from './usage.ts'
 
 export type Io = {
   read: (path: string) => Promise<string>
@@ -54,27 +54,19 @@ export type Io = {
   now: () => number
   /** Told about every failed write, so the caller can log what the queue would otherwise swallow. */
   onWriteError?: (path: string, error: unknown) => void
-  /**
-   * The optional file operations the cross-session table (costly.json) can use to be written
-   * safely. Each is a no-op fallback when left out: without `claim` the lock is a weaker
-   * write-and-read-back check, without `rename` the table is written in place, without
-   * `exists` a failed read is told from a missing file by its error text.
-   */
   /** Whether the path exists; lets a failed read be told from an absent file. */
   exists?: (path: string) => Promise<boolean>
-  /** Creates the file only if it is absent (like open 'wx'): true when this call created it. */
-  claim?: (path: string, text: string) => Promise<boolean>
-  /** Moves `from` over `to` in one step. */
+  /** Moves `from` over `to` in one step; without it a file is written in place. */
   rename?: (from: string, to: string) => Promise<void>
   /** Deletes the file; a missing file is not an error. */
   remove?: (path: string) => Promise<void>
+  /** The names of the files in a directory; without it only the older shared table is read. */
+  list?: (path: string) => Promise<readonly string[]>
   /**
    * The session's working directory. Only the handoff text uses it, to show paths inside it
    * relative to it; what is stored on disk keeps the absolute paths. Left out, paths stay as they are.
    */
   cwd?: () => string | undefined | Promise<string | undefined>
-  /** Waits roughly `ms` milliseconds; without it a real timer is used when there is one. */
-  sleep?: (ms: number) => Promise<void>
 }
 
 export type Env = {
@@ -231,6 +223,8 @@ const PENDING_MS = 120_000
 
 /** The cross-session table's file name; it sits beside the sessions' own directories. */
 const COSTLY_FILE = 'costly.json'
+/** The directory of the sessions' own cross-session files; each session writes only its own. */
+const SHARED_DIR = 'costly'
 
 /** The held-back user messages, kept in the session's directory until they are delivered. */
 const HELD_FILE = 'held.json'
@@ -499,15 +493,21 @@ const costlyFrom = (value: unknown): Record<string, number> => {
 /** One group's measure as the cross-session table holds it; a hand-written entry may leave `context` out. */
 type SharedCost = { write: number; context?: number; at: number }
 
-/**
- * Where the cross-session table lives: one level above this session's directory, so every
- * session under the same mod directory reads and writes one file. A root with no slash has
- * no parent to hold it, and then there is no table at all.
- */
-const sharedPath = (root: string): string | null => {
-  const cut = root.lastIndexOf('/')
+/** Where the cross-session measures are: the older shared table, and each session's own file under one directory. */
+type SharedPaths = { legacy: string; own: string; shards: string }
 
-  return cut < 0 ? null : `${root.slice(0, cut)}/${COSTLY_FILE}`
+/**
+ * The paths of the cross-session measures: one level above this session's directory, so every
+ * session under the same mod directory reads the same measures. Each session only ever writes its
+ * own file, so no two writers share one. A root with no slash has no parent, and then there are none.
+ */
+const sharedPathsOf = (root: string): SharedPaths | null => {
+  const cut = root.lastIndexOf('/')
+  if (cut < 0) return null
+  const dir = root.slice(0, cut)
+  const shards = `${dir}/${SHARED_DIR}`
+
+  return { legacy: `${dir}/${COSTLY_FILE}`, own: `${shards}/${root.slice(cut + 1)}.json`, shards }
 }
 
 /**
@@ -541,12 +541,73 @@ const sharedFrom = (text: string | null, now: number): Record<string, SharedCost
   return table
 }
 
-/** The table as the file holds it: the version the format is read by. */
-/** The lock file sits beside the table; a holder that died leaves it, so it goes stale. */
-const SHARED_LOCK_SUFFIX = '.lock'
-const SHARED_LOCK_STALE_MS = 10_000
-const SHARED_LOCK_TRIES = 8
-const SHARED_LOCK_PAUSE_MS = 40
+/**
+ * The table as the file holds it, or null when it is there but cannot be trusted: unreadable is
+ * not the same as empty, and a file that cannot be trusted is never written over.
+ */
+const tableOf = (text: string | null | undefined, now: number): Record<string, SharedCost> | null => {
+  if (text === null) return {}
+  if (text === undefined) return null
+  try {
+    const parsed: unknown = JSON.parse(text)
+    const groups = typeof parsed === 'object' && parsed !== null ? (parsed as { groups?: unknown }).groups : undefined
+    if (typeof groups !== 'object' || groups === null || Array.isArray(groups)) return null
+  } catch {
+    return null
+  }
+
+  return sharedFrom(text, now)
+}
+
+/** Keeps, for each group, the newer of the two measures: the last one written wins whichever file holds it. */
+const newerInto = (into: Record<string, SharedCost>, from: Record<string, SharedCost>): void => {
+  for (const [name, cost] of Object.entries(from)) {
+    const held = into[name]
+    if (held === undefined || held.at < cost.at) into[name] = cost
+  }
+}
+
+/**
+ * Every measure the sessions have written, and this session's own file. A file that cannot be read
+ * is left out; a session's own file that cannot be trusted comes back as null, so it is not written over.
+ */
+const readShared = async (
+  io: Io,
+  paths: SharedPaths,
+): Promise<{ table: Record<string, SharedCost>; own: Record<string, SharedCost> | null }> => {
+  const now = io.now()
+  const table = tableOf(await readAt(io, paths.legacy), now) ?? {}
+  let names: readonly string[] = []
+  if (io.list !== undefined) {
+    try {
+      names = await io.list(paths.shards)
+    } catch {
+      names = []
+    }
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    newerInto(table, tableOf(await readAt(io, `${paths.shards}/${name}`), now) ?? {})
+  }
+  const own = tableOf(await readAt(io, paths.own), now)
+  newerInto(table, own ?? {})
+
+  return { table, own }
+}
+
+/**
+ * The file's text: null when the file is absent, undefined when it cannot be read though it may be
+ * there. Only an absent file is empty; one that failed to read must not be written over.
+ */
+const readAt = async (io: Io, path: string): Promise<string | null | undefined> => {
+  try {
+    return await io.read(path)
+  } catch (problem) {
+    const isGone = io.exists === undefined ? isMissingError(problem) : !(await io.exists(path).catch(() => true))
+
+    return isGone ? null : undefined
+  }
+}
 
 /** Whether a failed read says the file is simply not there (as opposed to unreadable). */
 const isMissingError = (error: unknown): boolean => {
@@ -590,6 +651,7 @@ const stateFrom = (raw: Record<string, unknown> | null): State => {
   state.ledgerSeq = asInt(raw.ledgerSeq, 0)
   state.switchTimes = asNumberArray(raw.switchTimes)
   state.requestsSinceSwitch = asInt(raw.requestsSinceSwitch, 0)
+  state.lastRequestAt = typeof raw.lastRequestAt === 'number' && Number.isFinite(raw.lastRequestAt) ? raw.lastRequestAt : null
   state.archive = asRecordArray<ArchivePage>(raw.archive)
   state.activities = asRecordArray<FileActivity>(raw.activities)
   state.roster = rosterFrom(raw.roster)
@@ -669,10 +731,12 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
    * disk and miss a write still queued, so every switch appends to this text.
    */
   let eventsText: string | null = null
-  /** The cross-session table's file, or null when this session's directory has no parent to hold one. */
-  const sharedFile = sharedPath(root)
-  /** The table as this session last read or wrote it: never persisted, read again at each load. */
+  /** Where the cross-session measures are, or null when this session's directory has no parent to hold them. */
+  const shared = sharedPathsOf(root)
+  /** The measures as this session last read or wrote them: never persisted, read again at each load. */
   let sharedCostly: Record<string, SharedCost> = {}
+  /** This session's own measures as its file holds them; null when that file cannot be trusted, so it is not written. */
+  let ownCostly: Record<string, SharedCost> | null = {}
   /** The messages held back and not yet delivered, as held.json has them. */
   let held: HeldItem[] = []
   const heldJson = (): string => JSON.stringify({ items: held })
@@ -753,6 +817,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       activities: state.activities,
       roster: state.roster,
       costlyLoads: state.costlyLoads,
+      lastRequestAt: state.lastRequestAt,
       lastPrefix: state.lastPrefix,
       lastHandoff: state.lastHandoff,
     })
@@ -859,7 +924,11 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       for (const entry of entries) state.ledgerSeq = Math.max(state.ledgerSeq, entry.seq)
     }
     // Another session may have measured a group this one has not met, so the whole table is read.
-    if (sharedFile !== null) sharedCostly = sharedFrom(await readText(sharedFile), io.now())
+    if (shared !== null) {
+      const loaded = await readShared(io, shared)
+      sharedCostly = loaded.table
+      ownCostly = loaded.own
+    }
     held = heldFrom(await readText(pathIn(HELD_FILE)))
   }
 
@@ -1079,13 +1148,13 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
    * again in the same window does not rebuild, so only the first load is recorded.
    */
   /**
-   * Puts one measured group into the cross-session table. The file is read again first:
-   * another session may have written it since this one loaded, and its groups must stay.
+   * Puts one measured group into the cross-session measures, in this session's own file: no other
+   * session writes that file, so there is no lock. The file is written whole, from what this session
+   * has recorded, and a file that could not be read at load is left as it is.
    */
   const recordShared = async (group: string, write: number, context: number): Promise<void> => {
-    if (sharedFile === null) return
-    const file = sharedFile
-    const lockPath = `${file}${SHARED_LOCK_SUFFIX}`
+    if (shared === null) return
+    const file = shared.own
     const report = (problem: unknown): void => {
       try {
         io.onWriteError?.(file, problem)
@@ -1093,111 +1162,21 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
         // A reporter that throws must not change how the write fails.
       }
     }
-    const pause = async (): Promise<void> => {
-      if (io.sleep !== undefined) return await io.sleep(SHARED_LOCK_PAUSE_MS)
-      const timer = (globalThis as { setTimeout?: (run: () => void, ms: number) => unknown }).setTimeout
-      if (typeof timer === 'function') {
-        await new Promise<void>(resolve => {
-          timer(resolve, SHARED_LOCK_PAUSE_MS)
-        })
-      }
+    if (ownCostly === null) {
+      report(new Error('the session file could not be read or parsed: left as it is, this measure was not recorded'))
+
+      return
     }
-    /** The lock file's holder time: null when it is absent, -Infinity when it is damaged, undefined when unreadable. */
-    const lockTime = async (): Promise<number | null | undefined> => {
-      let text: string
-      try {
-        text = await io.read(lockPath)
-      } catch (problem) {
-        const isGone = io.exists === undefined ? isMissingError(problem) : !(await io.exists(lockPath).catch(() => true))
-
-        return isGone ? null : undefined
-      }
-      if (text === '') return Number.NEGATIVE_INFINITY
-      try {
-        const at = (JSON.parse(text) as { at?: unknown }).at
-
-        return typeof at === 'number' && Number.isFinite(at) ? at : Number.NEGATIVE_INFINITY
-      } catch {
-        return Number.NEGATIVE_INFINITY
-      }
-    }
-    /** Takes the lock, or gives up after a few tries: a measure is never worth waiting long for. */
-    const acquire = async (token: string): Promise<boolean> => {
-      for (let attempt = 0; attempt < SHARED_LOCK_TRIES; attempt += 1) {
-        const body = JSON.stringify({ token, at: io.now() })
-        const held = await lockTime()
-        if (held === undefined) {
-          await pause()
-          continue
-        }
-        const isFree = held === null || io.now() - held > SHARED_LOCK_STALE_MS
-        if (io.claim !== undefined) {
-          if (held !== null && isFree) await io.remove?.(lockPath)
-          if ((held === null || isFree) && (await io.claim(lockPath, body))) return true
-        } else if (isFree) {
-          // No exclusive create here: write, then read back, so the loser of a close race usually notices.
-          await io.write(lockPath, body)
-          if ((await readText(lockPath)) === body) return true
-        }
-        await pause()
-      }
-
-      return false
-    }
-    const release = async (token: string): Promise<void> => {
-      try {
-        const text = await readText(lockPath)
-        if (text === null || (JSON.parse(text) as { token?: unknown }).token !== token) return
-        if (io.remove !== undefined) await io.remove(lockPath)
-        else await io.write(lockPath, '')
-      } catch {
-        // A lock that cannot be released goes stale by itself.
-      }
-    }
-    /** The table as the file holds it: {} when there is no file, null when it is there but cannot be trusted. */
-    const readCurrent = async (): Promise<Record<string, SharedCost> | null> => {
-      let text: string
-      try {
-        text = await io.read(file)
-      } catch (problem) {
-        const isGone = io.exists === undefined ? isMissingError(problem) : !(await io.exists(file).catch(() => true))
-
-        return isGone ? {} : null
-      }
-      try {
-        const parsed: unknown = JSON.parse(text)
-        const groups = typeof parsed === 'object' && parsed !== null ? (parsed as { groups?: unknown }).groups : undefined
-        if (typeof groups !== 'object' || groups === null || Array.isArray(groups)) return null
-      } catch {
-        return null
-      }
-
-      return sharedFrom(text, io.now())
-    }
-
-    const token = `${io.now()}-${Math.random().toString(36).slice(2)}`
-    let isLocked = false
+    const at = io.now()
+    // Only this session writes this file, so it drops its own measures that have gone stale.
+    const fresh = Object.fromEntries(Object.entries(ownCostly).filter(([, cost]) => at - cost.at <= SHARED_MS))
+    const own = { ...fresh, [group]: { write, context, at } }
     try {
-      isLocked = await acquire(token)
-      if (!isLocked) {
-        report(new Error('costly.json is locked by another session: this measure was not recorded'))
-
-        return
-      }
-      const current = await readCurrent()
-      if (current === null) {
-        // Written over, a table that merely failed to read would lose every other session's groups.
-        report(new Error('costly.json could not be read or parsed: left as it is, this measure was not recorded'))
-
-        return
-      }
-      const now = io.now()
-      const table = { ...current, [group]: { write, context, at: now } }
-      const text = sharedJson(table)
+      const text = sharedJson(own)
       if (io.rename === undefined) {
         await io.write(file, text)
       } else {
-        const temp = `${file}.${token}.tmp`
+        const temp = `${file}.${at}-${Math.random().toString(36).slice(2)}.tmp`
         await io.write(temp, text)
         try {
           await io.rename(temp, file)
@@ -1206,19 +1185,20 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
           throw problem
         }
       }
-      sharedCostly = table
+      ownCostly = own
+      sharedCostly = { ...sharedCostly, [group]: { write, context, at } }
     } catch (problem) {
       report(problem)
-    } finally {
-      if (isLocked) await release(token)
     }
   }
 
   const noteStep = async (usage: { input: number; read: number; write: number }): Promise<void> => {
     await ensureLoaded()
     const before = state.lastContext
+    // A cache that expired on its own (the wait, not a load, emptied it) is no load's doing: nothing is recorded.
+    const expired = isCold({ now: io.now(), cache: null, lastRequestAt: state.lastRequestAt }, config)
     // Two groups loaded in one step rewrote the cache together: neither can be blamed for it alone.
-    if (state.pendingLoads.length === 1 && before !== null) {
+    if (!expired && state.pendingLoads.length === 1 && before !== null) {
       const rebuilt =
         usage.read < before * REBUILT_READ_SHARE && before - usage.read > REBUILT_MIN_DROP && usage.write > 0
       if (rebuilt) {
@@ -1360,6 +1340,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
   const noteRequest = (): void => {
     state.requestsSinceSwitch += 1
     state.lastRequestAt = io.now()
+    // Kept on disk: a session reopened after a restart must still know how long its cache has been idle.
+    saveMeta()
   }
 
   const reminder = (env: Env): string | null => {

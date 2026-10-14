@@ -134,6 +134,12 @@ describe('isCold', () => {
     expect(isCold({ now, cache: null, lastRequestAt: now - 3_600_000 }, DEFAULTS)).toBe(true)
     expect(isCold({ now, cache: null, lastRequestAt: now - 3_599_999 }, DEFAULTS)).toBe(false)
   })
+
+  test('a five-minute cache without an expiry is cold after five minutes, not an hour', () => {
+    const fiveMin = cache({ ttl: '5m' })
+    expect(isCold({ now, cache: fiveMin, lastRequestAt: now - 300_000 }, DEFAULTS)).toBe(true)
+    expect(isCold({ now, cache: fiveMin, lastRequestAt: now - 299_999 }, DEFAULTS)).toBe(false)
+  })
 })
 
 describe('gateSwitch', () => {
