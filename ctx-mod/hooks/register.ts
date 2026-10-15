@@ -604,14 +604,16 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     try {
       enabled = (await $.env.get('CTX_MOD')) === '1'
+      // The command is always there, so a person who installed the mod and
+      // typed /ctx-mod is told how to turn it on instead of meeting an unknown command.
+      await $.command.register({
+        name: COMMAND,
+        description: '显示 ctx-mod 的状态；/ctx-mod switch 立即换到新窗口（不调用模型）',
+      })
       if (enabled) {
         for (const tool of TOOLS) {
           await $.tool.register({ ...tool, isDeferred: false })
         }
-        await $.command.register({
-          name: COMMAND,
-          description: '显示 ctx-mod 的状态；/ctx-mod switch 立即换到新窗口（不调用模型）',
-        })
         await sessionOf($)
       }
     } catch (error) {
@@ -622,7 +624,9 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: COMMAND }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!enabled) {
+      return { text: 'ctx-mod 未启用：用环境变量 CTX_MOD=1 启动 Claude Code 后生效（例如 `CTX_MOD=1 claude`）。' }
+    }
     try {
       const session = await sessionOf($)
       if (session === undefined) return { text: 'ctx-mod：拿不到会话。' }
@@ -780,12 +784,15 @@ export const register: Register = (on, options) => {
 
       if (e.door === 'prompt') {
         const said = textOf(e.message.content)
-        const at = personTexts.indexOf(said.trim())
-        if (at !== -1) personTexts.splice(at, 1)
         // The engine's own session-start hook lands in this door too, wrapped in
         // a `<system-reminder>` block: a person's row must survive stripping it
-        // and still not look like an injected notice.
+        // and still not look like an injected notice. The text held in
+        // `personTexts` came from `prompt.submit`, which never sees that block,
+        // so the match is made on the stripped text as well.
         const stripped = stripInjected(said)
+        let at = personTexts.indexOf(said.trim())
+        if (at === -1 && stripped !== '') at = personTexts.indexOf(stripped)
+        if (at !== -1) personTexts.splice(at, 1)
         // With the source confirmed, only the engine's own envelopes are ruled out by their opening; any other `<` is the person's words.
         const isConfirmed = at !== -1 || isPersonOrigin(e.origin) || isOurUser(e.origin)
         const isPerson = isConfirmed && stripped !== '' && looksLikePerson(stripped, true)

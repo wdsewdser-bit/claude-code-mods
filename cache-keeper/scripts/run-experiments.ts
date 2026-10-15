@@ -137,7 +137,7 @@ const findClaude = (): string => {
 const cleanEnv = (ttl: string): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = {}
   for (const [name, value] of Object.entries(process.env)) {
-    if (!/^(CLAUDE|ANTHROPIC|FORCE_PROMPT_CACHING)/i.test(name)) env[name] = value
+    if (!/^(CLAUDE|ANTHROPIC|FORCE_PROMPT_CACHING|CTX_MOD)/i.test(name)) env[name] = value
   }
   env.CLAUDE_CODE_PROMPT_CACHE_TTL = ttl
 

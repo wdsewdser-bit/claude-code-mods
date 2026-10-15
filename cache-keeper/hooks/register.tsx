@@ -395,8 +395,15 @@ const boot = async ($: EngineInterface): Promise<Session> => {
     s.stopNote = typeof saved.stopNote === 'string' ? saved.stopNote : null
     s.agentHits = numberOf(saved.agentHits, 0)
     s.agentMisses = numberOf(saved.agentMisses, 0)
+    s.agentFailures = numberOf(saved.agentFailures, 0)
     s.agentStopNote =
       typeof saved.agentStopNote === 'string' ? saved.agentStopNote : null
+    // A keepalive still in flight across a reload keeps its id, so the
+    // task-notification that answers it is still dropped.
+    for (const pair of Array.isArray(saved.quiet) ? saved.quiet : []) {
+      if (!Array.isArray(pair) || typeof pair[0] !== 'string') continue
+      s.quiet.set(pair[0], numberOf(pair[1], 0))
+    }
     for (const one of Array.isArray(saved.agents) ? saved.agents : []) {
       if (!isRecord(one) || typeof one.id !== 'string') continue
       // A reload forgets what was in flight: the loop's next event says.
@@ -467,8 +474,10 @@ const save = async ($: EngineInterface, s: Session): Promise<void> => {
         stopNote: s.stopNote,
         agentHits: s.agentHits,
         agentMisses: s.agentMisses,
+        agentFailures: s.agentFailures,
         agentStopNote: s.agentStopNote,
         agents: [...s.agents].map(([id, agent]) => ({ id, ...agent })),
+        quiet: [...s.quiet],
         run: s.run,
       }),
     undefined,
@@ -481,10 +490,17 @@ const flush = async ($: EngineInterface, s: Session): Promise<void> => {
     eventsPath(s),
     `${s.rows.map(row => JSON.stringify(row)).join('\n')}\n`,
   )
-  if (s.rows.length >= CHUNK_ROWS) {
-    s.chunk += 1
-    s.rows = []
-  }
+}
+
+// Moves to a new chunk only between turns: the rows of the turn that just
+// ended must still be in memory for reconcile and stepDone, and rows already
+// moved to a finished chunk can no longer be filled in. Not during an
+// experiment, whose run is read back from the rows of its own steps.
+const rotateChunkIfNeeded = async ($: EngineInterface, s: Session): Promise<void> => {
+  if (s.run !== null || s.rows.length < CHUNK_ROWS) return
+  await flush($, s)
+  s.chunk += 1
+  s.rows = []
 }
 
 const syncKeeper = (s: Session): void => {
@@ -581,11 +597,15 @@ const readTranscript = async (
 // the API's cache-miss reason, matched to the rows recorded live.
 const reconcile = async ($: EngineInterface, s: Session): Promise<void> => {
   if (s.transcriptPath === null) return
+  // matchSplits pairs a row only within 600 s of its request: an older row that is
+  // still open never will be, so it is not worth re-reading the transcript for.
+  const now = await $.clock.now()
   const open = s.rows.filter(
     row =>
       row.kind === 'step' &&
       row.source !== 'subagent' &&
-      row.ephemeral_5m_input_tokens === null,
+      row.ephemeral_5m_input_tokens === null &&
+      now - Date.parse(row.timestamp) <= 600_000,
   )
   if (open.length === 0) return
   const jsonl = await readTranscript($, s.transcriptPath)
@@ -1128,6 +1148,7 @@ const handoffStep = async (
     ttl: effectiveTtl(s.requested.ttl, s.observed),
     atPercent: config.weeklyHandoffAtPercent,
     isBackgroundBusy: isBackgroundBusy(s.backgroundPending, s.backgroundSeenAt, now),
+    isTurnRunning: s.keeper.isTurnRunning,
   })
   const limit = sevenDay(limits)
   const reset = resetMs(limit)
@@ -1193,6 +1214,7 @@ const bridgeStep = async (
     ttl: s.keeper.ttl,
     atPercent: config.bridgeAtPercent,
     isBackgroundBusy: isBackgroundBusy(s.backgroundPending, s.backgroundSeenAt, now),
+    isTurnRunning: s.keeper.isTurnRunning,
   })
   if (!wrap || s.keeper.cachedPrefixTokens < config.minCacheReadTokens) return
   const limit = fiveHour(limits)
@@ -1259,8 +1281,14 @@ const setEnabled = async ($: EngineInterface, isOn: boolean): Promise<void> => {
   s.keeper.enabled = isOn
   s.isEnabledDecided = true
   s.stopNote = null
-  if (isOn) s.keeper.consecutiveFailures = 0
-  else s.bridge.phase = 'idle'
+  if (isOn) {
+    s.keeper.consecutiveFailures = 0
+    // Turning the keeper on also lifts a subagent keepalive stop.
+    s.agentFailures = 0
+    s.agentStopNote = null
+  } else {
+    s.bridge.phase = 'idle'
+  }
   await save($, s)
   await refreshBar($, s)
 }
@@ -1554,8 +1582,11 @@ const runCommand = async ($: EngineInterface, args: string): Promise<string> => 
     s.keeper.enabled = true
     s.isEnabledDecided = true
     s.keeper.consecutiveFailures = 0
+    s.agentFailures = 0
+    s.agentStopNote = null
     s.stopNote = null
     await save($, s)
+    await refreshBar($, s)
     return statusText($, s)
   }
   if (sub === 'stop') {
@@ -1564,6 +1595,7 @@ const runCommand = async ($: EngineInterface, args: string): Promise<string> => 
     s.stopNote = null
     s.bridge.phase = 'idle'
     await save($, s)
+    await refreshBar($, s)
     return statusText($, s)
   }
   if (sub === 'status') return statusText($, s)
@@ -1626,18 +1658,23 @@ export const register: Register = (on, options) => {
     if (e.props.hasSurvey) return next(e)
     const text = await read($, barAtom)
     if (text === '') return next(e)
+    // Other mods' rows above the prompt stay: our bar goes on top of them.
+    const below = await next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
 
     return (
-      <Box>
-        <Text dimColor>{text} </Text>
-        <Button key="keeper-on" label="开启保活" onPress={() => setEnabled($, true)} />
-        <Text> </Text>
-        <Button key="keeper-off" label="关闭保活" onPress={() => setEnabled($, false)} />
-        <Text> </Text>
-        <Button key="anchor-on" label="设为锚点" onPress={() => setAnchor($, true)} />
-        <Text> </Text>
-        <Button key="anchor-off" label="取消锚点" onPress={() => setAnchor($, false)} />
+      <Box flexDirection="column">
+        <Box>
+          <Text dimColor>{text} </Text>
+          <Button key="keeper-on" label="开启保活" onPress={() => setEnabled($, true)} />
+          <Text> </Text>
+          <Button key="keeper-off" label="关闭保活" onPress={() => setEnabled($, false)} />
+          <Text> </Text>
+          <Button key="anchor-on" label="设为锚点" onPress={() => setAnchor($, true)} />
+          <Text> </Text>
+          <Button key="anchor-off" label="取消锚点" onPress={() => setAnchor($, false)} />
+        </Box>
+        {below}
       </Box>
     )
   })
@@ -1653,6 +1690,7 @@ export const register: Register = (on, options) => {
       timer?.cancel()
       timer = $.clock.every(TICK_MS, () => void tick($))
       showStatus($, s, await $.clock.now())
+      await refreshBar($, s)
     } catch (error) {
       debug($, error)
     }
@@ -1672,12 +1710,20 @@ export const register: Register = (on, options) => {
   // model to read "OK": it stops here.
   on('prompt.submit', async ($, e, next) => {
     try {
-      if (e.origin.kind === 'composer' || e.origin.kind === 'bridge') {
+      // A message ctx-mod held back for a cold cache and re-submitted as the
+      // person's own is the person's message too. Only ctx-mod's re-submit
+      // counts: our own experiment prompts are also submitted asUser.
+      const origin = e.origin as { kind: string; name?: unknown; asUser?: unknown }
+      const isHeldPerson =
+        origin.kind === 'plugin' && origin.name === 'ctx-mod' && origin.asUser === true
+      if (origin.kind === 'composer' || origin.kind === 'bridge' || isHeldPerson) {
         const s = await ensure($)
         s.lastRealAt = await $.clock.now()
         s.keeper.idleKeepalives = 0
-        // Only the person typing is a takeover: a plugin's own message (the wrap-up itself, a finished background job) is not.
-        if (s.bridge.phase === 'wrapped' && e.origin.kind === 'composer') s.bridge.isTakenOver = true
+        // Only the person is a takeover: a plugin's own message (the wrap-up itself, a finished background job) is not.
+        if (s.bridge.phase === 'wrapped' && (origin.kind === 'composer' || isHeldPerson)) {
+          s.bridge.isTakenOver = true
+        }
         await save($, s)
       }
       if (e.origin.kind === 'task-notification' && booting !== undefined) {
@@ -1725,6 +1771,9 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    // A subagent's turn never clears the flag (turn.complete returns early for it),
+    // so it must not raise it either.
+    if ((e as { agentId?: unknown }).agentId !== undefined) return next(e)
     try {
       const s = await ensure($)
       s.keeper.isTurnRunning = true
@@ -1853,6 +1902,7 @@ export const register: Register = (on, options) => {
         s.tags.delete(e.turnId)
         if (s.run !== null) await stepDone($, s, s.run, tag, e.turnId, e.reason)
       }
+      await rotateChunkIfNeeded($, s)
       await save($, s)
     } catch (error) {
       debug($, error)
