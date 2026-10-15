@@ -98,19 +98,25 @@ export type HandoffInput = {
   atPercent: number
   /** Background work this session started is still out (see isBackgroundBusy). */
   isBackgroundBusy: boolean
+  /** A main-thread turn is running now, however long it has been going. */
+  isTurnRunning: boolean
 }
 
 /**
- * Whether the session is being worked in: background work is out, or the main
- * thread spoke within the active window (never longer than the cache TTL).
+ * Whether the session is being worked in: background work is out, a turn is
+ * running, or the main thread spoke within the active window (never longer
+ * than the cache TTL). A session idle for longer than that is left alone.
  */
 const isWorkedIn = (
   lastRealAt: number,
   ttl: Ttl | null,
   now: number,
   isBackgroundBusy: boolean,
+  isTurnRunning: boolean,
 ): boolean =>
-  isBackgroundBusy || now - lastRealAt < Math.min(ACTIVE_MS, TTL_MS[ttl ?? '1h'])
+  isBackgroundBusy ||
+  isTurnRunning ||
+  now - lastRealAt < Math.min(ACTIVE_MS, TTL_MS[ttl ?? '1h'])
 
 /**
  * Whether to ask for a handoff document now: the weekly window is nearly
@@ -127,7 +133,7 @@ export const shouldHandoff = (input: HandoffInput): boolean => {
   if (windowKey(reset) === input.bridge.weeklyWindow) return false
   if (input.lastRealAt === null) return false
 
-  return isWorkedIn(input.lastRealAt, input.ttl, input.now, input.isBackgroundBusy)
+  return isWorkedIn(input.lastRealAt, input.ttl, input.now, input.isBackgroundBusy, input.isTurnRunning)
 }
 
 export type WrapInput = {
@@ -143,6 +149,8 @@ export type WrapInput = {
   atPercent: number
   /** Background work this session started is still out (see isBackgroundBusy). */
   isBackgroundBusy: boolean
+  /** A main-thread turn is running now (see isWorkedIn). */
+  isTurnRunning: boolean
 }
 
 /**
@@ -160,7 +168,7 @@ export const shouldWrap = (input: WrapInput): boolean => {
   if (limit.resetsAt === input.bridge.window) return false
   if (input.lastRealAt === null) return false
 
-  return isWorkedIn(input.lastRealAt, input.ttl, input.now, input.isBackgroundBusy)
+  return isWorkedIn(input.lastRealAt, input.ttl, input.now, input.isBackgroundBusy, input.isTurnRunning)
 }
 
 /**

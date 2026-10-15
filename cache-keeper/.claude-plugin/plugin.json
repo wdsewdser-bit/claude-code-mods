@@ -87,7 +87,7 @@
     "bridgeEnabled": {
       "type": "boolean",
       "title": "Quota bridge",
-      "description": "At bridgeAtPercent of the 5-hour window, tell the main session to wrap up, keep its cache warm until the reset, then tell it to continue. Only sessions with a user or assistant message within the cache TTL, or with background tasks still out; never subagents.",
+      "description": "At bridgeAtPercent of the 5-hour window, tell the main session to wrap up, keep its cache warm until the reset, then tell it to continue. Only sessions worked in within the last 10 minutes or the cache TTL, whichever is shorter (a user message, a turn still running, or background tasks still out), so a session that ended hours ago is never woken; never subagents.",
       "default": true
     },
     "bridgeAtPercent": {

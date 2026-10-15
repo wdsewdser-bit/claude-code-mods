@@ -41,6 +41,7 @@ describe('bridge logic', () => {
     ttl: '1h' as const,
     atPercent: 90,
     isBackgroundBusy: false,
+    isTurnRunning: false,
   }
 
   test('wraps at the threshold for a session worked in within its TTL', () => {
@@ -53,6 +54,13 @@ describe('bridge logic', () => {
     expect(shouldWrap(quiet)).toBe(false)
     expect(shouldWrap({ ...quiet, isBackgroundBusy: true })).toBe(true)
     expect(shouldWrap({ ...quiet, isBackgroundBusy: true, lastRealAt: null })).toBe(false)
+  })
+
+  test('a turn still running is worked in, however long it has run since the last message', () => {
+    const quiet = { ...base, now: START + 1_800_000 }
+    expect(shouldWrap(quiet)).toBe(false)
+    expect(shouldWrap({ ...quiet, isTurnRunning: true })).toBe(true)
+    expect(shouldWrap({ ...quiet, isTurnRunning: true, isRunActive: true })).toBe(false)
   })
 
   test('background work tracks its launches and gives up on lost ones', () => {
@@ -104,6 +112,7 @@ describe('bridge logic', () => {
       ttl: '1h' as const,
       atPercent: 98,
       isBackgroundBusy: false,
+      isTurnRunning: false,
     }
     expect(shouldHandoff(ask)).toBe(true)
     expect(shouldHandoff({ ...ask, now: START + 1_800_000 })).toBe(false)
