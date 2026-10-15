@@ -939,6 +939,41 @@ test('armed, a person’s prompt survives an injected head and the handoff drops
   expect(text).not.toContain('引擎自己的开场')
 })
 
+test('armed, a prompt submitted as the person’s stays theirs when the stored row carries the engine’s opening', async ($, on) => {
+  world(on, 's-injected-3', { CTX_MOD: '1' })
+  await boot($)
+  // The submission has no reminder, the stored row does: the match must strip it first.
+  await $.prompt.submit({
+    text: '把登录页的按钮改成蓝色',
+    wait: false,
+    origin: { kind: 'composer' },
+  } as never)
+  await append($, {
+    message: {
+      type: 'user',
+      content: [
+        {
+          type: 'text',
+          text: '<system-reminder>引擎自己的开场</system-reminder>\n\n把登录页的按钮改成蓝色',
+        },
+      ],
+    },
+    door: 'prompt',
+    origin: { kind: 'unclassified' },
+    uuid: 'row-3',
+  })
+  await callTool(
+    $,
+    ledger({ tool_use_id: 'l1', task_id: 't1', title: '按钮', status: 'in_progress', text: '在做', next_step: '接着改' }),
+  )
+  const result = await compact($, 'auto')
+  const text = messagesOf(result)
+    .map(message => message.text ?? '')
+    .join('\n')
+  expect(text).toContain('把登录页的按钮改成蓝色')
+  expect(text).not.toContain('引擎自己的开场')
+})
+
 test('armed, an automatic compaction with a stale ledger keeps core and adds the handoff', async ($, on) => {
   const w = world(on, 's-stale', { CTX_MOD: '1' })
   await boot($)
