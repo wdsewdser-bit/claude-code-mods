@@ -349,3 +349,14 @@ delegate 的经验：后台模式（`background: true`）在这一晚后半段�
 - 接线：`register.ts` 的 `io` 补了 `exists`（`$.fs.exists`）和 `cwd`（`$.session.cwd()`）。`claim`、`rename`、`remove` 引擎无对应原语，仍走回退：锁退化为“写后读回”的弱校验，表直接原地写。
 - 验收：tsc 0；`claude plugin test .` 400 过 0 败（基线 385）；`validate --strict` 通过。
 - 未验证：真实引擎中 `$.fs.exists` 与 `$.session.cwd()` 的实际返回；读失败与缺文件在引擎里的报错文本区分（现在依赖 exists）；已开会话需重启才生效。
+
+## （二十二）子代理冷续用拦截（用户提出）
+
+- 起因：主会话隔几天用 SendMessage 续用已结束的子代理，它 1h 的提示缓存早已过期，第一轮要重写约 19 万 token；新建同类型代理加短交接只要约 3–4 万。
+- 名单（roster）每行新增：`name`（Agent 调用的 name，SendMessage 也认它）、`lastActiveAt`（派发、续用、子代理每个回合结束时更新）、`contextTokens`（该子代理最近一次请求的 input+cache_read+cache_creation）。来源：子代理自己的 `turn.step` 事件带 `agentId` 和 `result.usage`，是 API 报的真实值，不是估计；只在内存更新，回合结束（`turn.complete`）时一并落盘。没有这个字段的旧行（升级前写的）不会被拦，因为不知道它多大。
+- 拦截（`register.ts` 主会话 `tool.call`，tool 为 SendMessage）：`to` 按 id 或 name 匹配名单（去掉末尾的 ` [ref]`）；已结束、闲置超过 `agentColdMinutes`（60）、`contextTokens` 超过 `agentColdMinTokens`（60000）时第一次 deny，文案写明闲置多久、约重写多少 token、建议新建同类型代理加最后报告和文件路径做交接、仍要续用就原样再发一次。同一目标同一消息体，或 `agentResendMinutes`（10）分钟内对同一目标再发，放行（判断后清掉记录）。放行时 `agentResumed` 把行的 `lastActiveAt` 改成现在并去掉 `ended`。名单里没有的目标、仍在跑的、热的、小的都不拦。
+- 配置：三个阈值在 `types.ts` 的 `Config`/`DEFAULTS`，与其他阈值同一处；ctx-mod 目前没有用户级配置文件，改默认值即可。
+- 交接：已结束且有 `contextTokens` 的代理，行内加“；闲置 X 小时，缓存已冷，约 N 万 token”或“缓存可能仍热”。
+- 测试：`session.test.ts` 加 9 条、`register.test.ts` 加 6 条（Date.now 在测试沙箱里只读，注册层测试用“改 meta.json 里的 lastActiveAt 再换会话 id 重开”来模拟闲置，与真实引擎验证做法一致）。验收：`npx tsc --noEmit -p .` 0 错；`claude plugin test .` 417 过（基线 400）；`claude plugin validate --strict .` 通过。
+- 调查（只调查未实现）：类型里 `SessionCompactTrigger = 'manual' | 'auto' | 'plugin' | 'precompute'`；`session.compact` 的钩子输入有 `agentId`（子代理或 fork 自己的 transcript 压缩时带），`$.session.messages({agentId})` 能读子代理对话；但插件主动调用的 `$.session.compact(args)` 只收 `instructions`，没有 agentId，只能压主会话，且回合中会 reject。已结束子代理被 SendMessage 续用时，引擎是从保存的 transcript 恢复，`session.messages({agentId})` 对已结束且没有保存的 transcript 会返回 deny。结论：没有 API 能对已停止的子代理主动压缩，也没有在续用时替换为压缩后历史的接口；只能等它续用后在它自己的回合里碰上 `session.compact`（auto）时用钩子改 `messages`，对冷缓存没有帮助。
+- 未做：真实引擎验证（起 Haiku 子代理、改早 lastActiveAt 后 SendMessage）没有做。

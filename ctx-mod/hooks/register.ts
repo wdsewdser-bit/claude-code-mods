@@ -744,6 +744,15 @@ export const register: Register = (on, options) => {
       if (session !== undefined && session.pending() !== null) {
         return { deny: '正在换窗口：请立即结束本回合，不要再调用工具。' }
       }
+      // A resume of an ended subagent whose cache has gone cold is held back once, with its cost.
+      if (session !== undefined && String(e.tool) === 'SendMessage') {
+        const args = argsOf(e)
+        const to = typeof args.to === 'string' ? args.to : ''
+        const message = typeof args.message === 'string' ? args.message : ''
+        const notice = await session.coldResend(to, message)
+        if (notice !== null) return { deny: notice }
+        await session.agentResumed(to)
+      }
       // A load that would rebuild the cache waits for a window switch while the context is large.
       if (session !== undefined && String(e.tool) === 'ToolSearch') {
         const id = await idOf($)
@@ -939,7 +948,13 @@ export const register: Register = (on, options) => {
       // rather than a task of its own.
       if (typeof id === 'string' && id !== '' && e.parentAgentId === undefined && e.fork !== true) {
         const session = await sessionOf($)
-        await session?.noteAgent({ id, type: e.subagentType, description: e.description, model: result.model })
+        await session?.noteAgent({
+          id,
+          type: e.subagentType,
+          description: e.description,
+          model: result.model,
+          ...(typeof e.name === 'string' ? { name: e.name } : {}),
+        })
       }
     } catch (error) {
       logError($, 'agent.spawn', error)
@@ -956,7 +971,16 @@ export const register: Register = (on, options) => {
     try {
       // Only the main loop's requests are measured: a subagent has a cache of its own.
       const usage = result.usage
-      if (e.agentId === undefined) {
+      if (e.agentId !== undefined) {
+        // A subagent's request size is the size a later resume would have to rewrite once its cache is gone.
+        if (usage !== null) {
+          const size =
+            (typeof usage.input_tokens === 'number' ? usage.input_tokens : 0) +
+            (typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0) +
+            (typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0)
+          await (await sessionOf($))?.agentStep(e.agentId, size)
+        }
+      } else {
         const session = await sessionOf($)
         // One step is one model request, whether or not it called a tool; a retried
         // or replayed step carries the same turn and index and is not a second one.
