@@ -1,0 +1,1 @@
+{ "name": "ptc-run", "version": "0.1.0", "description": "Programmatic tool calling: run_code runs a JS program that calls read/glob/grep/edit/bash in a sandbox and returns only the final value; large results spill to refs.", "author": { "name": "yadaz" } }

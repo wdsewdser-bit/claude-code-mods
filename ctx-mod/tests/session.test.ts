@@ -2626,3 +2626,111 @@ describe('importMessages into a session that has history', () => {
     expect(session.latestPersonSeq()).toBeNull()
   })
 })
+
+describe('the cold-cache hold-back on resuming a subagent', () => {
+  const HOUR = 3_600_000
+
+  /** A subagent that ran a large request and ended, with the clock then moved on by `idleMs`. */
+  const endedAgent = async (idleMs: number, tokens = 190_000, name?: string) => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.noteAgent({ id: 'a1', type: 'worker', description: '改 hooks', ...(name === undefined ? {} : { name }) })
+    box.advance(1_000)
+    await session.agentStep('a1', tokens)
+    await session.agentEnded('a1')
+    await session.flush()
+    box.advance(idleMs)
+
+    return { box, session }
+  }
+
+  test('the roster row keeps lastActiveAt and contextTokens, written when the turn ends', async () => {
+    const { box } = await endedAgent(0)
+    const row = rosterOf(box)[0]
+    expect(row?.contextTokens).toBe(190_000)
+    expect(row?.lastActiveAt).toBe(1_001_000)
+    expect(row?.ended).toBe(true)
+  })
+
+  test('a cold, large, ended subagent is held back once, and the same send goes through the second time', async () => {
+    const { session } = await endedAgent(3 * HOUR)
+    const first = await session.coldResend('a1', '继续')
+    expect(first).toContain('闲置 3 小时')
+    expect(first).toContain('19.0 万')
+    expect(first).toContain('原样再发一次')
+    expect(await session.coldResend('a1', '继续')).toBeNull()
+  })
+
+  test('a different body within the resend window also goes through; the pair is then spent', async () => {
+    const { box, session } = await endedAgent(3 * HOUR)
+    expect(await session.coldResend('a1', '一')).not.toBeNull()
+    box.advance(5 * 60_000)
+    expect(await session.coldResend('a1', '二')).toBeNull()
+    expect(await session.coldResend('a1', '三')).not.toBeNull()
+  })
+
+  test('a name matches as well as an id, and a trailing [ref] is ignored', async () => {
+    const { session } = await endedAgent(3 * HOUR, 190_000, 'scout')
+    expect(await session.coldResend('scout [ab12]', 'x')).not.toBeNull()
+  })
+
+  test('a hot, a small, a running or an unknown recipient is not held back', async () => {
+    const hot = await endedAgent(30 * 60_000)
+    expect(await hot.session.coldResend('a1', 'x')).toBeNull()
+
+    const small = await endedAgent(3 * HOUR, 20_000)
+    expect(await small.session.coldResend('a1', 'x')).toBeNull()
+
+    const box = makeIo()
+    const running = createSession(DIR, box.io, DEFAULTS)
+    await running.noteAgent({ id: 'a1', type: 'worker', description: '在跑' })
+    await running.agentStep('a1', 190_000)
+    box.advance(3 * HOUR)
+    expect(await running.coldResend('a1', 'x')).toBeNull()
+
+    expect(await small.session.coldResend('nobody', 'x')).toBeNull()
+  })
+
+  test('the thresholds come from the config', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, { ...DEFAULTS, agentColdMinutes: 5, agentColdMinTokens: 1_000 })
+    await session.noteAgent({ id: 'a1', type: 'worker', description: 'x' })
+    await session.agentStep('a1', 2_000)
+    await session.agentEnded('a1')
+    box.advance(6 * 60_000)
+    expect(await session.coldResend('a1', 'x')).toContain('闲置 6 分钟')
+  })
+
+  test('a resume stamps the row and clears ended', async () => {
+    const { box, session } = await endedAgent(3 * HOUR)
+    await session.agentResumed('a1')
+    await session.flush()
+    const row = rosterOf(box)[0]
+    expect(row?.ended).toBeUndefined()
+    expect(row?.lastActiveAt).toBe(1_001_000 + 3 * HOUR)
+  })
+
+  test('the handoff tells an ended subagent idle time and cache state', async () => {
+    const cold = await endedAgent(3 * HOUR)
+    const coldText = await cold.session.buildHandoff({ isMidTurn: false, agents: [] })
+    expect(coldText).toContain('- a1（worker，已结束；闲置 3 小时，缓存已冷，约 19.0 万 token）：改 hooks')
+
+    const hot = await endedAgent(10 * 60_000)
+    const hotText = await hot.session.buildHandoff({ isMidTurn: false, agents: [] })
+    expect(hotText).toContain('闲置 10 分钟，缓存可能仍热')
+  })
+
+  test('a row from before the new fields loads and is never held back', async () => {
+    const box = makeIo()
+    const first = createSession(DIR, box.io, DEFAULTS)
+    await first.noteAgent({ id: 'a1', type: 'worker', description: '旧' })
+    await first.agentEnded('a1')
+    await first.flush()
+    const meta = readMeta(box)
+    meta.roster = [{ id: 'a1', type: 'worker', description: '旧', window: 1, ts: 1, ended: true }]
+    box.files.set(`${DIR}/meta.json`, JSON.stringify(meta))
+    box.advance(5 * HOUR)
+    const second = createSession(DIR, box.io, DEFAULTS)
+    expect(await second.coldResend('a1', 'x')).toBeNull()
+  })
+})
