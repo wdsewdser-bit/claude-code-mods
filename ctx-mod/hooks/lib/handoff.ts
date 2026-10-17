@@ -44,7 +44,7 @@ export const renderAgents = (agents: readonly AgentNote[]): string => {
   const ranked = [...agents].sort((left, right) => rankOf(left.state) - rankOf(right.state))
   const lines = ranked
     .slice(0, MAX_AGENTS)
-    .map(agent => `- ${agent.id}（${agent.type}，${agent.state}）：${agent.description}`)
+    .map(agent => `- ${agent.id}（${agent.type}，${agent.state}${agent.cache === undefined ? '' : `；${agent.cache}`}）：${agent.description}`)
   const rest = ranked.length - lines.length
   if (rest > 0) lines.push(`另有 ${rest} 个未列出，用 ListAgents 查看`)
 
