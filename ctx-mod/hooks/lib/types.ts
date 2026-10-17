@@ -41,6 +41,12 @@ export type Config = {
   freshTailSteps: number
   /** On an automatic compaction, more unrecorded tool results than this send the summary back to the engine. */
   autoTailSteps: number
+  /** An ended subagent idle longer than this many minutes has a cold cache (the 1h prompt-cache TTL). */
+  agentColdMinutes: number
+  /** A SendMessage to such a subagent is held back once only when its last request was above this many tokens. */
+  agentColdMinTokens: number
+  /** After a hold-back, a repeat to the same subagent within this many minutes goes through. */
+  agentResendMinutes: number
 }
 
 export const DEFAULTS: Config = {
@@ -70,6 +76,9 @@ export const DEFAULTS: Config = {
   gateMinTokens: 120_000,
   freshTailSteps: 5,
   autoTailSteps: 25,
+  agentColdMinutes: 60,
+  agentColdMinTokens: 60_000,
+  agentResendMinutes: 10,
 }
 
 /**
