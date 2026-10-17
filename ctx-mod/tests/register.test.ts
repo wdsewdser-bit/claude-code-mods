@@ -1674,3 +1674,99 @@ test('armed, the engine messages after the last recorded one are filed when the 
   expect(w.logs.some(line => line.includes('补录了 1 条'))).toBe(true)
   expect(await searchHistory($, { query: '停用期间做的回答' })).toContain('#2 w1 assistant')
 })
+/** The roster rows as the session meta.json holds them. */
+const rosterRows = (w: World): Record<string, unknown>[] =>
+  (JSON.parse(fileAt(w, `ctx-mod/${w.sessionId}/meta.json`) ?? '{}') as { roster?: Record<string, unknown>[] }).roster ?? []
+
+/** A subagent that spawned, made one large request and ended, `idleMs` ago. */
+const endedBigAgent = async ($: Engine, w: World, idleMs: number, spawnExtra: Record<string, unknown> = {}): Promise<void> => {
+  await boot($)
+  await spawn($, spawnExtra)
+  w.stepUsage = usageOf(500, 150_000, 40_000)
+  await step($, 1, 'a1', 'turn-sub')
+  await endSubagentTurn($, 'a1')
+  await ageAgents($, w, idleMs)
+}
+
+const HOURS = 3_600_000
+
+/**
+ * Time cannot be moved under the mod (it stamps with Date.now), so a test ages the subagent the way the
+ * real-engine check does: the roster row in meta.json is written back with an earlier lastActiveAt and
+ * the conversation reopens under a new session id that reads it.
+ */
+const ageAgents = async ($: Engine, w: World, ms: number): Promise<void> => {
+  await w.clock.settle()
+  const meta = JSON.parse(fileAt(w, `ctx-mod/${w.sessionId}/meta.json`) ?? '{}') as { roster?: Record<string, number>[] }
+  for (const row of meta.roster ?? []) row.lastActiveAt = (row.lastActiveAt ?? 0) - ms
+  w.sessionId = `${w.sessionId}-later`
+  w.readable.set(`${slashed(HOME)}/.claude/ctx-mod/${w.sessionId}/meta.json`, JSON.stringify(meta))
+  await boot($)
+}
+
+test('a subagent own steps and end fill its roster row with lastActiveAt and contextTokens', async ($, on) => {
+  const w = world(on, 's-cold-row', { CTX_MOD: '1' })
+  await endedBigAgent($, w, 0)
+  w.sessionId = 's-cold-row'
+  const row = rosterRows(w)[0]
+  expect(row?.contextTokens).toBe(190_500)
+  expect(row?.ended).toBe(true)
+  expect(typeof row?.lastActiveAt).toBe('number')
+})
+
+test('SendMessage to an ended, cold, large subagent is denied once and goes through when repeated', async ($, on) => {
+  const w = world(on, 's-cold-deny', { CTX_MOD: '1' })
+  await endedBigAgent($, w, 3 * HOURS, { name: 'scout' })
+  const send = { tool: 'SendMessage', tool_use_id: 'sm-1', to: 'a1', message: '再查一遍' }
+  const first = await callTool($, send)
+  expect(String(first.deny)).toContain('闲置 3 小时')
+  expect(String(first.deny)).toContain('19.1 万')
+  expect(String(first.deny)).toContain('原样再发一次')
+
+  const second = await callTool($, { ...send, tool_use_id: 'sm-2' })
+  expect(second.deny).toBeUndefined()
+  expect(second.result).toBe('the tool ran')
+  expect(rosterRows(w)[0]?.ended).toBeUndefined()
+})
+
+test('SendMessage by the agent name is held back the same way', async ($, on) => {
+  const w = world(on, 's-cold-name', { CTX_MOD: '1' })
+  await endedBigAgent($, w, 3 * HOURS, { name: 'scout' })
+  const first = await callTool($, { tool: 'SendMessage', tool_use_id: 'sm-1', to: 'scout', message: 'x' })
+  expect(String(first.deny)).toContain('scout')
+})
+
+test('SendMessage to a hot subagent, or one the roster lacks, is not held back', async ($, on) => {
+  const w = world(on, 's-cold-pass', { CTX_MOD: '1' })
+  await endedBigAgent($, w, 20 * 60_000)
+  const hot = await callTool($, { tool: 'SendMessage', tool_use_id: 'sm-1', to: 'a1', message: 'x' })
+  expect(hot.deny).toBeUndefined()
+  const unknown = await callTool($, { tool: 'SendMessage', tool_use_id: 'sm-2', to: 'stranger', message: 'x' })
+  expect(unknown.deny).toBeUndefined()
+  expect(unknown.result).toBe('the tool ran')
+})
+
+test('SendMessage to a cold subagent whose last request was small is not held back', async ($, on) => {
+  const w = world(on, 's-cold-small', { CTX_MOD: '1' })
+  await boot($)
+  await spawn($, {})
+  w.stepUsage = usageOf(500, 10_000, 2_000)
+  await step($, 1, 'a1', 'turn-sub')
+  await endSubagentTurn($, 'a1')
+  await ageAgents($, w, 3 * HOURS)
+  const sent = await callTool($, { tool: 'SendMessage', tool_use_id: 'sm-1', to: 'a1', message: 'x' })
+  expect(sent.deny).toBeUndefined()
+})
+
+test('armed, the handoff tells how long an ended subagent has been idle and that its cache is cold', async ($, on) => {
+  const w = world(on, 's-cold-handoff', { CTX_MOD: '1' })
+  await boot($)
+  await spawn($, {})
+  w.stepUsage = usageOf(500, 150_000, 40_000)
+  await step($, 1, 'a1', 'turn-sub')
+  await endSubagentTurn($, 'a1')
+  await ageAgents($, w, 3 * HOURS)
+  await armedWithFreshLedger($, '交接里写出子代理缓存')
+  const text = await handoffOf($)
+  expect(text).toContain('- a1（worker，已结束；闲置 3 小时，缓存已冷，约 19.1 万 token）：改 register')
+})
