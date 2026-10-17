@@ -114,7 +114,14 @@ export type RecordInput = {
  * of importing the engine's `AgentInfo`, so it stays loadable without the
  * `claude-code` types; the register maps the engine's rows onto this.
  */
-export type AgentNote = { id: string; type: string; description: string; state: string }
+export type AgentNote = {
+  id: string
+  type: string
+  description: string
+  state: string
+  /** For an ended subagent: how long it has been idle and whether its cache is cold, ready to print. */
+  cache?: string
+}
 
 /**
  * A subagent the main loop started, kept in the session: the engine lists an agent
@@ -129,6 +136,12 @@ export type AgentSeen = {
   window: number
   ts: number
   ended?: boolean
+  /** The Agent call's `name`, which SendMessage also takes as a recipient. */
+  name?: string
+  /** When the subagent last ran: its spawn, a resume, or the end of its latest turn. */
+  lastActiveAt?: number
+  /** Its latest request's input size (input + cache read + cache write), as the API reported it on `turn.step`. */
+  contextTokens?: number
 }
 
 /**
@@ -403,9 +416,19 @@ export type Session = {
   /** The time of the last noted request, or null before the first one; `await ready()` first. */
   lastRequestAt: () => number | null
   /** Notes a subagent the main loop started, by id; a repeat of the id updates its row. `await ready()` is not needed. */
-  noteAgent: (input: { id: string; type: string; description: string; model?: string }) => Promise<void>
-  /** Tags a noted subagent as ended; an id never noted changes nothing. */
+  noteAgent: (input: { id: string; type: string; description: string; model?: string; name?: string }) => Promise<void>
+  /** Tags a noted subagent as ended and stamps when; an id never noted changes nothing. */
   agentEnded: (id: string) => Promise<void>
+  /** Records a noted subagent's latest request size (kept in memory until its turn ends); an id never noted changes nothing. */
+  agentStep: (id: string, tokens: number) => Promise<void>
+  /** A SendMessage is about to resume a noted subagent: it runs again from now. Unknown recipients change nothing. */
+  agentResumed: (to: string) => Promise<void>
+  /**
+   * Whether a SendMessage to `to` (an id or a name) should be held back once: the recipient is a noted,
+   * ended subagent, idle past the cold limit, whose last request was large. Returns the Chinese notice,
+   * or null to let it through (including the repeat of a held-back send).
+   */
+  coldResend: (to: string, message: string) => Promise<string | null>
   /** Reads one main-loop request's usage: a request right after a deferred load that rewrote the cache names that load's group. `await ready()` is not needed. */
   noteStep: (usage: { input: number; read: number; write: number }) => Promise<void>
   /** The costly groups this session judges by: the cross-session table with this session's own measures on top. `await ready()` first. */
@@ -469,6 +492,11 @@ const seenOf = (value: unknown): AgentSeen | null => {
     window: row.window,
     ts: row.ts,
     ...(row.ended === true ? { ended: true } : {}),
+    ...(typeof row.name === 'string' && row.name !== '' ? { name: row.name } : {}),
+    ...(typeof row.lastActiveAt === 'number' && Number.isFinite(row.lastActiveAt) ? { lastActiveAt: row.lastActiveAt } : {}),
+    ...(typeof row.contextTokens === 'number' && Number.isFinite(row.contextTokens) && row.contextTokens >= 0
+      ? { contextTokens: row.contextTokens }
+      : {}),
   }
 }
 
@@ -664,17 +692,51 @@ const stateFrom = (raw: Record<string, unknown> | null): State => {
   return state
 }
 
+/** The minutes a noted subagent has been idle; a row from before the stamp counts from its spawn. */
+const idleMinutesOf = (seen: AgentSeen, now: number): number =>
+  Math.max(0, now - (seen.lastActiveAt ?? seen.ts)) / 60_000
+
+/** An idle time spelled for a person: minutes under an hour, hours (one decimal under ten) from there. */
+const idleText = (minutes: number): string => {
+  if (minutes < 60) return `${Math.round(minutes)} 分钟`
+  const hours = minutes / 60
+
+  return hours < 10 ? `${Math.round(hours * 10) / 10} 小时` : `${Math.round(hours)} 小时`
+}
+
+/** What the handoff says of an ended subagent's cache: cold past the limit, otherwise possibly still hot. */
+const cacheNoteOf = (seen: AgentSeen, now: number, config: Config): string => {
+  const minutes = idleMinutesOf(seen, now)
+  const size = rewriteOf(seen.contextTokens ?? 0)
+  if (minutes > config.agentColdMinutes) return `闲置 ${idleText(minutes)}，缓存已冷，${size} token`
+
+  return `闲置 ${idleText(minutes)}，缓存可能仍热，${size} token`
+}
+
 /**
  * The subagents the handoff names: the engine's live list as it gave it, then the
  * noted ones it no longer lists, as ended and newest first. An id both sides hold
  * keeps the engine's row, so each agent is named once.
  */
-const agentsForHandoff = (live: readonly AgentNote[], roster: readonly AgentSeen[]): AgentNote[] => {
+const agentsForHandoff = (
+  live: readonly AgentNote[],
+  roster: readonly AgentSeen[],
+  now: number,
+  config: Config,
+): AgentNote[] => {
   const listed = new Set(live.map(agent => agent.id))
   const ended = roster
     .filter(seen => !listed.has(seen.id))
     .sort((left, right) => right.ts - left.ts)
-    .map((seen): AgentNote => ({ id: seen.id, type: seen.type, description: seen.description, state: ENDED_STATE }))
+    .map(
+      (seen): AgentNote => ({
+        id: seen.id,
+        type: seen.type,
+        description: seen.description,
+        state: ENDED_STATE,
+        ...(seen.contextTokens === undefined ? {} : { cache: cacheNoteOf(seen, now, config) }),
+      }),
+    )
 
   return [...live, ...ended]
 }
@@ -1106,7 +1168,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
    * runs, yet SendMessage still reaches it by this id after it ends, so the handoff
    * has to keep its id, type and task. A repeat of the id updates the row instead.
    */
-  const noteAgent = async (input: { id: string; type: string; description: string; model?: string }): Promise<void> => {
+  const noteAgent = async (input: { id: string; type: string; description: string; model?: string; name?: string }): Promise<void> => {
     await ensureLoaded()
     const known = state.roster.find(seen => seen.id === input.id)
     if (known === undefined) {
@@ -1115,8 +1177,10 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
         type: input.type,
         description: input.description,
         ...(input.model === undefined ? {} : { model: input.model }),
+        ...(input.name === undefined || input.name === '' ? {} : { name: input.name }),
         window: state.window,
         ts: io.now(),
+        lastActiveAt: io.now(),
       })
       if (state.roster.length > MAX_ROSTER) state.roster.splice(0, state.roster.length - MAX_ROSTER)
     } else {
@@ -1124,6 +1188,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       known.description = input.description
       if (input.model === undefined) delete known.model
       else known.model = input.model
+      if (input.name !== undefined && input.name !== '') known.name = input.name
+      known.lastActiveAt = io.now()
       delete known.ended
     }
     saveMeta()
@@ -1136,9 +1202,57 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
   const agentEnded = async (id: string): Promise<void> => {
     await ensureLoaded()
     const known = state.roster.find(seen => seen.id === id)
-    if (known === undefined || known.ended === true) return
+    if (known === undefined) return
     known.ended = true
+    known.lastActiveAt = io.now()
     saveMeta()
+  }
+
+  const agentStep = async (id: string, tokens: number): Promise<void> => {
+    await ensureLoaded()
+    const known = state.roster.find(seen => seen.id === id)
+    if (known === undefined || !Number.isFinite(tokens) || tokens <= 0) return
+    // Kept in memory: the turn's end writes it, so a step does not cost a write.
+    known.contextTokens = Math.round(tokens)
+    known.lastActiveAt = io.now()
+  }
+
+  /** The roster row a SendMessage recipient names: by id, else by the Agent call's name (a trailing ` [ref]` is not part of it). */
+  const seenFor = (to: string): AgentSeen | undefined => {
+    const wanted = to.trim().replace(/\s*\[[^\]]*\]$/, '')
+    if (wanted === '') return undefined
+
+    return state.roster.find(seen => seen.id === wanted) ?? state.roster.find(seen => seen.name === wanted)
+  }
+
+  /** Recipient id -> the hold-back it last got: the repeat of that message, or any within the resend window, goes through. */
+  const heldResends = new Map<string, { at: number; message: string }>()
+
+  const agentResumed = async (to: string): Promise<void> => {
+    await ensureLoaded()
+    const known = seenFor(to)
+    if (known === undefined) return
+    known.lastActiveAt = io.now()
+    delete known.ended
+    saveMeta()
+  }
+
+  const coldResend = async (to: string, message: string): Promise<string | null> => {
+    await ensureLoaded()
+    const known = seenFor(to)
+    if (known === undefined || known.ended !== true) return null
+    const now = io.now()
+    const held = heldResends.get(known.id)
+    if (held !== undefined) {
+      heldResends.delete(known.id)
+      if (held.message === message || now - held.at < config.agentResendMinutes * 60_000) return null
+    }
+    const minutes = idleMinutesOf(known, now)
+    const tokens = known.contextTokens
+    if (tokens === undefined || tokens <= config.agentColdMinTokens || minutes <= config.agentColdMinutes) return null
+    heldResends.set(known.id, { at: now, message })
+
+    return `子代理 ${known.name ?? known.id}（${known.type}）已闲置 ${idleText(minutes)}，提示缓存早已过期，续用第一轮要重写${rewriteOf(tokens)} token 的缓存。建议新建同类型代理，用它最后的报告加文件路径做短交接；若仍要续用，原样再发一次。`
   }
 
   /**
@@ -1875,7 +1989,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     const requests = displayRequests(personRequests(rows, config.recentRequests))
     const answered = repliesAnswered(rows, requests)
     const window = state.window + 1
-    const agents = renderAgents(agentsForHandoff(opts.agents ?? [], state.roster))
+    const agents = renderAgents(agentsForHandoff(opts.agents ?? [], state.roster, io.now(), config))
     const home = renderHome(
       { window, entries: state.page, requests, ...(relay === undefined ? {} : { relay }), answered, archive: state.archive },
       config,
@@ -2071,6 +2185,9 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     activity,
     noteAgent,
     agentEnded,
+    agentStep,
+    agentResumed,
+    coldResend,
     noteStep,
     costlyGroups,
     importMessages,

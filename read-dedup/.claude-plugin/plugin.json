@@ -1,0 +1,1 @@
+{ "name": "read-dedup", "version": "0.1.0", "description": "Re-reading a file already in the context returns a one-line notice if unchanged, or only a diff if changed, saving context tokens.", "author": { "name": "yadaz" } }
