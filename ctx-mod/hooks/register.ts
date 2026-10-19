@@ -650,13 +650,17 @@ const loadClaudeMd = async ($: EngineInterface, cwd: string): Promise<void> => {
 
 // The process-stable attachments (the environment, the model, the listings) are
 // asked again for the first request of every window, so every window writes
-// them into the message again. At the end of the system prompt they read from
-// cache, but the main prompt is composed before they are asked: the texts seen
-// are kept on disk under the session id, so a restart or resume of this session
-// carries them from its first prompt. The types that do not depend on the
-// session are also kept per working directory, so a new session there starts
-// with the same prefix; the session archive, when there is one, wins. This
-// process carries the texts it saw after a window switch.
+// them into the message again. Only the types every session in one directory
+// can share (the listings and the whole texts) move to the end of the system
+// prompt, where they read from cache; the session's own types (the environment
+// with its scratchpad path, the model, the session context) stay in the
+// message, so every session's prompt ends the same and another session's cache
+// can be read. The main prompt is composed before they are asked: the texts
+// seen are kept on disk under the session id, so a restart or resume of this
+// session carries them from its first prompt. The shared types are also kept
+// per entrypoint and working directory, so a new session there starts with the
+// same prefix; the session archive, when there is one, wins. This process
+// carries the texts it saw after a window switch.
 
 /** The attachment types that stay the same for the process, so may move. */
 const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
@@ -952,7 +956,11 @@ export const register: Register = (on, options) => {
       // the same prefix, then the rest as they arrived. Until a switch the
       // previous process's texts are used, so the first window hits the cache;
       // after one, this process's own texts replace them, dropping stale ones.
+      // Only the shared types move: a session's own texts (its scratchpad path,
+      // model, git status) would make every session's prompt differ, so the
+      // prompt's tail could never be read from another session's cache.
       const attachmentsSource = orderedAttachments(attachmentsArmed ? seenAttachments : storedAttachments ?? [])
+        .filter(seen => SHARED_TYPE_SET.has(seen.type))
       const attachments = main && attachToSystem && attachmentsSource.length > 0
         ? [{ id: 'ctx-mod:attachments', text: attachmentsSource.map(seen => seen.text).join('\n\n'), scope: 'session' as const }]
         : []
