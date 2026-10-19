@@ -6,9 +6,9 @@
 
 ## SDK
 
-- `tools.read / write / edit`：edit 是原子写，带过期检查（STALE）。
+- `tools.read / write / edit`：edit 是原子写，带过期检查（STALE）。`all:true` 时返回改动处数和行号，可传 `expect` 声明预期处数，不符则整次不写（COUNT_MISMATCH）。
 - `tools.glob / grep`：调用 ripgrep，遵循 `.gitignore`，跳过隐藏项、`node_modules`、`target`、`.venv`，单文件上限 2MB；结果分页。
-- `tools.replace`：跨文件正则替换，支持 `dryRun`。
+- `tools.replace`：跨文件正则替换，支持 `dryRun` 和 `expect`，结果带每个文件的处数和行号。一次改了多处的写操作会在输出开头列出，成功时也会。
 - `tools.batch`：复制/移动/删除的预检、执行、续跑，带日志，支持跨盘（`toRoot`）。
 - `tools.bash`：同步执行一条命令。
 - `tools.parallel([{command,cwd?,timeoutMs?}], {concurrency})`：并发执行多条命令，按输入顺序返回；单项超时不影响其他项，结束时清理子进程。
