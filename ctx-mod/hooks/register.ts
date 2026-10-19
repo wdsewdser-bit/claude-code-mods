@@ -652,8 +652,9 @@ const loadClaudeMd = async ($: EngineInterface, cwd: string): Promise<void> => {
 // asked again for the first request of every window, so every window writes
 // them into the message again. At the end of the system prompt they read from
 // cache, but the main prompt is composed before they are asked: the texts seen
-// are kept on disk per working directory, so the next process carries them from
-// its first prompt; this process carries the texts it saw after a window switch.
+// are kept on disk under the session id, so a restart or resume of this session
+// carries them from its first prompt; this process carries the texts it saw
+// after a window switch. Another session in the same directory never sees them.
 
 /** The attachment types that stay the same for the process, so may move. */
 const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
@@ -669,13 +670,47 @@ const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
   'session_context',
 ])
 
+/** One process-stable attachment: its type and the text as the engine rendered it. */
+type SeenAttachment = { type: string; text: string }
+
+/** A stored entry's shape; anything else is a damaged archive. */
+const isSeenAttachment = (item: unknown): item is SeenAttachment =>
+  typeof item === 'object' &&
+  item !== null &&
+  typeof (item as { type?: unknown }).type === 'string' &&
+  typeof (item as { text?: unknown }).text === 'string'
+
+/** A type that may appear more than once: each delta and the listing is its own text. */
+const isIncremental = (type: string): boolean => type === 'skill_listing' || type.endsWith('_delta')
+
+/** Records one attachment; incremental types accumulate, the others keep only the newest per type. */
+const recordAttachment = (type: string, text: string): boolean => {
+  if (isIncremental(type)) {
+    if (seenAttachments.some(seen => seen.type === type && seen.text === text)) return false
+    seenAttachments.push({ type, text })
+
+    return true
+  }
+  const index = seenAttachments.findIndex(seen => seen.type === type)
+  if (index < 0) {
+    seenAttachments.push({ type, text })
+
+    return true
+  }
+  // A changed non-incremental text replaces the old one in place.
+  if (seenAttachments[index]?.text === text) return false
+  seenAttachments[index] = { type, text }
+
+  return true
+}
+
 /** `CTX_MOD_ATTACH_TO_SYSTEM` is not 0: the whitelisted attachments may move. */
 let attachToSystem = false
-/** The whitelisted texts the model read this process, in arrival order, each once. */
-let seenAttachments: string[] = []
-/** The texts the previous process stored, read at session start. */
-let storedAttachments: string[] | undefined
-/** Where `storedAttachments` lives; empty when the mod is off for this session. */
+/** The whitelisted attachments the model read this process, in arrival order. */
+let seenAttachments: SeenAttachment[] = []
+/** The attachments the previous process of this session stored, read at session start. */
+let storedAttachments: SeenAttachment[] | undefined
+/** Where `storedAttachments` lives; empty when the mod is off or the session has no id. */
 let attachmentsPath = ''
 /** The JSON last read or written, so an unchanged list is not written again. */
 let attachmentsSaved = ''
@@ -686,8 +721,8 @@ let attachmentsInSystem: string[] = []
 /** A compaction happened: every main compose from now on carries the section. */
 let attachmentsArmed = false
 
-/** Reads the switch and the stored texts at session start; a new process starts with nothing seen. */
-const loadAttachments = async ($: EngineInterface, cwd: string): Promise<void> => {
+/** Reads the switch and this session's stored texts at session start; a new process starts with nothing seen. */
+const loadAttachments = async ($: EngineInterface): Promise<void> => {
   attachToSystem = (await $.env.get('CTX_MOD_ATTACH_TO_SYSTEM')) !== '0'
   seenAttachments = []
   storedAttachments = undefined
@@ -696,15 +731,20 @@ const loadAttachments = async ($: EngineInterface, cwd: string): Promise<void> =
   attachmentsInSystem = []
   attachmentsArmed = false
   if (!attachToSystem) return
+  // The archive belongs to one session: a new session in the same directory must
+  // not inherit another one's environment, model or scratchpad paths.
+  const id = await idOf($)
+  // The id names a file, so one that could leave the directory is not used.
+  if (id === undefined || !/^[\w-]+$/.test(id)) return
   const home = await homeOf($)
   if (home === '') return
-  attachmentsPath = `${home}/.claude/ctx-mod/attachments/${cwdKey(cwd)}.json`
+  attachmentsPath = `${home}/.claude/ctx-mod/attachments/${id}.json`
   const text = await attempt(async () => await $.fs.read(attachmentsPath), undefined)
   if (typeof text !== 'string') return
   const parsed = await attempt(async () => JSON.parse(text) as unknown, undefined)
-  // A damaged or empty archive is no archive: the first window stays as it was.
-  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(item => typeof item === 'string')) return
-  storedAttachments = parsed as string[]
+  // A damaged, empty or old string-array archive is no archive: the first window stays as it was.
+  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(isSeenAttachment)) return
+  storedAttachments = parsed as SeenAttachment[]
   attachmentsSaved = JSON.stringify(storedAttachments)
 }
 
@@ -767,7 +807,7 @@ export const register: Register = (on, options) => {
     try {
       enabled = (await $.env.get('CTX_MOD')) === '1'
       if (enabled) {
-        await loadAttachments($, e.cwd).catch(error => logError($, 'attachments', error))
+        await loadAttachments($).catch(error => logError($, 'attachments', error))
         await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
       }
       // The command is always there, so a person who installed the mod and
@@ -826,10 +866,10 @@ export const register: Register = (on, options) => {
       // after one, this process's own texts replace them, dropping stale ones.
       const attachmentsSource = attachmentsArmed ? seenAttachments : storedAttachments ?? []
       const attachments = main && attachToSystem && attachmentsSource.length > 0
-        ? [{ id: 'ctx-mod:attachments', text: attachmentsSource.join('\n\n'), scope: 'session' as const }]
+        ? [{ id: 'ctx-mod:attachments', text: attachmentsSource.map(seen => seen.text).join('\n\n'), scope: 'session' as const }]
         : []
       // Only a main prompt carries them; a side analysis leaves the set alone.
-      if (main) attachmentsInSystem = attachments.length > 0 ? [...attachmentsSource] : []
+      if (main) attachmentsInSystem = attachments.length > 0 ? attachmentsSource.map(seen => seen.text) : []
 
       return {
         ...result,
@@ -857,10 +897,7 @@ export const register: Register = (on, options) => {
     try {
       if (!ATTACHMENT_TYPES.has(e.type) || result.text === null) return result
       // Record first: a text already in the prompt must survive the next switch.
-      if (!seenAttachments.includes(result.text)) {
-        seenAttachments.push(result.text)
-        await saveAttachments($)
-      }
+      if (recordAttachment(e.type, result.text)) await saveAttachments($)
       if (attachmentsInSystem.includes(result.text)) return { text: null }
 
       return result

@@ -43,6 +43,8 @@ type World = {
   runError: unknown
   /** Files `$.fs.read` answers with; empty unless a test puts one here, so every other read is denied as before. */
   readable: Map<string, string>
+  /** The paths `$.fs.read` was asked for, in order. */
+  reads: string[]
   /** Awaited inside every `$.fs.write`, so a test can hold writes open; none unless set. */
   writeGate: (() => Promise<void>) | undefined
   /** What `$.agent.list()` answers with. */
@@ -97,6 +99,7 @@ const world = (
     clock: mock.clock(on, { now }),
     files: new Map(),
     readable: new Map(),
+    reads: [],
     messages: [],
     tools: [],
     commands: [],
@@ -129,6 +132,7 @@ const world = (
     return { value: undefined }
   })
   on('fs.read', (_$, e) => {
+    w.reads.push(slashed(e.path))
     const text = w.readable.get(slashed(e.path))
 
     return text === undefined ? { deny: `ENOENT: ${e.path}` } : ({ value: text } as never)
@@ -1903,14 +1907,6 @@ const attachmentText = (sections: readonly { id: string; text: string }[]): stri
 const storedAttachmentsPath = (w: World): string | undefined =>
   [...w.files.keys()].find(path => path.includes('/.claude/ctx-mod/attachments/'))
 
-/** The same key register.ts derives from a working directory. */
-const keyOf = (cwd: string): string => {
-  let hash = 5381
-  for (const char of cwd.replaceAll('\\', '/').toLowerCase()) hash = ((hash * 33) ^ char.charCodeAt(0)) >>> 0
-
-  return hash.toString(16).padStart(8, '0')
-}
-
 /** One process that sees these attachments, leaving their archive where the next process reads it. */
 const archiveFrom = async (
   $: Engine,
@@ -2017,6 +2013,7 @@ test('armed, the next process carries the stored attachments from its first syst
   promptBottoms(on)
   const path = await archiveFrom($, on, w, [['environment', 'ENV'], ['skill_listing', 'SKILL']])
   expect(path.startsWith(`${slashed(HOME)}/.claude/ctx-mod/attachments/`)).toBe(true)
+  expect(path.endsWith('/s-at-stored.json')).toBe(true)
 
   await boot($)
   // The first main prompt already carries the archive, before this process sees anything.
@@ -2036,7 +2033,8 @@ test('armed, a damaged, non-string or empty archive is treated as no archive', a
   const w = world(on, 's-at-bad-archive', { CTX_MOD: '1' })
   promptBottoms(on)
   const path = await archiveFrom($, on, w, [['environment', 'ENV']])
-  for (const bad of ['{not json', '{"a":1}', '[]', '[1,2]']) {
+  // The old pure string-array format is no longer an archive.
+  for (const bad of ['{not json', '{"a":1}', '[]', '["ENV"]', '[{"type":"environment"}]', '[{"type":1,"text":"ENV"}]']) {
     w.readable.set(path, bad)
     w.files.clear()
     await boot($)
@@ -2081,7 +2079,7 @@ test('armed, a new attachment is stored and an unchanged list is not written aga
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   const path = storedAttachmentsPath(w)
   expect(path).toBeDefined()
-  expect(w.files.get(path ?? '')).toBe('["ENV"]')
+  expect(w.files.get(path ?? '')).toBe('[{"type":"environment","text":"ENV"}]')
 
   w.files.clear()
   // The same text again adds nothing, so nothing is written.
@@ -2089,7 +2087,7 @@ test('armed, a new attachment is stored and an unchanged list is not written aga
   expect(storedAttachmentsPath(w)).toBeUndefined()
   // A new text is added, and the whole list is written.
   expect(await attach($, 'skill_listing', 'SKILL')).toBe('SKILL')
-  expect(w.files.get(path ?? '')).toBe('["ENV","SKILL"]')
+  expect(w.files.get(path ?? '')).toBe('[{"type":"environment","text":"ENV"},{"type":"skill_listing","text":"SKILL"}]')
 })
 
 test('armed, attachments arriving together write the archive one at a time, ending with the whole list', async ($, on) => {
@@ -2107,19 +2105,88 @@ test('armed, attachments arriving together write the archive one at a time, endi
   await boot($)
   await Promise.all([attach($, 'environment', 'ENV'), attach($, 'model', 'MODEL'), attach($, 'skill_listing', 'SKILL')])
   expect(overlapped).toBe(false)
-  expect(JSON.parse(w.files.get(storedAttachmentsPath(w) ?? '') ?? '[]')).toEqual(['ENV', 'MODEL', 'SKILL'])
+  expect(JSON.parse(w.files.get(storedAttachmentsPath(w) ?? '') ?? '[]')).toEqual([
+    { type: 'environment', text: 'ENV' },
+    { type: 'model', text: 'MODEL' },
+    { type: 'skill_listing', text: 'SKILL' },
+  ])
 })
 
 test('with CTX_MOD_ATTACH_TO_SYSTEM=0 the archive is neither read nor written', async ($, on) => {
   const w = world(on, 's-at-off-archive', { CTX_MOD: '1', CTX_MOD_ATTACH_TO_SYSTEM: '0' })
   promptBottoms(on)
   attachmentBottom(on)
-  const path = `${slashed(HOME)}/.claude/ctx-mod/attachments/${keyOf('/work')}.json`
-  w.readable.set(path, '["STORED"]')
+  const path = `${slashed(HOME)}/.claude/ctx-mod/attachments/${w.sessionId}.json`
+  w.readable.set(path, '[{"type":"environment","text":"STORED"}]')
   await boot($)
   expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   await compact($, 'manual')
   expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(w.reads.filter(p => p.includes('/.claude/ctx-mod/attachments/'))).toEqual([])
   expect(storedAttachmentsPath(w)).toBeUndefined()
+})
+
+test('armed, another session in the same directory does not see this session’s archive', async ($, on) => {
+  const w = world(on, 's-at-owner', { CTX_MOD: '1' })
+  promptBottoms(on)
+  const ownerPath = await archiveFrom($, on, w, [['model', 'Opus 5.5'], ['environment', 'OWNER-ENV']])
+  expect(ownerPath.endsWith('/s-at-owner.json')).toBe(true)
+
+  // The same working directory, a different session: the owner's texts are not read.
+  w.sessionId = 's-at-other'
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await attach($, 'model', 'Haiku 4')).toBe('Haiku 4')
+  // This session writes its own archive and leaves the owner's alone.
+  const otherPath = storedAttachmentsPath(w)
+  expect(otherPath?.endsWith('/s-at-other.json')).toBe(true)
+  expect(w.files.get(ownerPath)).toBeUndefined()
+})
+
+test('armed, without a session id the archive is neither read nor written', async ($, on) => {
+  const w = world(on, 's-at-no-id', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  w.sessionId = undefined as never
+  w.reads.length = 0
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(w.reads.filter(p => p.includes('/.claude/ctx-mod/attachments/'))).toEqual([])
+  expect(storedAttachmentsPath(w)).toBeUndefined()
+})
+
+test('after a window switch, a changed non-incremental text replaces the old one', async ($, on) => {
+  const w = world(on, 's-at-replace', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'model', 'MODEL-A')).toBe('MODEL-A')
+  expect(await attach($, 'model', 'MODEL-B')).toBe('MODEL-B')
+  // The same text again adds nothing.
+  expect(await attach($, 'model', 'MODEL-B')).toBe('MODEL-B')
+
+  await compact($, 'manual')
+  const text = attachmentText(await composeIds($))
+  expect(text).toBe('ENV\n\nMODEL-B')
+  expect(text).not.toContain('MODEL-A')
+})
+
+test('after a window switch, incremental types keep every text they saw', async ($, on) => {
+  const w = world(on, 's-at-incremental', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'agent_listing_delta', 'DELTA-A')).toBe('DELTA-A')
+  expect(await attach($, 'agent_listing_delta', 'DELTA-B')).toBe('DELTA-B')
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBe('SKILL-A')
+  expect(await attach($, 'skill_listing', 'SKILL-B')).toBe('SKILL-B')
+  // A repeat is still kept once.
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBe('SKILL-A')
+
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('DELTA-A\n\nDELTA-B\n\nSKILL-A\n\nSKILL-B')
 })
