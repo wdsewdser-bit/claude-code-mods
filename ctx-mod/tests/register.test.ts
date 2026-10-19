@@ -1774,3 +1774,105 @@ test('armed, the handoff tells how long an ended subagent has been idle and that
   const text = await handoffOf($)
   expect(text).toContain('- a1（worker，已结束；闲置 3 小时，缓存已冷，约 19.1 万 token）：改 register')
 })
+
+// ── CLAUDE.md moved to the end of the system prompt ──
+
+/** The claudeMd block is the files' whole rendering: the announcement and each file's contents. */
+const RENDERED = 'Codebase and user instructions are shown below.\n\nContents of CLAUDE.md:\n\nthe rules'
+const FILE = { path: 'C:/Users/someone/.claude/CLAUDE.md', kind: 'user', content: 'the rules' }
+const CORE_SECTIONS = [{ id: 'core:intro', text: 'You are Claude Code.', scope: 'shared' as const }]
+
+/** The bottoms of the two events: core's context blocks with its files, and core's system prompt. */
+const promptBottoms = (on: On, files: readonly typeof FILE[] = [FILE]): void => {
+  on('prompt.context', () => ({
+    blocks: [
+      { name: 'claudeMd', text: RENDERED },
+      { name: 'userEmail', text: 'a@b.c' },
+    ],
+    instructionFiles: files,
+  }) as never)
+  on('prompt.compose', () => ({ sections: CORE_SECTIONS }))
+}
+
+const MAIN_TRAITS = ['lean', 'print', 'skills'] as const
+
+const composeIds = async ($: Engine, traits: readonly string[] = MAIN_TRAITS): Promise<{ id: string; text: string }[]> =>
+  (await $.prompt.compose({ model: 'claude-haiku-5-5', promptModel: 'claude-haiku-5-5', tools: [], outputStyle: null, surfaces: [], traits } as never)).sections.map(s => ({ id: s.id, text: s.text }))
+
+const contextNames = async ($: Engine, files: readonly typeof FILE[] = [FILE]): Promise<string[]> =>
+  ((await $.prompt.context({ blocks: [], instructionFiles: files } as never)) as unknown as { blocks: readonly { name: string }[] }).blocks.map(b => b.name)
+
+/** Where the mod keeps the rendered files for the next process, once it wrote them. */
+const storedPath = (w: World): string | undefined => [...w.files.keys()].find(path => path.includes('/.claude/ctx-mod/claude-md/'))
+
+test('armed, the first process stores the files and keeps them in the message', async ($, on) => {
+  const w = world(on, 's-md-first', { CTX_MOD: '1' })
+  promptBottoms(on)
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await contextNames($)).toEqual(['claudeMd', 'userEmail'])
+  const path = storedPath(w)
+  expect(path?.startsWith(`${slashed(HOME)}/.claude/ctx-mod/claude-md/`)).toBe(true)
+  expect(w.files.get(path ?? '')).toBe(RENDERED)
+})
+
+test('armed, the next process closes the main system prompt with the stored files and drops the message copy', async ($, on) => {
+  const w = world(on, 's-md-next', { CTX_MOD: '1' })
+  promptBottoms(on)
+  await boot($)
+  await composeIds($)
+  await contextNames($)
+  const path = storedPath(w) ?? ''
+  w.readable.set(path, RENDERED)
+  w.files.clear()
+  await boot($)
+  const sections = await composeIds($)
+  expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:claude-md', 'ctx-mod:context'])
+  expect(sections[1]?.text).toBe(RENDERED)
+  expect(await contextNames($)).toEqual(['userEmail'])
+  // A side analysis prompt carries no files.
+  expect((await composeIds($, ['lean', 'analysis'])).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  // Nothing changed, so nothing is written again.
+  expect(storedPath(w)).toBeUndefined()
+})
+
+test('armed, files changed since the last process stay in the message and are stored again', async ($, on) => {
+  const w = world(on, 's-md-changed', { CTX_MOD: '1' })
+  promptBottoms(on)
+  await boot($)
+  await contextNames($)
+  const path = storedPath(w) ?? ''
+  w.readable.set(path, 'an older text')
+  w.files.clear()
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:claude-md', 'ctx-mod:context'])
+  expect(await contextNames($)).toEqual(['claudeMd', 'userEmail'])
+  expect(w.files.get(path)).toBe(RENDERED)
+})
+
+test('armed, with no instruction files nothing moves or is stored', async ($, on) => {
+  const w = world(on, 's-md-empty', { CTX_MOD: '1' })
+  promptBottoms(on, [])
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await contextNames($, [])).toEqual(['claudeMd', 'userEmail'])
+  expect(storedPath(w)).toBeUndefined()
+})
+
+test('armed with CTX_MOD_CLAUDEMD_TO_SYSTEM=0, the files are left alone', async ($, on) => {
+  const w = world(on, 's-md-off', { CTX_MOD: '1', CTX_MOD_CLAUDEMD_TO_SYSTEM: '0' })
+  promptBottoms(on)
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await contextNames($)).toEqual(['claudeMd', 'userEmail'])
+  expect(storedPath(w)).toBeUndefined()
+})
+
+test('with CTX_MOD unset, the files are left alone', async ($, on) => {
+  const w = world(on, 's-md-unset')
+  promptBottoms(on)
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro'])
+  expect(await contextNames($)).toEqual(['claudeMd', 'userEmail'])
+  expect(storedPath(w)).toBeUndefined()
+})

@@ -599,11 +599,81 @@ const TOOLS = [
   },
 ] as const
 
+// The instruction files (CLAUDE.md, AGENTS.md, memory) ride in the first user
+// message, which has no cache mark, so every window writes them again. At the
+// end of the system prompt they read from cache. The main system prompt is
+// composed once per process and before the context is, so it carries the files
+// as the previous process rendered them, kept on disk per working directory;
+// the message drops its copy only when that text is the files as they are now.
+
+/** The files as the previous process rendered them, read at session start. */
+let storedClaudeMd: string | undefined
+/** Where `storedClaudeMd` lives; empty when the mod is off for this session. */
+let claudeMdPath = ''
+/** The main system prompt carries `storedClaudeMd`. */
+let claudeMdInSystem = false
+
+/** Only the main conversation's prompt carries the files; a side analysis does not. */
+const isMainCompose = (traits: readonly string[]): boolean => !traits.includes('analysis')
+
+/** A file name for a working directory: a short hash, the same on every run. */
+const cwdKey = (cwd: string): string => {
+  let hash = 5381
+  for (const char of cwd.replaceAll('\\', '/').toLowerCase()) hash = ((hash * 33) ^ char.charCodeAt(0)) >>> 0
+
+  return hash.toString(16).padStart(8, '0')
+}
+
+/** Reads the stored text at session start; off, or nothing stored, leaves it absent. */
+const loadClaudeMd = async ($: EngineInterface, cwd: string): Promise<void> => {
+  storedClaudeMd = undefined
+  claudeMdInSystem = false
+  claudeMdPath = ''
+  if ((await $.env.get('CTX_MOD_CLAUDEMD_TO_SYSTEM')) === '0') return
+  const profile = await attempt(async () => await $.env.get('USERPROFILE'), undefined)
+  const raw =
+    typeof profile === 'string' && profile !== ''
+      ? profile
+      : await attempt(async () => await $.env.get('HOME'), undefined)
+  const home = typeof raw === 'string' ? raw.replace(/[\\/]+$/, '') : ''
+  if (home === '') return
+  claudeMdPath = `${home}/.claude/ctx-mod/claude-md/${cwdKey(cwd)}.txt`
+  const text = await attempt(async () => await $.fs.read(claudeMdPath), undefined)
+  storedClaudeMd = typeof text === 'string' && text.trim() !== '' ? text : undefined
+}
+
 export const register: Register = (on, options) => {
+  // The context fires once per conversation and again after a compaction.
+  on('prompt.context', async ($, e, next) => {
+    const result = await next(e)
+    if (!enabled || claudeMdPath === '') return result
+    try {
+      const block = result.blocks.find(b => b.name === 'claudeMd')
+      const files = (result.instructionFiles ?? e.instructionFiles ?? []).filter(f => f.content.trim() !== '')
+      if (block === undefined || files.length === 0) return result
+      // The block is the files' whole rendering: the announcement and each file's contents.
+      const current = block.text
+      if (current !== storedClaudeMd) {
+        // The next process composes with these; this one keeps its copy in the message.
+        await $.fs.write(claudeMdPath, current)
+
+        return result
+      }
+      // Only a main prompt already composed with this text lets the message drop its copy.
+      if (!claudeMdInSystem) return result
+
+      return { ...result, blocks: result.blocks.filter(b => b !== block) }
+    } catch (error) {
+      logError($, 'prompt.context', error)
+
+      return result
+    }
+  })
 
   on('session.start', async ($, e, next) => {
     try {
       enabled = (await $.env.get('CTX_MOD')) === '1'
+      if (enabled) await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
       // The command is always there, so a person who installed the mod and
       // typed /ctx-mod is told how to turn it on instead of meeting an unknown command.
       await $.command.register({
@@ -649,10 +719,16 @@ export const register: Register = (on, options) => {
     if (!enabled) return next(e)
     const result = await next(e)
     try {
+      const claudeMd = isMainCompose(e.traits) && storedClaudeMd !== undefined
+        ? [{ id: 'ctx-mod:claude-md', text: storedClaudeMd, scope: 'session' as const }]
+        : []
+      if (claudeMd.length > 0) claudeMdInSystem = true
+
       return {
         ...result,
         sections: [
           ...result.sections,
+          ...claudeMd,
           { id: 'ctx-mod:context', text: SYSTEM_TEXT, scope: 'session' as const },
         ],
       }
