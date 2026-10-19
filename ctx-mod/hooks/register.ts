@@ -13,7 +13,7 @@ import { DEFAULTS, OWN_TOOL_PREFIX } from './lib/types.ts'
 
 /** The section of the system prompt, the same all session long. */
 const SYSTEM_TEXT =
-  '这个会话可能跨多个上下文窗口。你有一个任务账本（mcp__ctx-mod__ledger_append、mcp__ctx-mod__ledger_read）和完整历史（mcp__ctx-mod__history）。工具结果末尾形如 [#123] 的是历史编号。每完成一个阶段，就追加一条账本记录：用 task_id 标识任务，status 填 in_progress / done / superseded / blocked。标 done 时必须在 evidence 里附上证明它的工具结果的历史编号。用户提出新请求时，如果它取代了旧任务，就把旧任务标为 superseded。对还没做完的任务，写明 next_step，并用 anchors 记下接下来要改的位置：文件路径，加一小段能在文件里唯一定位的原文。收到收尾或交接通知时，先更新账本。上下文用量可以用 mcp__ctx-mod__context 查看；它提示可以换窗口时，先记账再调用它的 new。申请换窗口之前，先用 ledger_append 把进行中任务的进度写清楚，text 里写明后面要用到的关键事实（产物路径、已确认的结论、约定的参数），有子代理在跑时写明各自的 id、负责什么、产物放哪。'
+  '这个会话可能跨多个上下文窗口。你有一个任务账本（mcp__ctx-mod__ledger_append、mcp__ctx-mod__ledger_read）和完整历史（mcp__ctx-mod__history）。工具结果末尾形如 [#123] 的是历史编号。每完成一个阶段，就追加一条账本记录：用 task_id 标识任务，status 填 in_progress / done / superseded / blocked。标 done 时必须在 evidence 里附上证明它的工具结果的历史编号。用户提出新请求时，如果它取代了旧任务，就把旧任务标为 superseded。对还没做完的任务，写明 next_step，并用 anchors 记下接下来要改的位置：文件路径，加一小段能在文件里唯一定位的原文。收到收尾或交接通知时，先更新账本。上下文用量可以用 mcp__ctx-mod__context 查看；它提示可以换窗口时，先记账再调用它的 new。申请换窗口之前，先用 ledger_append 把进行中任务的进度写清楚，text 里写明后面要用到的关键事实（产物路径、已确认的结论、约定的参数），有子代理在跑时写明各自的 id、负责什么、产物放哪。改法已经确定的改动不要留给新窗口：和 new 放在同一条消息里并发做完；只有还需要判断的才写进 anchors。'
 
 /** Submitted after a switch the model itself asked for, so the new window carries on. */
 const CONTINUE_TEXT = 'ctx-mod：已换到新的上下文窗口。先用一句话复述当前请求和进度，然后继续。'
@@ -494,7 +494,7 @@ const TOOLS = [
   {
     name: 'context',
     description:
-      '查看上下文用量，或申请换到新的上下文窗口。action 为 "new" 时申请换窗口；引擎批准后必须立即结束本回合，不要再调用任何工具。',
+      '查看上下文用量，或申请换到新的上下文窗口。action 为 "new" 时申请换窗口；改法已经完全确定的改动，和 new 放在同一条消息里并发调用（如 ptc），让程序打印一行成败摘要，这些调用照常执行，摘要会完整带进交接；引擎批准后必须立即结束本回合，不要再发起新的工具调用。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -741,7 +741,7 @@ export const register: Register = (on, options) => {
     try {
       remember(String(e.tool_use_id), String(e.tool), e as unknown as Record<string, unknown>)
       const session = await sessionOf($)
-      if (session !== undefined && session.pending() !== null) {
+      if (session !== undefined && session.blocksCalls()) {
         return { deny: '正在换窗口：请立即结束本回合，不要再调用工具。' }
       }
       // A resume of an ended subagent whose cache has gone cold is held back once, with its cost.

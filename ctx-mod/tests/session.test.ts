@@ -495,7 +495,7 @@ describe('requestSwitch', () => {
     )
     const urgent = session.requestSwitch({ reason: '上下文快满了' }, env(90_000))
     expect(urgent.isError).toBeUndefined()
-    expect(session.pending()).toEqual({ reason: '上下文快满了', at: 1_001_000 })
+    expect(session.pending()).toMatchObject({ reason: '上下文快满了', at: 1_001_000 })
 
     box.advance(121_000)
     expect(session.pending()).toBeNull()
