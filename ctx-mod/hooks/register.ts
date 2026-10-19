@@ -624,18 +624,24 @@ const cwdKey = (cwd: string): string => {
   return hash.toString(16).padStart(8, '0')
 }
 
+/** The home directory from the environment; empty when neither variable names one. */
+const homeOf = async ($: EngineInterface): Promise<string> => {
+  const profile = await attempt(async () => await $.env.get('USERPROFILE'), undefined)
+  const raw =
+    typeof profile === 'string' && profile !== ''
+      ? profile
+      : await attempt(async () => await $.env.get('HOME'), undefined)
+
+  return typeof raw === 'string' ? raw.replace(/[\\/]+$/, '') : ''
+}
+
 /** Reads the stored text at session start; off, or nothing stored, leaves it absent. */
 const loadClaudeMd = async ($: EngineInterface, cwd: string): Promise<void> => {
   storedClaudeMd = undefined
   claudeMdInSystem = false
   claudeMdPath = ''
   if ((await $.env.get('CTX_MOD_CLAUDEMD_TO_SYSTEM')) === '0') return
-  const profile = await attempt(async () => await $.env.get('USERPROFILE'), undefined)
-  const raw =
-    typeof profile === 'string' && profile !== ''
-      ? profile
-      : await attempt(async () => await $.env.get('HOME'), undefined)
-  const home = typeof raw === 'string' ? raw.replace(/[\\/]+$/, '') : ''
+  const home = await homeOf($)
   if (home === '') return
   claudeMdPath = `${home}/.claude/ctx-mod/claude-md/${cwdKey(cwd)}.txt`
   const text = await attempt(async () => await $.fs.read(claudeMdPath), undefined)
@@ -646,7 +652,8 @@ const loadClaudeMd = async ($: EngineInterface, cwd: string): Promise<void> => {
 // asked again for the first request of every window, so every window writes
 // them into the message again. At the end of the system prompt they read from
 // cache, but the main prompt is composed before they are asked: the texts seen
-// so far are kept and put into the next window's prompt.
+// are kept on disk per working directory, so the next process carries them from
+// its first prompt; this process carries the texts it saw after a window switch.
 
 /** The attachment types that stay the same for the process, so may move. */
 const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
@@ -666,17 +673,58 @@ const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
 let attachToSystem = false
 /** The whitelisted texts the model read this process, in arrival order, each once. */
 let seenAttachments: string[] = []
+/** The texts the previous process stored, read at session start. */
+let storedAttachments: string[] | undefined
+/** Where `storedAttachments` lives; empty when the mod is off for this session. */
+let attachmentsPath = ''
+/** The JSON last read or written, so an unchanged list is not written again. */
+let attachmentsSaved = ''
+/** The write in flight, so the next one starts after it. */
+let attachmentsSaving: Promise<void> = Promise.resolve()
 /** The texts the current main system prompt carries, so the message can leave them out. */
 let attachmentsInSystem: string[] = []
 /** A compaction happened: every main compose from now on carries the section. */
 let attachmentsArmed = false
 
-/** Reads the switch at session start; a new process starts with nothing seen. */
-const loadAttachments = async ($: EngineInterface): Promise<void> => {
+/** Reads the switch and the stored texts at session start; a new process starts with nothing seen. */
+const loadAttachments = async ($: EngineInterface, cwd: string): Promise<void> => {
   attachToSystem = (await $.env.get('CTX_MOD_ATTACH_TO_SYSTEM')) !== '0'
   seenAttachments = []
+  storedAttachments = undefined
+  attachmentsPath = ''
+  attachmentsSaved = ''
   attachmentsInSystem = []
   attachmentsArmed = false
+  if (!attachToSystem) return
+  const home = await homeOf($)
+  if (home === '') return
+  attachmentsPath = `${home}/.claude/ctx-mod/attachments/${cwdKey(cwd)}.json`
+  const text = await attempt(async () => await $.fs.read(attachmentsPath), undefined)
+  if (typeof text !== 'string') return
+  const parsed = await attempt(async () => JSON.parse(text) as unknown, undefined)
+  // A damaged or empty archive is no archive: the first window stays as it was.
+  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(item => typeof item === 'string')) return
+  storedAttachments = parsed as string[]
+  attachmentsSaved = JSON.stringify(storedAttachments)
+}
+
+/** Writes the texts seen so far back for the next process; an unchanged list is not written again. */
+const saveAttachments = async ($: EngineInterface): Promise<void> => {
+  // Attachments arrive in parallel: overlapping writes to one file leave it
+  // padded with NULs, so each write waits for the one before and takes the
+  // list as it is then.
+  attachmentsSaving = attachmentsSaving.then(async () => {
+    if (attachmentsPath === '') return
+    const text = JSON.stringify(seenAttachments)
+    if (text === attachmentsSaved) return
+    try {
+      await $.fs.write(attachmentsPath, text)
+      attachmentsSaved = text
+    } catch (error) {
+      logError($, 'attachments', error)
+    }
+  })
+  await attachmentsSaving
 }
 
 /** After a window switch: the next main compose carries the attachments, so it is composed again. */
@@ -719,7 +767,7 @@ export const register: Register = (on, options) => {
     try {
       enabled = (await $.env.get('CTX_MOD')) === '1'
       if (enabled) {
-        await loadAttachments($).catch(error => logError($, 'attachments', error))
+        await loadAttachments($, e.cwd).catch(error => logError($, 'attachments', error))
         await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
       }
       // The command is always there, so a person who installed the mod and
@@ -773,12 +821,15 @@ export const register: Register = (on, options) => {
         : []
       if (claudeMd.length > 0) claudeMdInSystem = true
       // The attachments ride after the files and before the mod's own section,
-      // so the prompt's tail stays the same all window long.
-      const attachments = main && attachToSystem && attachmentsArmed && seenAttachments.length > 0
-        ? [{ id: 'ctx-mod:attachments', text: seenAttachments.join('\n\n'), scope: 'session' as const }]
+      // so the prompt's tail stays the same all window long. Until a switch the
+      // previous process's texts are used, so the first window hits the cache;
+      // after one, this process's own texts replace them, dropping stale ones.
+      const attachmentsSource = attachmentsArmed ? seenAttachments : storedAttachments ?? []
+      const attachments = main && attachToSystem && attachmentsSource.length > 0
+        ? [{ id: 'ctx-mod:attachments', text: attachmentsSource.join('\n\n'), scope: 'session' as const }]
         : []
       // Only a main prompt carries them; a side analysis leaves the set alone.
-      if (main) attachmentsInSystem = attachments.length > 0 ? [...seenAttachments] : []
+      if (main) attachmentsInSystem = attachments.length > 0 ? [...attachmentsSource] : []
 
       return {
         ...result,
@@ -805,8 +856,12 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     try {
       if (!ATTACHMENT_TYPES.has(e.type) || result.text === null) return result
+      // Record first: a text already in the prompt must survive the next switch.
+      if (!seenAttachments.includes(result.text)) {
+        seenAttachments.push(result.text)
+        await saveAttachments($)
+      }
       if (attachmentsInSystem.includes(result.text)) return { text: null }
-      if (!seenAttachments.includes(result.text)) seenAttachments.push(result.text)
 
       return result
     } catch (error) {
