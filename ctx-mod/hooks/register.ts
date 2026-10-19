@@ -653,8 +653,10 @@ const loadClaudeMd = async ($: EngineInterface, cwd: string): Promise<void> => {
 // them into the message again. At the end of the system prompt they read from
 // cache, but the main prompt is composed before they are asked: the texts seen
 // are kept on disk under the session id, so a restart or resume of this session
-// carries them from its first prompt; this process carries the texts it saw
-// after a window switch. Another session in the same directory never sees them.
+// carries them from its first prompt. The types that do not depend on the
+// session are also kept per working directory, so a new session there starts
+// with the same prefix; the session archive, when there is one, wins. This
+// process carries the texts it saw after a window switch.
 
 /** The attachment types that stay the same for the process, so may move. */
 const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
@@ -683,6 +685,51 @@ const isSeenAttachment = (item: unknown): item is SeenAttachment =>
 /** A type that may appear more than once: each delta and the listing is its own text. */
 const isIncremental = (type: string): boolean => type === 'skill_listing' || type.endsWith('_delta')
 
+/** The types every session in one directory may share: the listings and the whole texts. */
+const SHARED_TYPES = [
+  'skill_listing',
+  'agent_listing_delta',
+  'mcp_instructions_delta',
+  'output_style_instructions',
+  'language',
+] as const
+
+const SHARED_TYPE_SET: ReadonlySet<string> = new Set(SHARED_TYPES)
+/** Types whose texts are lists of lines, so a change is compared line by line. */
+const LIST_TYPE_SET: ReadonlySet<string> = new Set(['skill_listing', 'agent_listing_delta', 'mcp_instructions_delta'])
+const SHARED_ORDER = new Map<string, number>(SHARED_TYPES.map((type, index): [string, number] => [type, index]))
+
+/** The shared types first in their fixed order, then the rest in arrival order; the sort is stable. */
+const orderedAttachments = (list: readonly SeenAttachment[]): SeenAttachment[] =>
+  [...list].sort((a, b) => (SHARED_ORDER.get(a.type) ?? SHARED_TYPES.length) - (SHARED_ORDER.get(b.type) ?? SHARED_TYPES.length))
+
+/** A listing's lines, without the empty ones and the trailing whitespace. */
+const listingLines = (text: string): string[] =>
+  text.split('\n').map(line => line.trimEnd()).filter(line => line !== '')
+
+/**
+ * What the message says for a listing the prompt already partly carries: the
+ * new lines, and for a skill listing the lines this session lacks. Undefined
+ * keeps the text as it came; null leaves it out of the message.
+ */
+const listingMessage = (type: string, text: string, inSystem: readonly SeenAttachment[]): string | null | undefined => {
+  const same = inSystem.filter(seen => seen.type === type)
+  if (same.length === 0) return undefined
+  const lines = listingLines(text)
+  const known = new Set(same.flatMap(seen => listingLines(seen.text)))
+  const added = lines.filter(line => !known.has(line))
+  // Almost no overlap: the whole text is new, so it reads better as it came.
+  if (lines.length > 0 && added.length === lines.length) return undefined
+  // Only a skill listing is a whole set; a delta is new lines by nature.
+  const missing = type === 'skill_listing' ? [...known].filter(line => !lines.includes(line)) : []
+  if (added.length === 0 && missing.length === 0) return null
+  const parts: string[] = []
+  if (added.length > 0) parts.push('In addition to what the system prompt lists:\n' + added.join('\n'))
+  if (missing.length > 0) parts.push('These are no longer available in this session; ignore them:\n' + missing.join('\n'))
+
+  return parts.join('\n\n')
+}
+
 /** Records one attachment; incremental types accumulate, the others keep only the newest per type. */
 const recordAttachment = (type: string, text: string): boolean => {
   if (isIncremental(type)) {
@@ -708,44 +755,69 @@ const recordAttachment = (type: string, text: string): boolean => {
 let attachToSystem = false
 /** The whitelisted attachments the model read this process, in arrival order. */
 let seenAttachments: SeenAttachment[] = []
-/** The attachments the previous process of this session stored, read at session start. */
+/** The attachments the first window carries: this session's archive, else the shared one. */
 let storedAttachments: SeenAttachment[] | undefined
-/** Where `storedAttachments` lives; empty when the mod is off or the session has no id. */
+/** Where the session archive lives; empty when the mod is off or the session has no id. */
 let attachmentsPath = ''
-/** The JSON last read or written, so an unchanged list is not written again. */
+/** The JSON last read or written for the session, so an unchanged list is not written again. */
 let attachmentsSaved = ''
+/** Where the working directory's shared archive lives; empty when the mod is off or home is unknown. */
+let attachmentsSharedPath = ''
+/** The shared archive's JSON last read or written; an empty list when there is none. */
+let attachmentsSharedSaved = '[]'
 /** The write in flight, so the next one starts after it. */
 let attachmentsSaving: Promise<void> = Promise.resolve()
-/** The texts the current main system prompt carries, so the message can leave them out. */
-let attachmentsInSystem: string[] = []
+/** The entries the current main system prompt carries, so the message can leave them out or trim them. */
+let attachmentsInSystem: SeenAttachment[] = []
 /** A compaction happened: every main compose from now on carries the section. */
 let attachmentsArmed = false
 
-/** Reads the switch and this session's stored texts at session start; a new process starts with nothing seen. */
-const loadAttachments = async ($: EngineInterface): Promise<void> => {
+/** The entries in one archive; a damaged, empty or old string-array file is no archive. */
+const readArchive = async ($: EngineInterface, path: string): Promise<SeenAttachment[] | undefined> => {
+  const text = await attempt(async () => await $.fs.read(path), undefined)
+  if (typeof text !== 'string') return undefined
+  const parsed = await attempt(async () => JSON.parse(text) as unknown, undefined)
+  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(isSeenAttachment)) return undefined
+
+  return parsed as SeenAttachment[]
+}
+
+/** Reads the switch, this session's archive and the shared one at session start; a new process starts with nothing seen. */
+const loadAttachments = async ($: EngineInterface, cwd: string): Promise<void> => {
   attachToSystem = (await $.env.get('CTX_MOD_ATTACH_TO_SYSTEM')) !== '0'
   seenAttachments = []
   storedAttachments = undefined
   attachmentsPath = ''
   attachmentsSaved = ''
+  attachmentsSharedPath = ''
+  attachmentsSharedSaved = '[]'
   attachmentsInSystem = []
   attachmentsArmed = false
   if (!attachToSystem) return
-  // The archive belongs to one session: a new session in the same directory must
-  // not inherit another one's environment, model or scratchpad paths.
-  const id = await idOf($)
-  // The id names a file, so one that could leave the directory is not used.
-  if (id === undefined || !/^[\w-]+$/.test(id)) return
   const home = await homeOf($)
   if (home === '') return
-  attachmentsPath = `${home}/.claude/ctx-mod/attachments/${id}.json`
-  const text = await attempt(async () => await $.fs.read(attachmentsPath), undefined)
-  if (typeof text !== 'string') return
-  const parsed = await attempt(async () => JSON.parse(text) as unknown, undefined)
-  // A damaged, empty or old string-array archive is no archive: the first window stays as it was.
-  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(isSeenAttachment)) return
-  storedAttachments = parsed as SeenAttachment[]
-  attachmentsSaved = JSON.stringify(storedAttachments)
+  // The shared archive belongs to the working directory and the entrypoint: a
+  // new session starts with the listings and whole texts another session there
+  // already saw. The desktop app and the CLI list different skills, so each
+  // keeps its own rather than overwriting the other's.
+  const raw = await attempt(async () => await $.env.get('CLAUDE_CODE_ENTRYPOINT'), undefined)
+  const entry = typeof raw === 'string' && /^[\w-]+$/.test(raw) ? raw : 'unknown'
+  attachmentsSharedPath = home + '/.claude/ctx-mod/attachments/shared/' + entry + '-' + cwdKey(cwd) + '.json'
+  const shared = await readArchive($, attachmentsSharedPath)
+  const sharedEntries = shared?.filter(seen => SHARED_TYPE_SET.has(seen.type)) ?? []
+  if (sharedEntries.length > 0) attachmentsSharedSaved = JSON.stringify(orderedAttachments(sharedEntries))
+  // The session archive is this same conversation restarted, so it wins.
+  const id = await idOf($)
+  // The id names a file, so one that could leave the directory is not used.
+  if (id !== undefined && /^[\w-]+$/.test(id)) {
+    attachmentsPath = home + '/.claude/ctx-mod/attachments/' + id + '.json'
+    const stored = await readArchive($, attachmentsPath)
+    if (stored !== undefined) {
+      storedAttachments = stored
+      attachmentsSaved = JSON.stringify(stored)
+    }
+  }
+  if (storedAttachments === undefined && sharedEntries.length > 0) storedAttachments = sharedEntries
 }
 
 /** Writes the texts seen so far back for the next process; an unchanged list is not written again. */
@@ -754,14 +826,28 @@ const saveAttachments = async ($: EngineInterface): Promise<void> => {
   // padded with NULs, so each write waits for the one before and takes the
   // list as it is then.
   attachmentsSaving = attachmentsSaving.then(async () => {
-    if (attachmentsPath === '') return
-    const text = JSON.stringify(seenAttachments)
-    if (text === attachmentsSaved) return
-    try {
-      await $.fs.write(attachmentsPath, text)
-      attachmentsSaved = text
-    } catch (error) {
-      logError($, 'attachments', error)
+    if (attachmentsPath !== '') {
+      const text = JSON.stringify(seenAttachments)
+      if (text !== attachmentsSaved) {
+        try {
+          await $.fs.write(attachmentsPath, text)
+          attachmentsSaved = text
+        } catch (error) {
+          logError($, 'attachments', error)
+        }
+      }
+    }
+    if (attachmentsSharedPath !== '') {
+      const shared = orderedAttachments(seenAttachments.filter(seen => SHARED_TYPE_SET.has(seen.type)))
+      const text = JSON.stringify(shared)
+      if (text !== attachmentsSharedSaved) {
+        try {
+          await $.fs.write(attachmentsSharedPath, text)
+          attachmentsSharedSaved = text
+        } catch (error) {
+          logError($, 'attachments', error)
+        }
+      }
     }
   })
   await attachmentsSaving
@@ -807,7 +893,7 @@ export const register: Register = (on, options) => {
     try {
       enabled = (await $.env.get('CTX_MOD')) === '1'
       if (enabled) {
-        await loadAttachments($).catch(error => logError($, 'attachments', error))
+        await loadAttachments($, e.cwd).catch(error => logError($, 'attachments', error))
         await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
       }
       // The command is always there, so a person who installed the mod and
@@ -861,15 +947,17 @@ export const register: Register = (on, options) => {
         : []
       if (claudeMd.length > 0) claudeMdInSystem = true
       // The attachments ride after the files and before the mod's own section,
-      // so the prompt's tail stays the same all window long. Until a switch the
+      // so the prompt's tail stays the same all window long. The order is fixed:
+      // the shared types first, so every session in this directory starts with
+      // the same prefix, then the rest as they arrived. Until a switch the
       // previous process's texts are used, so the first window hits the cache;
       // after one, this process's own texts replace them, dropping stale ones.
-      const attachmentsSource = attachmentsArmed ? seenAttachments : storedAttachments ?? []
+      const attachmentsSource = orderedAttachments(attachmentsArmed ? seenAttachments : storedAttachments ?? [])
       const attachments = main && attachToSystem && attachmentsSource.length > 0
         ? [{ id: 'ctx-mod:attachments', text: attachmentsSource.map(seen => seen.text).join('\n\n'), scope: 'session' as const }]
         : []
       // Only a main prompt carries them; a side analysis leaves the set alone.
-      if (main) attachmentsInSystem = attachments.length > 0 ? attachmentsSource.map(seen => seen.text) : []
+      if (main) attachmentsInSystem = attachments.length > 0 ? attachmentsSource : []
 
       return {
         ...result,
@@ -896,9 +984,18 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     try {
       if (!ATTACHMENT_TYPES.has(e.type) || result.text === null) return result
-      // Record first: a text already in the prompt must survive the next switch.
-      if (recordAttachment(e.type, result.text)) await saveAttachments($)
-      if (attachmentsInSystem.includes(result.text)) return { text: null }
+      const text = result.text
+      // Record first, with the whole text: a text the prompt carries, or that the
+      // message only partly carries, must survive the next switch unchanged.
+      if (recordAttachment(e.type, text)) await saveAttachments($)
+      if (attachmentsInSystem.some(seen => seen.text === text)) return { text: null }
+      // A listing the prompt partly carries: the message says only what is new,
+      // and for a skill listing what the prompt lists but this session lacks.
+      if (SHARED_TYPE_SET.has(e.type) && LIST_TYPE_SET.has(e.type)) {
+        const message = listingMessage(e.type, text, attachmentsInSystem)
+        if (message === null) return { text: null }
+        if (message !== undefined) return { text: message }
+      }
 
       return result
     } catch (error) {
