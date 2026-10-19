@@ -1731,7 +1731,9 @@ export const register: Register = (on, options) => {
         for (const id of s.quiet.keys()) {
           if (!e.text.includes(id)) continue
           s.quiet.delete(id)
-
+          // This notice is the one the keep-warm subagent's background count was waiting for; the early return below skips the decrement.
+          if (s.backgroundPending > 0) s.backgroundPending -= 1
+          await save($, s)
           return { drop: `cache-keeper kept subagent ${id.slice(0, 8)} warm` }
         }
       }
