@@ -4,10 +4,27 @@ const fs = require("fs"), path = require("path"), os = require("os"), cp = requi
 // Launched by a tiny bootstrap (the full source exceeds the Windows 32K command-line limit): the bootstrap
 // puts the input JSON in globalThis.__PTC_IN and evals this file. Falls back to stdin when run directly.
 const input = JSON.parse(typeof globalThis.__PTC_IN === "string" ? globalThis.__PTC_IN : fs.readFileSync(0, "utf8"));
-const cwd = input.cwd || process.cwd();
-const MAX = input.maxChars || 6000;
+let cwd = input.cwd || process.cwd();
+const MAX = input.maxChars || 8000;
 const NL = "\n";
 const WIN = process.platform === "win32";
+// Read-only mode: started by src/broker.js under the Node permission model (no child processes, writes only in the
+// scope dir). rg runs through the broker; write/edit/replace/batch/bash/parallel/job_output are refused.
+const RO = input.readonly === true;
+// "bash" alone would make Windows search System32 before PATH and pick the WSL launcher, which runs the
+// command in Linux and re-parses it ($VAR expanded twice). Prefer a real bash from PATH (Git Bash).
+const BASH = (() => {
+  if (input.readonly === true) return "bash"; // read-only mode: bash is refused, and probing PATH would hit the read sandbox
+  if (!WIN) return "bash";
+  const skip = /[\\/](windows[\\/]system32|windowsapps)[\\/]/i;
+  for (const d of (process.env.PATH || "").split(";")) {
+    if (!d) continue;
+    const f = path.join(d, "bash.exe");
+    if (!skip.test(f) && fs.existsSync(f)) return f;
+  }
+  const git = path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe");
+  return fs.existsSync(git) ? git : "bash";
+})();
 
 // ---------- structured errors ----------
 class PtcError extends Error {
@@ -30,6 +47,7 @@ const SYS = {
   EINVAL: ["INVALID_ARGUMENT", "Invalid argument for this operation."],
   ENAMETOOLONG: ["INVALID_ARGUMENT", "Path is too long."],
 };
+if (RO) SYS.ERR_ACCESS_DENIED = ["POLICY_DENIED", "Blocked by the read-only sandbox (read-only mode: no writes outside the session scope, no child processes)."];
 const sysErr = (e) => {
   if (e instanceof PtcError) return e;
   // BUSY: EBUSY / sharing-violation text. On Windows a lock can also surface as EPERM/EACCES, so those are classified
@@ -55,6 +73,7 @@ const withRetry = (fn) => {
 };
 // icacls: is there an explicit DENY ACE for the current user / Everyone / Users on p?
 const hasDenyAce = (p) => {
+  if (RO) return false; // read-only mode: no child processes (icacls)
   const r = cp.spawnSync("icacls.exe", [p], { encoding: "utf8", timeout: 5000, windowsHide: true });
   if (r.error || r.status !== 0) return false;
   const me = String(os.userInfo().username || "").toLowerCase();
@@ -62,6 +81,7 @@ const hasDenyAce = (p) => {
 };
 // Decide whether an EPERM/EACCES on a Windows path is a lock (BUSY) or a real permission problem (POLICY_DENIED).
 const classifyPerm = (e) => {
+  if (RO) return null; // read-only mode: no probe files / icacls; keep the plain EPERM/EACCES mapping
   const p = e.path;
   let st; try { st = fs.lstatSync(p); } catch { return null; }
   const denied = (why) => ({ code: "POLICY_DENIED", note: " (permission denied: " + why + ")" });
@@ -90,15 +110,35 @@ const optInt = (v, name, def, min, max) => {
   return v;
 };
 
+// ---------- optional root: an existing absolute directory that becomes the working directory ----------
+let rootErr = null;
+if (input.root !== undefined) {
+  try {
+    if (typeof input.root !== "string" || input.root === "" || !path.isAbsolute(input.root)) {
+      throw E("INVALID_ARGUMENT", "root must be an absolute path: " + String(input.root), 'Pass an existing absolute directory, e.g. root: "D:/proj".');
+    }
+    let st;
+    try { st = fs.statSync(input.root); } catch (e) {
+      if (e.code === "ENOENT") throw E("NOT_FOUND", "root not found: " + input.root, "Pass an existing absolute directory.");
+      throw e;
+    }
+    if (!st.isDirectory()) throw E("INVALID_ARGUMENT", "root is not a directory: " + input.root, "Pass a directory path.");
+    cwd = path.resolve(input.root);
+    process.chdir(cwd);
+  } catch (e) { rootErr = sysErr(e); }
+}
+
 // ---------- state dirs (per session scope) ----------
 const scope = (String(input.scope || "default").replace(/[^A-Za-z0-9_.-]/g, "_").replace(/^\.+/, "_").slice(0, 80)) || "default";
-const dir = path.join(os.tmpdir(), "cc-ptc", scope);
+const dir = RO && typeof input.stateDir === "string" ? input.stateDir : path.join(os.tmpdir(), "cc-ptc", scope);
 const jobsDir = path.join(dir, "jobs");
+const bgDir = path.join(dir, "bg");
 fs.mkdirSync(jobsDir, { recursive: true });
+fs.mkdirSync(bgDir, { recursive: true });
 try { // sweep refs older than 24h in this scope (jobs are kept)
   const cut = Date.now() - 24 * 3600 * 1000;
   for (const n of fs.readdirSync(dir)) {
-    if (!/\.(json|tmp)$/.test(n)) continue;
+    if (!/\.(json|tmp|log|ops)$/.test(n)) continue;
     const p = path.join(dir, n);
     try { const st = fs.lstatSync(p); if (st.isFile() && st.mtimeMs < cut) fs.unlinkSync(p); } catch {}
   }
@@ -108,7 +148,54 @@ const abs = (p) => path.resolve(cwd, p);
 const rel = (f) => { const r = path.relative(cwd, f).split(path.sep).join("/"); return r.startsWith("..") || path.isAbsolute(r) ? f.split(path.sep).join("/") : r; };
 const lines = [];
 const fmt = (v) => typeof v === "string" ? v : JSON.stringify(v, null, 1);
-const logf = (...a) => lines.push(a.map(fmt).join(" "));
+// Streaming log + write-op journal: the hook reads these if the outer timeout kills this process.
+const logFile = input.logName ? path.join(dir, "run-" + String(input.logName).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) + ".log") : null;
+const opsFile = logFile ? logFile + ".ops" : null;
+let logFd = null, opsFd = null;
+try { if (logFile) logFd = fs.openSync(logFile, "a"); } catch {}
+try { if (opsFile) opsFd = fs.openSync(opsFile, "a"); } catch {}
+const writeOps = new Map();
+const noteWrite = (op, p, places, lines) => {
+  const key = op + "\u0000" + p;
+  const e = writeOps.get(key) || { op, path: p, count: 0, places: 0, lines: [] };
+  e.count++; e.places += places || 0; if (lines) e.lines.push(...lines); writeOps.set(key, e);
+  if (opsFd !== null) { try { fs.writeSync(opsFd, JSON.stringify({ op, path: p }) + NL); } catch {} }
+};
+// Line numbers (1-based, in the text before the change) of every match of a literal needle.
+const lineNosOf = (text, needle) => {
+  const out = []; let i = text.indexOf(needle), ln = 1, last = 0;
+  while (i >= 0) { for (let k = last; k < i; k++) if (text.charCodeAt(k) === 10) ln++; last = i; out.push(ln); i = text.indexOf(needle, i + needle.length); }
+  return out;
+};
+const lineNosAt = (text, offsets) => {
+  const out = []; let ln = 1, last = 0;
+  for (const i of offsets) { for (let k = last; k < i; k++) if (text.charCodeAt(k) === 10) ln++; last = i; out.push(ln); }
+  return out;
+};
+const placesText = (e) => e.places > 1 ? "（共 " + e.places + " 处，行 " + e.lines.slice(0, 15).join(",") + (e.lines.length > 15 ? ",…" : "") + "）" : "";
+// Shown even on success: one call that changed several places is easy to miss (e.g. replacing every "break" in a file).
+const multiText = () => {
+  const rows = [...writeOps.values()].filter((e) => e.places > 1).map((e) => "- " + e.op + " " + e.path + placesText(e));
+  return rows.length ? "注意：以下写操作一次改了多处，确认每处都是有意改的：\n" + rows.slice(0, 20).join("\n") : "";
+};
+const countCheck = (expect, n, what, p) => {
+  if (expect === undefined) return;
+  if (!Number.isInteger(expect) || expect < 0) throw E("INVALID_ARGUMENT", what + " must be a non-negative integer", "Pass the number of places you intend to change.");
+  if (n !== expect) throw E("COUNT_MISMATCH", "expected " + expect + " match(es) but found " + n + " in " + p + "; nothing was written", "Re-read the matches (tools.grep) and fix the pattern/old text or the expected count.");
+};
+const opsText = () => {
+  if (!writeOps.size) return "本程序已生效的写操作：无";
+  const rows = [...writeOps.values()].map((e) => "- " + e.op + " " + e.path + (e.count > 1 ? " ×" + e.count : "") + placesText(e));
+  return "本程序已生效的写操作：\n" + rows.slice(0, 50).join("\n") + (rows.length > 50 ? "\n- …等 " + rows.length + " 项" : "");
+};
+const closeLog = () => {
+  try { if (logFd !== null) fs.closeSync(logFd); } catch {}
+  try { if (opsFd !== null) fs.closeSync(opsFd); } catch {}
+  logFd = opsFd = null;
+  try { if (logFile) fs.unlinkSync(logFile); } catch {}
+  try { if (opsFile) fs.unlinkSync(opsFile); } catch {}
+};
+const logf = (...a) => { const s = a.map(fmt).join(" "); lines.push(s); if (logFd !== null) { try { fs.writeSync(logFd, s + NL); } catch {} } };
 const cons = { log: logf, error: logf, warn: logf, info: logf };
 const readState = {};
 
@@ -196,16 +283,36 @@ const credGuard = (p) => {
   if (hit) throw E("POLICY_DENIED", "credential path refused: " + rel(hit), "Credential files (.ssh, .aws, .env, *.pem, *.key, ...) are not readable through these tools; ask the user for the specific non-secret value instead.");
 };
 
+// ---------- child environment defaults (UTF-8 for Python; an explicit caller env wins) ----------
+const childEnv = (extra) => {
+  const e = Object.assign({}, process.env, { PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" });
+  if (extra !== undefined && extra !== null) {
+    if (typeof extra !== "object" || Array.isArray(extra)) throw E("INVALID_ARGUMENT", "env must be an object", "Pass env as {KEY: 'value'}.");
+    for (const k of Object.keys(extra)) { if (extra[k] === undefined || extra[k] === null) delete e[k]; else e[k] = String(extra[k]); }
+  }
+  return e;
+};
+// Background jobs: one detached node wrapper per command, state in files, 2h lifetime cap.
+const BG_MAX_MS = 2 * 60 * 60 * 1000;
+const BG_WRAP2 = 'const fs=require("fs"),cp=require("child_process");const [id,d,cmd,cwd,bash]=process.argv.slice(1);' +
+  'const stf=d+"/"+id+".st";const done=(code,sig,timedOut)=>{try{fs.writeFileSync(stf,JSON.stringify({code:code,sig:sig,timedOut:!!timedOut,t:Date.now()}))}catch{};process.exit(0)};' +
+  'let c;try{c=cp.spawn(bash,["-c",cmd],{cwd:cwd,stdio:["ignore","pipe","pipe"],windowsHide:true})}catch(e){try{fs.appendFileSync(d+"/"+id+".err",String(e))}catch{};done(null,"error")}' +
+  'const w=(f,b)=>{try{fs.appendFileSync(d+"/"+id+f,b)}catch{}};c.stdout.on("data",b=>w(".out",b));c.stderr.on("data",b=>w(".err",b));' +
+  'c.on("close",(code,sig)=>done(code,sig,false));c.on("error",e=>{w(".err",String(e));done(null,"error")});' +
+  'const t=setTimeout(()=>{try{if(process.platform==="win32")cp.spawnSync("taskkill",["/pid",String(c.pid),"/T","/F"],{windowsHide:true});else c.kill("SIGKILL")}catch{};done(null,"timeout",true)},' + BG_MAX_MS + ');if(t.unref)t.unref();';
+
 // ---------- tools: read / write / edit / bash ----------
 const tools = {};
-tools.read = ({ path: p, offset = 0, limit } = {}) => {
+tools.read = ({ path: p, offset = 0, limit, numbered = false } = {}) => {
   reqStr(p, "path"); credGuard(p);
   const f = abs(p), t = fs.readFileSync(f, "utf8");
   readState[f] = fs.statSync(f).mtimeMs;
-  if (!offset && limit === undefined) return t;
+  if (!offset && limit === undefined && !numbered) return t;
   const ls = t.split(NL);
   if (ls.length > 1 && ls[ls.length - 1] === "") ls.pop(); // a trailing newline terminates the last line, it does not start another
-  return ls.slice(offset, limit === undefined ? undefined : offset + limit).join(NL);
+  const part = ls.slice(offset, limit === undefined ? undefined : offset + limit);
+  // numbered: "N: text" with the file's real 1-based line numbers (CR stripped)
+  return numbered ? part.map((x, i) => (offset + i + 1) + ": " + x.replace(/\r$/, "")).join(NL) : part.join(NL);
 };
 tools.write = (a) => {
   A(a, "write"); reqStr(a.path, "path");
@@ -214,6 +321,7 @@ tools.write = (a) => {
   fs.mkdirSync(path.dirname(f), { recursive: true });
   atomicWrite(f, a.content);
   try { readState[f] = fs.statSync(f).mtimeMs; } catch {}
+  noteWrite("write", rel(f));
   return { bytes: Buffer.byteLength(a.content) };
 };
 tools.edit = (a) => {
@@ -228,20 +336,62 @@ tools.edit = (a) => {
   const t = fs.readFileSync(f, "utf8");
   const n = t.split(old).length - 1;
   if (n === 0) throw E("NOT_FOUND", "old string not found in " + p, "Re-read the file and copy the exact text (whitespace and line endings matter).");
-  if (n > 1 && !all) throw E("NOT_UNIQUE", "old string matches " + n + " places in " + p, "Add surrounding context to make it unique, or pass all:true.");
+  countCheck(a.expect, n, "expect", p);
+  if (n > 1 && !all) throw E("NOT_UNIQUE", "old string matches " + n + " places in " + p, "Add surrounding context to make it unique, or pass all:true (with expect:<count>).");
+  const lines = all ? lineNosOf(t, old) : lineNosOf(t, old).slice(0, 1);
   atomicWrite(f, all ? t.split(old).join(nw) : t.replace(old, () => nw));
   readState[f] = fs.statSync(f).mtimeMs;
-  return { replaced: all ? n : 1 };
+  noteWrite("edit", rel(f), lines.length, lines);
+  return { replaced: lines.length, lines };
 };
 tools.bash = (a) => {
   A(a, "bash"); reqStr(a.command, "command");
-  const { command, cwd: c, timeoutMs = 120000 } = a;
-  const o = { cwd: c ? abs(c) : cwd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 256 << 20 };
-  let r = cp.spawnSync("bash", ["-c", command], o);
+  const { command, cwd: c, timeoutMs = 120000, env, background = false } = a;
+  const cd = c ? abs(c) : cwd;
+  if (background === true) {
+    const bgEnv = childEnv(env);
+    let st; try { st = fs.statSync(cd); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "cwd not found: " + (c || cd), "Check the cwd."); throw e; }
+    if (!st.isDirectory()) throw E("INVALID_ARGUMENT", "cwd is not a directory: " + (c || cd), "Pass a directory.");
+    fs.mkdirSync(bgDir, { recursive: true });
+    const id = newId("b");
+    const meta = { id, kind: "bash", label: String(command).slice(0, 200), startedAt: Date.now(), deadlineAt: Date.now() + BG_MAX_MS };
+    fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify(meta));
+    fs.writeFileSync(path.join(bgDir, id + ".out"), "");
+    fs.writeFileSync(path.join(bgDir, id + ".err"), "");
+    let ch;
+    try { ch = cp.spawn(process.execPath, ["-e", BG_WRAP2, id, bgDir, command, cd, BASH], { detached: true, stdio: "ignore", windowsHide: true, env: bgEnv }); }
+    catch (e) { try { fs.writeFileSync(path.join(bgDir, id + ".st"), JSON.stringify({ code: null, sig: "error", t: Date.now() })); } catch {} throw sysErr(e); }
+    try { meta.pid = ch.pid; fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify(meta)); } catch {}
+    ch.unref();
+    return { id };
+  }
+  const o = { cwd: cd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 256 << 20, env: childEnv(env) };
+  let r = cp.spawnSync(BASH, ["-c", command], o);
   if (r.error && r.error.code === "ENOENT") r = cp.spawnSync(command, Object.assign({ shell: true }, o));
   if (r.error && r.error.code === "ENOBUFS") throw E("OUTPUT_LIMIT", "command output exceeded 256MB", "Redirect output to a file or filter it in the command.");
   if (r.error && r.error.code === "ETIMEDOUT") return { code: null, stdout: r.stdout || "", stderr: r.stderr || "", timedOut: true };
   return { code: r.status, stdout: r.stdout, stderr: r.stderr };
+};
+
+// tools.job: query a background bash started by tools.bash({background:true}); jobs live in the scope dir and
+// survive across run_code calls.
+tools.job = (a) => {
+  A(a, "job"); const id = checkId(reqStr(a.id, "id"));
+  const waitMs = optInt(a.wait, "wait", 0, 0, 600000);
+  const tailChars = optInt(a.tailChars, "tailChars", 4000, 1, 1 << 20);
+  const mf = path.join(bgDir, id + ".json");
+  if (!fs.existsSync(mf)) throw E("NOT_FOUND", "job not found: " + id, "Use the id returned by tools.bash({background:true}).");
+  const stf = path.join(bgDir, id + ".st");
+  const end = Date.now() + waitMs;
+  while (!fs.existsSync(stf) && Date.now() < end) sleepMs(100);
+  let out = "", err = "";
+  try { out = fs.readFileSync(path.join(bgDir, id + ".out"), "utf8"); } catch {}
+  try { err = fs.readFileSync(path.join(bgDir, id + ".err"), "utf8"); } catch {}
+  const st = fs.existsSync(stf) ? JSON.parse(fs.readFileSync(stf, "utf8")) : null;
+  const tail = (s) => s.length <= tailChars ? s : "…[省略 " + (s.length - tailChars) + " 字]…\n" + s.slice(-tailChars);
+  const r = { id, done: !!st, code: st ? st.code : null, stdout: tail(out), stderr: tail(err) };
+  if (st && st.timedOut) r.timedOut = true;
+  return r;
 };
 
 // ---------- tools.parallel: concurrent bash (async spawn) ----------
@@ -277,8 +427,8 @@ const runOne = (s) => new Promise((resolve) => {
     resolve(r);
   };
   const start = (useShell) => {
-    child = useShell ? cp.spawn(s.command, { shell: true, cwd: s.cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
-      : cp.spawn("bash", ["-c", s.command], { cwd: s.cwd, windowsHide: true, detached: !WIN, stdio: ["ignore", "pipe", "pipe"] });
+    child = useShell ? cp.spawn(s.command, { shell: true, cwd: s.cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], env: s.env })
+      : cp.spawn(BASH, ["-c", s.command], { cwd: s.cwd, windowsHide: true, detached: !WIN, stdio: ["ignore", "pipe", "pipe"], env: s.env });
     if (child.pid) wdSend("add " + child.pid);
     child.stdout.on("data", (d) => { if (over) return; nOut += d.length; if (nOut > PAR_MAX_BUF) { over = true; killTree(child); } else outB.push(d); });
     child.stderr.on("data", (d) => { if (over) return; nErr += d.length; if (nErr > PAR_MAX_BUF) { over = true; killTree(child); } else errB.push(d); });
@@ -305,7 +455,7 @@ tools.parallel = (calls, opts) => {
       let st; try { st = fs.statSync(cd); } catch { throw E("NOT_FOUND", "cwd not found for call " + i + ": " + c.cwd, "Check the cwd of that call."); }
       if (!st.isDirectory()) throw E("INVALID_ARGUMENT", "cwd of call " + i + " is not a directory", "Check the cwd of that call.");
     }
-    return { command: c.command, cwd: cd, timeoutMs };
+    return { command: c.command, cwd: cd, timeoutMs, env: childEnv(c.env) };
   });
   return new Promise((resolve) => {
     const results = new Array(specs.length); let next = 0, active = 0, done = 0;
@@ -333,15 +483,35 @@ const rgPath = () => {
   throw E("RG_UNAVAILABLE", "ripgrep (rg) was not found at the bundled path or on PATH", "Install ripgrep and put it on PATH, or use tools.bash with another search command.");
 };
 const globArgs = (g) => [].concat(g || []).flatMap((x) => ["-g", x]).concat(SKIP.flatMap((x) => ["-g", x]));
+// read-only mode: hand the argv to the broker (reqDir/<id>.req) and wait for resDir/<id>.res; exit if the broker is gone
+const brokerGone = () => { try { process.kill(input.brokerPid, 0); return false; } catch (e) { return e.code !== "EPERM"; } };
+if (RO) setInterval(() => { if (brokerGone()) process.exit(3); }, 500).unref();
+let rgSeq = 0;
+const brokerRg = (args) => {
+  const id = "q" + process.pid + "_" + (++rgSeq) + "_" + crypto.randomBytes(3).toString("hex");
+  const reqF = path.join(input.reqDir, id + ".req"), tmp = path.join(input.reqDir, "." + id + ".tmp");
+  fs.writeFileSync(tmp, JSON.stringify({ argv: args, cwd })); fs.renameSync(tmp, reqF);
+  const resF = path.join(input.resDir, id + ".res"), outF = path.join(input.resDir, id + ".out");
+  let wait = 1, last = Date.now();
+  while (!fs.existsSync(resF)) {
+    sleepMs(wait); if (wait < 4) wait *= 2;
+    if (Date.now() - last > 250) { last = Date.now(); if (brokerGone()) process.exit(3); }
+  }
+  let res;
+  try { res = JSON.parse(fs.readFileSync(resF, "utf8")); } finally { try { fs.unlinkSync(reqF); } catch {} }
+  if (res.error) throw E(res.error, String(res.message || "rg request failed"), "Read-only mode: rg runs through the broker with a fixed option whitelist.");
+  return { status: res.status, stdout: fs.existsSync(outF) ? fs.readFileSync(outF, "utf8") : "", stderr: res.stderr || "", error: res.errorCode ? { code: res.errorCode } : undefined };
+};
+const execRg = (args) => RO ? brokerRg(args) : cp.spawnSync(rgPath(), args, { cwd, encoding: "utf8", maxBuffer: 1024 << 20, timeout: 300000 });
 const runRg = (args, rootAbs, soft) => { // soft: return null instead of throwing when rg rejects the pattern
   if (soft) {
     if (rootAbs !== undefined && !fs.existsSync(rootAbs)) throw E("NOT_FOUND", "search path not found: " + rel(rootAbs), "Check the 'path' argument.");
-    const s = cp.spawnSync(rgPath(), args, { cwd, encoding: "utf8", maxBuffer: 1024 << 20, timeout: 300000 });
+    const s = execRg(args);
     if (s.error) { if (s.error.code === "ENOENT") throw E("RG_UNAVAILABLE", "cannot execute rg", "Install ripgrep and put it on PATH."); throw E("OUTPUT_LIMIT", "rg failed: " + s.error.code, "Narrow 'path' or 'glob'."); }
     return s.status === 2 && !s.stdout ? null : (s.stdout || "");
   }
   if (rootAbs !== undefined && !fs.existsSync(rootAbs)) throw E("NOT_FOUND", "search path not found: " + rel(rootAbs), "Check the 'path' argument.");
-  const r = cp.spawnSync(rgPath(), args, { cwd, encoding: "utf8", maxBuffer: 1024 << 20, timeout: 300000 });
+  const r = execRg(args);
   if (r.error) {
     if (r.error.code === "ENOENT") throw E("RG_UNAVAILABLE", "cannot execute rg", "Install ripgrep and put it on PATH.");
     throw E("OUTPUT_LIMIT", "rg failed: " + r.error.code, "Narrow 'path' or 'glob'.");
@@ -504,16 +674,17 @@ tools.replace = guard((a) => {
     let buf; try { buf = fs.readFileSync(f); } catch (e) { if (finder === "scan") continue; throw e; }
     if (finder === "scan" && buf.subarray(0, 8000).includes(0)) continue;
     const text = buf.toString("utf8");
-    let n = 0; text.replace(re, (m) => { n++; return m; });
+    let n = 0; const offs = []; text.replace(re, (...m) => { n++; const o = m.find((v, k) => k > 0 && typeof v === "number"); offs.push(o); return m[0]; });
     if (!n) continue;
     if (!Buffer.from(text, "utf8").equals(buf)) { skipped.push(rel(f)); continue; }
     matches += n;
     if (matches > maxRep) throw E("OUTPUT_LIMIT", "more than maxReplacements (" + maxRep + ") matches; nothing was written", "Narrow the pattern/path/glob or raise maxReplacements.");
     const nt = text.replace(re, replacement), diff = nt !== text;
     if (diff) changed++;
-    found.push({ f, n, mtime: fs.statSync(f).mtimeMs, nt: diff ? nt : null, buf: diff ? buf : null });
+    found.push({ f, n, lines: lineNosAt(text, offs), mtime: fs.statSync(f).mtimeMs, nt: diff ? nt : null, buf: diff ? buf : null });
   }
-  const items = found.map((x) => ({ file: rel(x.f), count: x.n }));
+  countCheck(a.expect, matches, "expect", "the searched files");
+  const items = found.map((x) => ({ file: rel(x.f), count: x.n, lines: x.lines.slice(0, 50) }));
   // phase 2: STALE-check every file to be written, then write; on any failure restore the already written files
   if (!dryRun) {
     const todo = found.filter((x) => x.nt !== null);
@@ -534,6 +705,7 @@ tools.replace = guard((a) => {
         { rolledBack, restored, restoreFailed, failedFile: rel(cur.f) });
     }
     for (const x of todo) { try { readState[x.f] = fs.statSync(x.f).mtimeMs; } catch {} }
+    for (const x of todo) noteWrite("replace", rel(x.f), x.n, x.lines);
   }
   const res = { files: found.length, matches, changed, items, dryRun: !!dryRun, finder };
   if (skipped.length) res.skipped = skipped;
@@ -595,6 +767,18 @@ const ref = {
     if (equals) v = v.filter((r) => Object.keys(equals).every((k) => r && r[k] === equals[k]));
     if (fields) v = v.map((r) => r && typeof r === "object" ? Object.fromEntries(fields.map((k) => [k, r[k]])) : r);
     return pageRows(v, offset, limit, maxBytes, extra);
+  }),
+  text: guard((id, o = {}) => {
+    checkId(id); A(o, "ref.text");
+    const from = optInt(o.from, "from", 0, 0, 1e12);
+    const to = o.to === undefined || o.to === null ? undefined : optInt(o.to, "to", 0, 0, 1e12);
+    let f = refFile(id);
+    if (!fs.existsSync(f)) f = jobFile(id);
+    let raw;
+    try { raw = fs.readFileSync(f, "utf8"); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "ref not found or expired: " + id, "Refs live 24h per session; re-create the data."); throw e; }
+    let s;
+    try { const v = JSON.parse(raw); s = typeof v === "string" ? v : JSON.stringify(v); } catch { s = raw; }
+    return to === undefined ? s.slice(from) : s.slice(from, to);
   }),
   release: guard((id) => {
     checkId(id);
@@ -841,7 +1025,9 @@ const runItems = (job, roots, idxs) => {
     it.state = "unknown"; delete it.error; delete it.code; delete it.stage; it.startedAt = new Date().toISOString();
     if (it.op !== "remove") it.tmp = tmpRelOf(job, it); // journaled before anything is written
     saveJob(job);
-    try { execItem(roots, it, job); it.state = "completed"; delete it.startedAt; delete it.stage; delete it.tmp; saveJob(job); }
+    try { execItem(roots, it, job); it.state = "completed"; delete it.startedAt; delete it.stage; delete it.tmp; saveJob(job);
+      try { const segs = segsOf(it); if (it.op === "remove") noteWrite("batch", rel(path.join(roots.s, ...segs[0]))); else { noteWrite("batch", rel(path.join(roots.d, ...segs[1]))); if (it.op === "move") noteWrite("batch", rel(path.join(roots.s, ...segs[0]))); } } catch {}
+    }
     catch (e) {
       const pe = sysErr(e);
       it.state = pe.effect === "none" ? "failed" : "unknown";
@@ -915,26 +1101,196 @@ tools.batch = guard((a) => {
   return summary(job);
 });
 
+// ---------- DSH-compatible bindings (read/write/edit/glob/grep/bash/job_output) ----------
+// Same names, parameters and return shapes as DeepSeek's DSH tools. They live in tools.dsh always; when the
+// caller sets input.dsh (delegate ptc-only: PTC_RUN_SDK_IN_PROMPT=1) they also take over the top-level
+// names read/write/edit/glob/grep/bash, because the system prompt there declares those names with DSH shapes.
+// The legacy shapes keep their names otherwise (main session).
+class ToolCallError extends Error {
+  constructor(toolName, message) { super(message); this.name = "ToolCallError"; this.toolName = toolName; }
+}
+const DSH_READ_LIMIT = 2000, DSH_LINE_CAP = 2000, DSH_GLOB_MAX = 1000, DSH_GREP_MAX = 200, DSH_OUT_TAIL = 30000;
+const dshArgs = (name, a) => { if (a === null || typeof a !== "object" || Array.isArray(a)) throw E("INVALID_ARGUMENT", name + " expects one object argument", "Pass an object, e.g. tools." + name + "({...})."); return a; };
+const dshStr = (v, n) => { if (typeof v !== "string" || v === "") throw E("INVALID_ARGUMENT", n + " must be a non-empty string", "Fix '" + n + "'."); return v; };
+const dshOptInt = (v, n, min) => { if (v === undefined || v === null) return undefined; if (typeof v !== "number" || !Number.isFinite(v) || v < min) throw E("INVALID_ARGUMENT", n + " must be a number >= " + min, "Fix '" + n + "'."); return Math.floor(v); };
+const dshWrap = (name, fn) => async (a) => {
+  try { return fn(dshArgs(name, a === undefined ? {} : a)); }
+  catch (e) {
+    const pe = sysErr(e);
+    throw new ToolCallError(name, String((pe && pe.message) || pe) + (pe && pe.nextAction ? " (" + pe.nextAction + ")" : ""));
+  }
+};
+const dsh = {};
+dsh.read = dshWrap("read", (a) => {
+  const p = dshStr(a.file_path, "file_path"); credGuard(p);
+  const off = dshOptInt(a.offset, "offset", 1) || 1, lim = dshOptInt(a.limit, "limit", 1) || DSH_READ_LIMIT;
+  const f = abs(p), st = fs.statSync(f);
+  if (st.isDirectory()) throw E("INVALID_ARGUMENT", "path is a directory: " + p, "Use glob to list files.");
+  const t = fs.readFileSync(f, "utf8");
+  readState[f] = st.mtimeMs;
+  const all = t.split(/\r?\n/);
+  if (all.length > 1 && all[all.length - 1] === "") all.pop();
+  const lines = all.slice(off - 1, off - 1 + lim).map((s, i) => ({ number: off + i, text: s.length > DSH_LINE_CAP ? s.slice(0, DSH_LINE_CAP) + "...[line truncated]" : s }));
+  return { path: rel(f), offset: off, lines, totalLines: all.length };
+});
+dsh.write = dshWrap("write", (a) => {
+  const p = dshStr(a.file_path, "file_path");
+  if (typeof a.content !== "string") throw E("INVALID_ARGUMENT", "content must be a string", "Pass content as a string.");
+  credGuard(p);
+  const f = abs(p); let before = null;
+  try { before = fs.readFileSync(f, "utf8"); } catch (e) { if (e.code !== "ENOENT") throw e; }
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  atomicWrite(f, a.content);
+  try { readState[f] = fs.statSync(f).mtimeMs; } catch {}
+  noteWrite("write", rel(f));
+  return { path: rel(f), operation: before === null ? "create" : "update", before, after: a.content };
+});
+dsh.edit = dshWrap("edit", (a) => {
+  const p = dshStr(a.file_path, "file_path"); credGuard(p);
+  if (typeof a.old_string !== "string" || a.old_string === "") throw E("INVALID_ARGUMENT", "old_string must be a non-empty string", "Pass the exact text to replace.");
+  if (typeof a.new_string !== "string") throw E("INVALID_ARGUMENT", "new_string must be a string", "Pass the replacement text (empty string deletes).");
+  const f = abs(p), before = fs.readFileSync(f, "utf8");
+  const n = before.split(a.old_string).length - 1;
+  if (n === 0) throw E("NOT_FOUND", "old_string not found in " + p, "Re-read the file and copy the exact text.");
+  countCheck(a.expected_count, n, "expected_count", p);
+  if (n > 1 && a.replace_all !== true) throw E("NOT_UNIQUE", "old_string matches " + n + " places in " + p, "Add context to make it unique, or set replace_all to true (with expected_count).");
+  const lines = a.replace_all === true ? lineNosOf(before, a.old_string) : lineNosOf(before, a.old_string).slice(0, 1);
+  const after = a.replace_all === true ? before.split(a.old_string).join(a.new_string) : before.replace(a.old_string, () => a.new_string);
+  atomicWrite(f, after);
+  try { readState[f] = fs.statSync(f).mtimeMs; } catch {}
+  noteWrite("edit", rel(f), lines.length, lines);
+  return { path: rel(f), replaced: lines.length, lines, before, after };
+});
+const VCS = ["!.git", "!.hg", "!.svn"].flatMap((x) => ["-g", x]);
+dsh.glob = dshWrap("glob", (a) => {
+  const pattern = dshStr(a.pattern, "pattern"), root = a.path === undefined ? "." : dshStr(a.path, "path");
+  credGuard(root);
+  const rootAbs = abs(root);
+  const out = runRg(["--files", "--null", "--hidden", "--no-ignore", "-g", pattern, ...VCS, rootAbs], rootAbs);
+  const files = out.split("\0").map((s) => s.replace(/^\r?\n/, "")).filter(Boolean).filter((f) => !credFast(f));
+  const withT = files.map((f) => { let m = 0; try { m = fs.statSync(f).mtimeMs; } catch {} return [f, m]; });
+  withT.sort((x, y) => (y[1] - x[1]) || cmp(x[0], y[0]));
+  const r = { root: rel(rootAbs) === "" ? "." : rel(rootAbs), paths: withT.slice(0, DSH_GLOB_MAX).map((x) => rel(x[0])) };
+  if (withT.length > DSH_GLOB_MAX) { r.truncated = true; r.total = withT.length; }
+  return r;
+});
+dsh.grep = dshWrap("grep", (a) => {
+  const pattern = dshStr(a.pattern, "pattern"), root = a.path === undefined ? "." : dshStr(a.path, "path");
+  credGuard(root);
+  const rootAbs = abs(root);
+  const args = ["--json", "--max-filesize", "2M", ...VCS];
+  if (a.include !== undefined) args.push("-g", dshStr(a.include, "include"));
+  args.push("-e", pattern, rootAbs);
+  const out = runRg(args, rootAbs);
+  const matches = []; let total = 0;
+  for (const l of out.split(NL)) {
+    if (!l.startsWith('{"type":"match"')) continue;
+    const d = JSON.parse(l).data, pf = pathOf(d.path);
+    if (credFast(pf)) continue;
+    total++;
+    matches.push({ path: rel(pf), lineNumber: d.line_number, line: pathOf(d.lines).replace(CRLF_END, "").slice(0, 500) });
+  }
+  matches.sort((x, y) => cmp(x.path, y.path) || x.lineNumber - y.lineNumber);
+  const r = { matches: matches.slice(0, DSH_GREP_MAX) };
+  if (total > DSH_GREP_MAX) { r.truncated = true; r.total = total; }
+  return r;
+});
+// background jobs: one detached node wrapper per command; state lives in files so later run_code calls can read it
+const BG_WRAP = 'const fs=require("fs"),cp=require("child_process");const [id,d,cmd,cwd,bash]=process.argv.slice(1);' +
+  'const f=d+"/"+id+".out",stf=d+"/"+id+".st";const done=(code,sig,timedOut)=>{try{if(!fs.existsSync(stf))fs.writeFileSync(stf,JSON.stringify({code:code,sig:sig,timedOut:!!timedOut,t:Date.now()}))}catch{};process.exit(0)};' +
+  'const c=cp.spawn(bash,["-c",cmd],{cwd:cwd,stdio:["ignore","pipe","pipe"],windowsHide:true});const w=b=>fs.appendFileSync(f,b);c.stdout.on("data",w);c.stderr.on("data",w);' +
+  'c.on("close",(code,sig)=>done(code,sig,false));c.on("error",e=>{fs.appendFileSync(f,String(e));done(null,"error")});' +
+  'const t=setTimeout(()=>{try{if(process.platform==="win32")cp.spawnSync("taskkill",["/pid",String(c.pid),"/T","/F"],{windowsHide:true});else c.kill("SIGKILL")}catch{};done(null,"timeout",true)},' + BG_MAX_MS + ');if(t.unref)t.unref();';
+const spillTail = (s) => {
+  if (s.length <= DSH_OUT_TAIL) return { text: s, truncated: false };
+  const f = path.join(os.tmpdir(), "ptc-bash-" + crypto.randomBytes(4).toString("hex") + ".txt");
+  fs.writeFileSync(f, s);
+  return { text: s.slice(-DSH_OUT_TAIL), truncated: true, spillPath: f };
+};
+dsh.bash = dshWrap("bash", (a) => {
+  dshStr(a.command, "command"); dshStr(a.description, "description");
+  const c = a.workdir === undefined ? cwd : abs(dshStr(a.workdir, "workdir"));
+  if (a.run_in_background === true) {
+    fs.mkdirSync(bgDir, { recursive: true });
+    const id = newId("d");
+    fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify({ id, kind: "bash", label: a.description, startedAt: Date.now(), deadlineAt: Date.now() + BG_MAX_MS, read: 0 }));
+    fs.writeFileSync(path.join(bgDir, id + ".out"), "");
+    const ch = cp.spawn(process.execPath, ["-e", BG_WRAP, id, bgDir, a.command, c, BASH], { detached: true, stdio: "ignore", windowsHide: true, env: childEnv(a.env) });
+    ch.unref();
+    return { kind: "background", taskId: id };
+  }
+  const timeoutMs = dshOptInt(a.timeoutMs, "timeoutMs", 1) || 120000;
+  const r = legacyBash({ command: a.command, cwd: c, timeoutMs, env: a.env });
+  return { kind: "foreground", exitCode: r.code === undefined ? null : r.code, signal: null, timedOut: !!r.timedOut, aborted: false, timeoutMs, stdout: spillTail(String(r.stdout || "")), stderr: spillTail(String(r.stderr || "")) };
+});
+dsh.job_output = dshWrap("job_output", (a) => {
+  const id = checkId(dshStr(a.job_id, "job_id"));
+  const mf = path.join(bgDir, id + ".json");
+  if (!fs.existsSync(mf)) throw E("NOT_FOUND", "job not found: " + id, "Use the job id returned by bash with run_in_background.");
+  const meta = JSON.parse(fs.readFileSync(mf, "utf8"));
+  const stf = path.join(bgDir, id + ".st");
+  const t = dshOptInt(a.timeout_ms, "timeout_ms", 0);
+  const waitMs = Math.min(t === undefined ? 30000 : t, 100000);
+  if (a.wait === true) { const end = Date.now() + waitMs; while (!fs.existsSync(stf) && Date.now() < end) sleepMs(100); }
+  const buf = fs.readFileSync(path.join(bgDir, id + ".out"));
+  const text = buf.subarray(meta.read).toString("utf8");
+  meta.read = buf.length; fs.writeFileSync(mf, JSON.stringify(meta));
+  const job = { id, kind: meta.kind, label: meta.label, status: "running", startedAt: meta.startedAt };
+  if (fs.existsSync(stf)) {
+    const s = JSON.parse(fs.readFileSync(stf, "utf8"));
+    job.status = s.code === 0 ? "completed" : s.sig ? "killed" : "failed";
+    job.detail = "exit code " + s.code; job.finishedAt = s.t;
+  }
+  return { text, job };
+});
+const legacyBash = tools.bash;
+tools.dsh = dsh;
+if (RO) { // read-only mode: everything that writes or runs a command is refused (legacy and DSH shapes alike)
+  const roMsg = (k) => "[POLICY_DENIED] tools." + k + " is disabled in read-only mode";
+  const roNext = "This run_code is read-only: use read, glob, grep and ref.*; report the change or command instead of making it.";
+  for (const k of ["write", "edit", "replace", "batch", "bash", "parallel", "job", "job_output"]) tools[k] = () => { throw new PtcError("POLICY_DENIED", "tools." + k + " is disabled in read-only mode", roNext); };
+  for (const k of ["write", "edit", "bash", "job_output"]) dsh[k] = async () => { const e = new ToolCallError(k, roMsg(k) + " (" + roNext + ")"); e.code = "POLICY_DENIED"; throw e; };
+}
+if (input.dsh) for (const k of ["read", "write", "edit", "glob", "grep", "bash", "job_output"]) tools[k] = dsh[k];
+
 // ---------- run user code ----------
-for (const k of Object.keys(tools)) tools[k] = guard(tools[k]);
+for (const k of Object.keys(tools)) if (k !== "dsh" && !(input.dsh && k in dsh)) tools[k] = guard(tools[k]);
+tools.root = cwd; // the base directory for relative paths, grep/glob and bash; set via the run_code root parameter
 const AF = Object.getPrototypeOf(async function () {}).constructor;
 (async () => {
   let out, err;
-  try { out = await new AF("tools", "ref", "console", input.code)(tools, ref, cons); } catch (e) { err = e; }
-  let text = lines.join(NL);
-  if (out !== undefined) text += (text ? NL : "") + fmt(out);
+  if (rootErr) err = rootErr;
+  else {
+    try { out = await new AF("tools", "ref", "console", "ToolCallError", input.code)(tools, ref, cons, ToolCallError); } catch (e) { err = e; }
+  }
+  let body = lines.join(NL);
+  if (out !== undefined) body += (body ? NL : "") + fmt(out);
+  let text = body;
+  if (!err) { const w = multiText(); if (w) text = w + (body ? NL + NL + body : ""); }
   if (err) {
     let m;
-    if (err && err.name === "PtcError") m = "Error: " + err.message + (err.nextAction ? NL + "nextAction: " + err.nextAction : "");
+    if (err && err.name === "ToolCallError") m = "ToolCallError (" + err.toolName + "): " + err.message;
+    else if (err && err.name === "PtcError") m = "Error: " + err.message + (err.nextAction ? NL + "nextAction: " + err.nextAction : "");
     else {
       m = "Error: " + (err && err.stack ? String(err.stack).split(NL).slice(0, 4).join(NL) : String(err));
       if (err && typeof err.code === "string") m += NL + "[code: " + err.code + "]";
     }
-    text += (text ? NL : "") + m;
+    if (/\.(catch|then) is not a function/.test(String(err && err.message))) m += NL + "hint: tools.* 是同步的，用 try/catch，不要链 .then/.catch";
+    text = opsText() + NL + NL + m + (body ? NL + NL + body : "");
   }
   if (text.length > MAX) {
     const id = ref.put(text);
-    text = text.slice(0, MAX) + "\n...[truncated " + (text.length - MAX) + " chars; full text saved as ref " + id + "; read in another run_code via ref.page(\"" + id + "\")]";
+    // Cut on line boundaries and say which output lines / chars were dropped, so the model re-reads only that part.
+    const tailLen = Math.max(1, Math.floor(MAX * 0.3));
+    let headEnd = text.lastIndexOf(NL, Math.max(0, MAX - tailLen));
+    if (headEnd <= 0) headEnd = Math.max(0, MAX - tailLen);
+    let tailStart = text.indexOf(NL, text.length - tailLen);
+    if (tailStart < 0 || tailStart <= headEnd) tailStart = text.length - tailLen;
+    const lineAt = (i) => text.slice(0, i).split(NL).length;
+    const totalLines = text.split(NL).length;
+    const fromLine = lineAt(headEnd) + 1, toLine = lineAt(tailStart);
+    text = text.slice(0, headEnd) + NL + "…[省略输出第 " + fromLine + "–" + toLine + " 行（共 " + totalLines + " 行，" + (tailStart - headEnd) + " 字），完整内容 ref " + id + "]…" + text.slice(tailStart) + NL +
+      "输出被截断（上限 " + MAX + " 字）：只补读缺的部分，ref.text(\"" + id + "\", {from: " + headEnd + ", to: " + tailStart + "}) 取回被省略的中段；或缩小打印范围；确需一次看全再传 maxChars:N（最大 50000）";
   }
-  process.stdout.write(text || "(run_code completed with no output)", () => process.exit(err ? 2 : 0));
+  process.stdout.write(text || "(run_code completed with no output)", () => { closeLog(); process.exit(err ? 2 : 0); });
 })();
