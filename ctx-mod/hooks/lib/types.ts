@@ -67,7 +67,7 @@ export const DEFAULTS: Config = {
   homeTokens: 1_500,
   pageTokens: 4_000,
   snippetLines: 30,
-  recentActions: 10,
+  recentActions: 5,
   recentRequests: 3,
   wRead: 0.025,
   wWrite: 1,

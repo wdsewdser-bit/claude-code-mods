@@ -82,7 +82,8 @@ export type Env = {
 export type ToolResult = { result: string; isError?: true }
 
 /** A switch the model asked for and the gate stood behind, until the turn ends. */
-export type Pending = { reason: string; at: number }
+/** `requests` and `seq` are the request count and history seq at approval: calls of the approving step are let through. */
+export type Pending = { reason: string; at: number; requests: number; seq: number }
 
 /** One conversation row as the engine hands it over; seq, ts and window are ours. */
 export type RecordInput = {
@@ -384,6 +385,7 @@ export type Session = {
   ready: () => Promise<void>
   /** The switch the model is waiting for, if any; `await ready()` is not needed (memory only). */
   pending: () => Pending | null
+  blocksCalls: () => boolean
   clearPending: () => void
   /** Copies a conversation that predates this mod; a no-op once anything is on disk. */
   importMessages: (messages: readonly ImportedMessage[]) => Promise<number>
@@ -1959,7 +1961,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     )
     if (!gate.isAllowed) return errorOf(`暂不换窗口：${gate.reason}`)
 
-    state.pending = { reason, at: now }
+    state.pending = { reason, at: now, requests: state.requestsSinceSwitch, seq: state.seq }
 
     return { result: APPROVED }
   }
@@ -1973,6 +1975,17 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     }
 
     return state.pending
+  }
+
+  /**
+   * Whether a tool call must be refused because a switch stands. The calls sent in the
+   * same step as the approved `new` still run, so finished edits can ride along with the
+   * switch; only a call from a later step, which the model was told not to make, is refused.
+   */
+  const blocksCalls = (): boolean => {
+    const p = pending()
+
+    return p !== null && state.requestsSinceSwitch > p.requests
   }
 
   const clearPending = (): void => {
@@ -2036,6 +2049,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       rows,
       state.window,
       Math.max(config.recentActions, Math.min(MAX_TAIL_ACTIONS, tail.steps)),
+      state.pending?.seq,
     ).map(action => (action.path === undefined ? action : { ...action, path: relativePath(action.path, base) }))
     const coverage = renderCoverage(tail)
     const tools = renderTools(costlyToolsOf(loadedTools(rows, state.window), costlyGroups()))
@@ -2197,6 +2211,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     ledgerRead,
     historyTool,
     status,
+    blocksCalls,
     requestSwitch,
     gateLoad,
     ready,

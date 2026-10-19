@@ -462,6 +462,9 @@ export type Action = { seq: number; tool: string; path?: string; input?: string;
 
 const HEAD_CHARS = 80
 
+/** The head kept for a call made in the step that asked for the switch: its summary is the only result the new window sees. */
+const SWITCH_HEAD_CHARS = 800
+
 /**
  * The tail of one window's tool calls, oldest first, as a short recap of what was
  * done. This mod's own calls are dropped before the tail is taken, so the count
@@ -471,6 +474,8 @@ export const recentActions = (
   rows: readonly HistoryRecord[],
   window: number,
   count: number,
+  /** The history seq at the switch's approval: calls after it keep a longer head. */
+  longFrom?: number,
 ): Action[] => {
   if (count <= 0) return []
 
@@ -484,7 +489,7 @@ export const recentActions = (
       seq: row.seq,
       tool: row.tool ?? '',
       isError: row.isError === true,
-      head: oneLine(row.text.slice(0, HEAD_CHARS)),
+      head: oneLine(row.text.slice(0, longFrom !== undefined && row.seq > longFrom ? SWITCH_HEAD_CHARS : HEAD_CHARS)),
     }
     if (row.path !== undefined) action.path = row.path
     if (row.input !== undefined) action.input = row.input
