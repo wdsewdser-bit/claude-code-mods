@@ -202,33 +202,63 @@ export function planRead(old: Lines, a: number, nt: string[], total: number, pat
   const b = a + n - 1
   const ops = align(old, a, nt, total)
   if (!ops) return { kind: 'full', reason: 'too-large', need: [] }
+  // "unseen": added lines before the first / after the last matched line whose (shift-corrected) old number was never cached,
+  // i.e. the part of the range that only extends past what was read before. Shown on its own, not counted as change.
+  let fe = -1
+  let le = -1
+  for (let i = 0; i < ops.length; i++) {
+    if ((ops[i] as Op).k === 'eq') {
+      if (fe < 0) fe = i
+      le = i
+    }
+  }
+  if (fe < 0) return { kind: 'full', reason: 'no-overlap', ops, need: [] }
+  const unseen = new Array<boolean>(ops.length).fill(false)
+  const firstEq = ops[fe] as Op
+  const lastEq = ops[le] as Op
+  for (let i = fe - 1; i >= 0; i--) {
+    const op = ops[i] as Op
+    if (op.k === 'del') continue
+    if (old.has((op.n as number) + (firstEq.o as number) - (firstEq.n as number))) break
+    unseen[i] = true
+  }
+  for (let i = le + 1; i < ops.length; i++) {
+    const op = ops[i] as Op
+    if (op.k === 'del') continue
+    if (old.has((op.n as number) + (lastEq.o as number) - (lastEq.n as number))) break
+    unseen[i] = true
+  }
   let adds = 0
   let dels = 0
+  let unseenCount = 0
   const deltas = new Set<number>()
-  for (const op of ops) {
-    if (op.k === 'add') adds++
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i] as Op
+    if (unseen[i]) unseenCount++
+    else if (op.k === 'add') adds++
     else if (op.k === 'del') dels++
     else deltas.add((op.n as number) - (op.o as number))
   }
   const changes = adds + dels
+  const seenN = n - unseenCount
   const srcOf = (o: number) => (old.get(o) as Line).src
-  if (changes === 0) {
+  if (changes === 0 && unseenCount === 0) {
     const need = [...new Set(ops.map(op => srcOf(op.o as number)))]
     const shifted = [...deltas].some(d => d !== 0)
     return shifted
       ? { kind: 'shifted', ops, text: shiftedMessage(path, a, b, [...deltas]), need }
       : { kind: 'same', ops, text: sameMessage(path, a, b), need }
   }
-  if (changes > MAX_CHANGE_RATIO * n) return { kind: 'full', reason: `changed ${changes}/${n} > 30%`, ops, need: [] }
+  if (changes > MAX_CHANGE_RATIO * seenN) return { kind: 'full', reason: `changed ${changes}/${seenN} > 30%`, ops, need: [] }
 
   // hunks: every change plus CONTEXT_LINES equal lines each side
   const keep = new Array<boolean>(ops.length).fill(false)
   for (let c = 0; c < ops.length; c++) {
-    if ((ops[c] as Op).k === 'eq') continue
+    if ((ops[c] as Op).k === 'eq' || unseen[c]) continue
     keep[c] = true
     for (const dir of [-1, 1]) {
       let cnt = 0
-      for (let t = c + dir; t >= 0 && t < ops.length && cnt < CONTEXT_LINES; t += dir) {
+      for (let t = c + dir; t >= 0 && t < ops.length && !unseen[t] && cnt < CONTEXT_LINES; t += dir) {
         keep[t] = true
         if ((ops[t] as Op).k === 'eq') cnt++
       }
@@ -238,6 +268,22 @@ export function planRead(old: Lines, a: number, nt: string[], total: number, pat
   const body: string[] = []
   let i = 0
   while (i < ops.length) {
+    if (unseen[i]) {
+      const block: string[] = []
+      let first = 0
+      let last = 0
+      for (; i < ops.length && unseen[i]; i++) {
+        const op = ops[i] as Op
+        if (op.k === 'del') continue
+        const num = op.n as number
+        if (block.length === 0) first = num
+        last = num
+        displayed.add(num)
+        block.push(`${num}	${nt[num - a]}`)
+      }
+      body.push(`@@ 此前未见 第 ${rangeText(first, last)} 行（原文） @@`, ...block)
+      continue
+    }
     if (!keep[i]) {
       i++
       continue
@@ -260,13 +306,27 @@ export function planRead(old: Lines, a: number, nt: string[], total: number, pat
     body.push(first === undefined ? '@@ @@' : `@@ 新第 ${rangeText(first, last as number)} 行 @@`, ...hunk)
   }
   const head =
-    `[read-dedup] ${path} 第 ${rangeText(a, b)} 行：此前读取过，只返回变动（diff 风格：" "上下文，"-"已删除（旧行号），"+"新增/改动/此前未见（新行号）；` +
-    `未列出的行与此前读取相同，行号以新行号为准）。如确需原文，立即再读一次同一范围。`
+    `[read-dedup] ${path} 第 ${rangeText(a, b)} 行：部分或全部此前读取过，只返回变动和此前未见的行（diff 风格：" "上下文，"-"已删除（旧行号），"+"新增/改动（新行号）；` +
+    `"此前未见"块为原文；未列出的行与此前读取相同，行号以新行号为准）。如确需原文，立即再读一次同一范围。`
   const text = [head, ...body].join('\n')
   if (text.length >= fullLen) return { kind: 'full', reason: 'diff-not-smaller', ops, need: [] }
   const need = new Set<string>()
   for (const op of ops) if (op.k === 'eq' && !displayed.has(op.n as number)) need.add(srcOf(op.o as number))
   return { kind: 'diff', ops, text, displayed, need: [...need] }
+}
+
+/** Removes a leading `1<TAB>`, `2<TAB>`, ... gutter (consecutive from 1, also `N→`) from the lines that carry it; other lines are kept as they are. */
+export function stripGutter(text: string): string {
+  let next = 1
+  return text
+    .split('\n')
+    .map(l => {
+      const m = /^\s*(\d+)[\t→]/.exec(l)
+      if (m === null || Number(m[1]) !== next) return l
+      next++
+      return l.slice(m[0].length)
+    })
+    .join('\n')
 }
 
 // ---------- cache update ----------
