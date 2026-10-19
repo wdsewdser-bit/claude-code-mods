@@ -1903,9 +1903,21 @@ const attach = async ($: Engine, type: string, text: string, agentId?: string): 
 const attachmentText = (sections: readonly { id: string; text: string }[]): string | undefined =>
   sections.find(section => section.id === 'ctx-mod:attachments')?.text
 
-/** Where the mod keeps the attachments for the next process, once it wrote them. */
+/** The working directory key the archives use, as the mod derives it. */
+const cwdKeyOf = (cwd: string): string => {
+  let hash = 5381
+  for (const char of cwd.replaceAll('\\', '/').toLowerCase()) hash = ((hash * 33) ^ char.charCodeAt(0)) >>> 0
+
+  return hash.toString(16).padStart(8, '0')
+}
+
+/** Where the mod keeps this session's attachments for the next process, once it wrote them. */
 const storedAttachmentsPath = (w: World): string | undefined =>
-  [...w.files.keys()].find(path => path.includes('/.claude/ctx-mod/attachments/'))
+  [...w.files.keys()].find(path => path.includes('/.claude/ctx-mod/attachments/') && !path.includes('/attachments/shared/'))
+
+/** Where the mod keeps the working directory's shared attachments, once it wrote them. */
+const sharedAttachmentsPath = (w: World): string | undefined =>
+  [...w.files.keys()].find(path => path.includes('/.claude/ctx-mod/attachments/shared/'))
 
 /** One process that sees these attachments, leaving their archive where the next process reads it. */
 const archiveFrom = async (
@@ -1919,7 +1931,10 @@ const archiveFrom = async (
   for (const [type, text] of texts) await attach($, type, text)
   const path = storedAttachmentsPath(w)
   if (path === undefined) throw new Error('the attachments were not stored')
-  w.readable.set(path, w.files.get(path) ?? '')
+  // The next process sees the same disk: this session's archive and the shared one.
+  for (const [file, text] of [...w.files]) {
+    if (file.includes('/.claude/ctx-mod/attachments/')) w.readable.set(file, text)
+  }
   w.files.clear()
 
   return path
@@ -1953,7 +1968,7 @@ test('after a window switch the whitelisted attachments move into the prompt and
   await compact($, 'manual')
   const sections = await composeIds($)
   expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:attachments', 'ctx-mod:context'])
-  expect(attachmentText(sections)).toBe('ENV\n\nSKILL-A\n\nSKILL-B')
+  expect(attachmentText(sections)).toBe('SKILL-A\n\nSKILL-B\n\nENV')
 
   // A text the prompt carries is no longer read from the message.
   expect(await attach($, 'environment', 'ENV')).toBeNull()
@@ -1962,7 +1977,7 @@ test('after a window switch the whitelisted attachments move into the prompt and
   expect(await attach($, 'date', 'DATE')).toBe('DATE')
   // A whitelisted type whose text changed stays, and the next prompt carries it.
   expect(await attach($, 'skill_listing', 'SKILL-C')).toBe('SKILL-C')
-  expect(attachmentText(await composeIds($))).toBe('ENV\n\nSKILL-A\n\nSKILL-B\n\nSKILL-C')
+  expect(attachmentText(await composeIds($))).toBe('SKILL-A\n\nSKILL-B\n\nSKILL-C\n\nENV')
   expect(await attach($, 'skill_listing', 'SKILL-C')).toBeNull()
 })
 
@@ -2019,7 +2034,7 @@ test('armed, the next process carries the stored attachments from its first syst
   // The first main prompt already carries the archive, before this process sees anything.
   const sections = await composeIds($)
   expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:attachments', 'ctx-mod:context'])
-  expect(attachmentText(sections)).toBe('ENV\n\nSKILL')
+  expect(attachmentText(sections)).toBe('SKILL\n\nENV')
   // A text the prompt carries leaves the message.
   expect(await attach($, 'environment', 'ENV')).toBeNull()
   expect(await attach($, 'skill_listing', 'SKILL')).toBeNull()
@@ -2064,7 +2079,7 @@ test('after a window switch, a stored text this process did not see leaves the p
   promptBottoms(on)
   await archiveFrom($, on, w, [['environment', 'ENV'], ['skill_listing', 'STALE']])
   await boot($)
-  expect(attachmentText(await composeIds($))).toBe('ENV\n\nSTALE')
+  expect(attachmentText(await composeIds($))).toBe('STALE\n\nENV')
   expect(await attach($, 'environment', 'ENV')).toBeNull()
   // STALE was never asked again this process.
   await compact($, 'manual')
@@ -2112,19 +2127,23 @@ test('armed, attachments arriving together write the archive one at a time, endi
   ])
 })
 
-test('with CTX_MOD_ATTACH_TO_SYSTEM=0 the archive is neither read nor written', async ($, on) => {
+test('with CTX_MOD_ATTACH_TO_SYSTEM=0 neither archive is read or written', async ($, on) => {
   const w = world(on, 's-at-off-archive', { CTX_MOD: '1', CTX_MOD_ATTACH_TO_SYSTEM: '0' })
   promptBottoms(on)
   attachmentBottom(on)
-  const path = `${slashed(HOME)}/.claude/ctx-mod/attachments/${w.sessionId}.json`
-  w.readable.set(path, '[{"type":"environment","text":"STORED"}]')
+  const attachments = slashed(HOME) + '/.claude/ctx-mod/attachments/'
+  w.readable.set(attachments + w.sessionId + '.json', '[{"type":"environment","text":"STORED"}]')
+  w.readable.set(attachments + 'shared/' + cwdKeyOf('/work') + '.json', '[{"type":"skill_listing","text":"SHARED"}]')
+  w.reads.length = 0
   await boot($)
   expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'skill_listing', 'SKILL')).toBe('SKILL')
   await compact($, 'manual')
   expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
   expect(w.reads.filter(p => p.includes('/.claude/ctx-mod/attachments/'))).toEqual([])
   expect(storedAttachmentsPath(w)).toBeUndefined()
+  expect(sharedAttachmentsPath(w)).toBeUndefined()
 })
 
 test('armed, another session in the same directory does not see this session’s archive', async ($, on) => {
@@ -2144,7 +2163,22 @@ test('armed, another session in the same directory does not see this session’s
   expect(w.files.get(ownerPath)).toBeUndefined()
 })
 
-test('armed, without a session id the archive is neither read nor written', async ($, on) => {
+test('armed, each entrypoint keeps its own shared archive', async ($, on) => {
+  const w = world(on, 's-at-entry', { CTX_MOD: '1', CLAUDE_CODE_ENTRYPOINT: 'cli' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  // The desktop app's archive for the same directory is not this entrypoint's.
+  w.readable.set(
+    slashed(HOME) + '/.claude/ctx-mod/attachments/shared/claude-desktop-' + cwdKeyOf('/work') + '.json',
+    JSON.stringify([{ type: 'skill_listing', text: 'DESKTOP' }]),
+  )
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await attach($, 'skill_listing', 'CLI')).toBe('CLI')
+  expect(sharedAttachmentsPath(w)).toBe(slashed(HOME) + '/.claude/ctx-mod/attachments/shared/cli-' + cwdKeyOf('/work') + '.json')
+})
+
+test('armed, without a session id only the shared archive is read and written', async ($, on) => {
   const w = world(on, 's-at-no-id', { CTX_MOD: '1' })
   promptBottoms(on)
   attachmentBottom(on)
@@ -2152,10 +2186,23 @@ test('armed, without a session id the archive is neither read nor written', asyn
   w.reads.length = 0
   await boot($)
   expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  // The shared archive is the only attachment file this process reads.
+  expect(w.reads.filter(p => p.includes('/.claude/ctx-mod/attachments/'))).toEqual([
+    slashed(HOME) + '/.claude/ctx-mod/attachments/shared/unknown-' + cwdKeyOf('/work') + '.json',
+  ])
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
-  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
-  expect(w.reads.filter(p => p.includes('/.claude/ctx-mod/attachments/'))).toEqual([])
+  expect(await attach($, 'skill_listing', 'SHARED')).toBe('SHARED')
+  // No session id: only the shared archive is written, and only the shared types.
   expect(storedAttachmentsPath(w)).toBeUndefined()
+  const sharedPath = sharedAttachmentsPath(w)
+  expect(sharedPath?.endsWith('/attachments/shared/unknown-' + cwdKeyOf('/work') + '.json')).toBe(true)
+  expect(JSON.parse(w.files.get(sharedPath ?? '') ?? '[]')).toEqual([{ type: 'skill_listing', text: 'SHARED' }])
+
+  // Another process without an id starts from that archive.
+  for (const [file, text] of [...w.files]) w.readable.set(file, text)
+  w.files.clear()
+  await boot($)
+  expect(attachmentText(await composeIds($))).toBe('SHARED')
 })
 
 test('after a window switch, a changed non-incremental text replaces the old one', async ($, on) => {
@@ -2188,5 +2235,173 @@ test('after a window switch, incremental types keep every text they saw', async 
   expect(await attach($, 'skill_listing', 'SKILL-A')).toBe('SKILL-A')
 
   await compact($, 'manual')
-  expect(attachmentText(await composeIds($))).toBe('DELTA-A\n\nDELTA-B\n\nSKILL-A\n\nSKILL-B')
+  expect(attachmentText(await composeIds($))).toBe('SKILL-A\n\nSKILL-B\n\nDELTA-A\n\nDELTA-B')
+})
+test('a new session in the same directory starts from the shared archive with only its shared types', async ($, on) => {
+  const w = world(on, 's-at-shared-owner', { CTX_MOD: '1' })
+  promptBottoms(on)
+  await archiveFrom($, on, w, [['environment', 'OWNER-ENV'], ['model', 'Opus 5.5'], ['skill_listing', 'SKILL-A']])
+  const sharedPath = slashed(HOME) + '/.claude/ctx-mod/attachments/shared/unknown-' + cwdKeyOf('/work') + '.json'
+  // The shared archive keeps the listing and nothing that belongs to the owner.
+  expect(JSON.parse(w.readable.get(sharedPath) ?? '[]')).toEqual([{ type: 'skill_listing', text: 'SKILL-A' }])
+
+  // A different session id in the same working directory.
+  w.sessionId = 's-at-shared-new'
+  await boot($)
+  const sections = await composeIds($)
+  expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:attachments', 'ctx-mod:context'])
+  expect(attachmentText(sections)).toBe('SKILL-A')
+  // The prompt carries the listing, so the message drops it; the owner's own texts are absent.
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBeNull()
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'model', 'Opus 5.5')).toBe('Opus 5.5')
+
+  // After a switch only this process's texts remain, in the fixed order.
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('SKILL-A\n\nENV\n\nOpus 5.5')
+})
+
+test('the session archive wins over the shared archive', async ($, on) => {
+  const w = world(on, 's-at-both', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  const attachments = slashed(HOME) + '/.claude/ctx-mod/attachments/'
+  w.readable.set(attachments + 's-at-both.json', '[{"type":"environment","text":"SESSION-ENV"},{"type":"skill_listing","text":"SESSION-SKILL"}]')
+  w.readable.set(attachments + 'shared/' + cwdKeyOf('/work') + '.json', '[{"type":"skill_listing","text":"SHARED-SKILL"}]')
+  await boot($)
+  expect(attachmentText(await composeIds($))).toBe('SESSION-SKILL\n\nSESSION-ENV')
+})
+
+test('the fixed order is the same whatever order the attachments arrived in', async ($, on) => {
+  const w = world(on, 's-at-order-a', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBe('SKILL-A')
+  expect(await attach($, 'skill_listing', 'SKILL-B')).toBe('SKILL-B')
+  expect(await attach($, 'language', 'LANG')).toBe('LANG')
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  await compact($, 'manual')
+  const first = attachmentText(await composeIds($))
+  expect(first).toBe('SKILL-A\n\nSKILL-B\n\nLANG\n\nENV')
+
+  // A second process in the same directory sees the shared archive and arrives in another order.
+  for (const [file, text] of [...w.files]) {
+    if (file.includes('/attachments/shared/')) w.readable.set(file, text)
+  }
+  w.sessionId = 's-at-order-b'
+  await boot($)
+  expect(attachmentText(await composeIds($))).toBe('SKILL-A\n\nSKILL-B\n\nLANG')
+  expect(await attach($, 'language', 'LANG')).toBeNull()
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  // The prompt already carries both listings, so the message leaves them out.
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBeNull()
+  expect(await attach($, 'skill_listing', 'SKILL-B')).toBeNull()
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe(first)
+})
+
+test('a skill listing with one new line only reports that line', async ($, on) => {
+  const w = world(on, 's-at-line-add', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'skill_listing', 'alpha\nbeta')).toBe('alpha\nbeta')
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('alpha\nbeta')
+  expect(await attach($, 'skill_listing', 'alpha\nbeta\ngamma')).toBe('In addition to what the system prompt lists:\ngamma')
+})
+
+test('a skill listing missing one line says it is unavailable, and the switch keeps the actual text', async ($, on) => {
+  const w = world(on, 's-at-line-missing', { CTX_MOD: '1' })
+  promptBottoms(on)
+  await archiveFrom($, on, w, [['skill_listing', 'alpha\nbeta']])
+  await boot($)
+  expect(attachmentText(await composeIds($))).toBe('alpha\nbeta')
+  expect(await attach($, 'skill_listing', 'alpha')).toBe('These are no longer available in this session; ignore them:\nbeta')
+  await compact($, 'manual')
+  // The section keeps the text as it actually came, not the note.
+  expect(attachmentText(await composeIds($))).toBe('alpha')
+})
+
+test('the same skill lines in another order with trailing whitespace are left out', async ($, on) => {
+  const w = world(on, 's-at-line-same', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'skill_listing', 'alpha\nbeta')).toBe('alpha\nbeta')
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('alpha\nbeta')
+  expect(await attach($, 'skill_listing', 'beta   \nalpha')).toBeNull()
+})
+
+test('a skill listing almost entirely new keeps its own text', async ($, on) => {
+  const w = world(on, 's-at-line-new', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'skill_listing', 'alpha\nbeta')).toBe('alpha\nbeta')
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('alpha\nbeta')
+  expect(await attach($, 'skill_listing', 'gamma\ndelta')).toBe('gamma\ndelta')
+})
+
+test('a delta reports only its new lines and never a missing one', async ($, on) => {
+  const w = world(on, 's-at-delta-lines', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'agent_listing_delta', 'd1\nd2')).toBe('d1\nd2')
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('d1\nd2')
+  expect(await attach($, 'agent_listing_delta', 'd1\nd3')).toBe('In addition to what the system prompt lists:\nd3')
+  await composeIds($)
+  // No new line and no missing line: the message leaves it out.
+  expect(await attach($, 'agent_listing_delta', 'd2\nd1')).toBeNull()
+})
+
+test('a whole-text shared type that changed keeps its text', async ($, on) => {
+  const w = world(on, 's-at-whole', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'language', 'en')).toBe('en')
+  await composeIds($)
+  expect(await attach($, 'language', 'zh')).toBe('zh')
+  expect(await attach($, 'output_style_instructions', 'STYLE-A')).toBe('STYLE-A')
+  await composeIds($)
+  expect(await attach($, 'output_style_instructions', 'STYLE-B')).toBe('STYLE-B')
+})
+
+test('the shared archive keeps only the shared types, in the fixed order, and only when they change', async ($, on) => {
+  const w = world(on, 's-at-shared-save', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  // A type no other session may share writes the session archive only.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(storedAttachmentsPath(w)?.endsWith('/s-at-shared-save.json')).toBe(true)
+  expect(sharedAttachmentsPath(w)).toBeUndefined()
+
+  expect(await attach($, 'language', 'LANG')).toBe('LANG')
+  const sharedPath = sharedAttachmentsPath(w)
+  expect(JSON.parse(w.files.get(sharedPath ?? '') ?? '[]')).toEqual([{ type: 'language', text: 'LANG' }])
+
+  // The same text again changes nothing, so the shared archive is not written again.
+  w.files.clear()
+  expect(await attach($, 'language', 'LANG')).toBe('LANG')
+  expect(sharedAttachmentsPath(w)).toBeUndefined()
+
+  // A listing comes first in the fixed order, whatever arrived first.
+  expect(await attach($, 'skill_listing', 'SKILL')).toBe('SKILL')
+  expect(JSON.parse(w.files.get(sharedPath ?? '') ?? '[]')).toEqual([
+    { type: 'skill_listing', text: 'SKILL' },
+    { type: 'language', text: 'LANG' },
+  ])
+
+  // A non-shared text changes only the session archive.
+  w.files.clear()
+  expect(await attach($, 'model', 'MODEL')).toBe('MODEL')
+  expect(sharedAttachmentsPath(w)).toBeUndefined()
+  expect(storedAttachmentsPath(w)).toBeDefined()
 })
