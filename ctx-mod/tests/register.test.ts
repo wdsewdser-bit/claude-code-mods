@@ -43,6 +43,8 @@ type World = {
   runError: unknown
   /** Files `$.fs.read` answers with; empty unless a test puts one here, so every other read is denied as before. */
   readable: Map<string, string>
+  /** Awaited inside every `$.fs.write`, so a test can hold writes open; none unless set. */
+  writeGate: (() => Promise<void>) | undefined
   /** What `$.agent.list()` answers with. */
   agents: { id: string; type: string; description: string; status: string }[]
   /** What the bottom answers `agent.spawn` with: the started agent, or a `{ deny }` refusal. */
@@ -116,10 +118,12 @@ const world = (
     submits: [],
     timeline: [],
     keeper: null,
+    writeGate: undefined,
   }
   mock.env(on, { USERPROFILE: HOME, ...env })
-  on('fs.write', (_$, e) => {
+  on('fs.write', async (_$, e) => {
     if (w.failWrites) return { deny: 'EIO: write failed' } as never
+    if (w.writeGate !== undefined) await w.writeGate()
     w.files.set(slashed(e.path), e.text)
 
     return { value: undefined }
@@ -1895,6 +1899,36 @@ const attach = async ($: Engine, type: string, text: string, agentId?: string): 
 const attachmentText = (sections: readonly { id: string; text: string }[]): string | undefined =>
   sections.find(section => section.id === 'ctx-mod:attachments')?.text
 
+/** Where the mod keeps the attachments for the next process, once it wrote them. */
+const storedAttachmentsPath = (w: World): string | undefined =>
+  [...w.files.keys()].find(path => path.includes('/.claude/ctx-mod/attachments/'))
+
+/** The same key register.ts derives from a working directory. */
+const keyOf = (cwd: string): string => {
+  let hash = 5381
+  for (const char of cwd.replaceAll('\\', '/').toLowerCase()) hash = ((hash * 33) ^ char.charCodeAt(0)) >>> 0
+
+  return hash.toString(16).padStart(8, '0')
+}
+
+/** One process that sees these attachments, leaving their archive where the next process reads it. */
+const archiveFrom = async (
+  $: Engine,
+  on: On,
+  w: World,
+  texts: readonly (readonly [string, string])[],
+): Promise<string> => {
+  attachmentBottom(on)
+  await boot($)
+  for (const [type, text] of texts) await attach($, type, text)
+  const path = storedAttachmentsPath(w)
+  if (path === undefined) throw new Error('the attachments were not stored')
+  w.readable.set(path, w.files.get(path) ?? '')
+  w.files.clear()
+
+  return path
+}
+
 test('armed, the first window keeps every attachment in the message and adds no section', async ($, on) => {
   const w = world(on, 's-at-first', { CTX_MOD: '1' })
   promptBottoms(on)
@@ -1976,4 +2010,116 @@ test('with CTX_MOD unset the attachments are left alone', async ($, on) => {
   await compact($, 'manual')
   expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro'])
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+})
+
+test('armed, the next process carries the stored attachments from its first system prompt', async ($, on) => {
+  const w = world(on, 's-at-stored', { CTX_MOD: '1' })
+  promptBottoms(on)
+  const path = await archiveFrom($, on, w, [['environment', 'ENV'], ['skill_listing', 'SKILL']])
+  expect(path.startsWith(`${slashed(HOME)}/.claude/ctx-mod/attachments/`)).toBe(true)
+
+  await boot($)
+  // The first main prompt already carries the archive, before this process sees anything.
+  const sections = await composeIds($)
+  expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:attachments', 'ctx-mod:context'])
+  expect(attachmentText(sections)).toBe('ENV\n\nSKILL')
+  // A text the prompt carries leaves the message.
+  expect(await attach($, 'environment', 'ENV')).toBeNull()
+  expect(await attach($, 'skill_listing', 'SKILL')).toBeNull()
+  // A type outside the whitelist stays in the message.
+  expect(await attach($, 'date', 'DATE')).toBe('DATE')
+  // A side analysis carries no attachments.
+  expect((await composeIds($, ['lean', 'analysis'])).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+})
+
+test('armed, a damaged, non-string or empty archive is treated as no archive', async ($, on) => {
+  const w = world(on, 's-at-bad-archive', { CTX_MOD: '1' })
+  promptBottoms(on)
+  const path = await archiveFrom($, on, w, [['environment', 'ENV']])
+  for (const bad of ['{not json', '{"a":1}', '[]', '[1,2]']) {
+    w.readable.set(path, bad)
+    w.files.clear()
+    await boot($)
+    // The first window stays as it was: nothing moved.
+    expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+    expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+    // After a switch the text seen this process still moves, as before.
+    await compact($, 'manual')
+    expect(attachmentText(await composeIds($))).toBe('ENV')
+  }
+})
+
+test('armed, a text the prompt carries is still recorded, so a switch keeps it', async ($, on) => {
+  const w = world(on, 's-at-kept', { CTX_MOD: '1' })
+  promptBottoms(on)
+  await archiveFrom($, on, w, [['skill_listing', 'SKILL-A']])
+  await boot($)
+  expect(attachmentText(await composeIds($))).toBe('SKILL-A')
+  // The prompt already carries it, so the message drops it; it must still be seen.
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBeNull()
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('SKILL-A')
+})
+
+test('after a window switch, a stored text this process did not see leaves the prompt', async ($, on) => {
+  const w = world(on, 's-at-stale', { CTX_MOD: '1' })
+  promptBottoms(on)
+  await archiveFrom($, on, w, [['environment', 'ENV'], ['skill_listing', 'STALE']])
+  await boot($)
+  expect(attachmentText(await composeIds($))).toBe('ENV\n\nSTALE')
+  expect(await attach($, 'environment', 'ENV')).toBeNull()
+  // STALE was never asked again this process.
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('ENV')
+})
+
+test('armed, a new attachment is stored and an unchanged list is not written again', async ($, on) => {
+  const w = world(on, 's-at-save', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  const path = storedAttachmentsPath(w)
+  expect(path).toBeDefined()
+  expect(w.files.get(path ?? '')).toBe('["ENV"]')
+
+  w.files.clear()
+  // The same text again adds nothing, so nothing is written.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(storedAttachmentsPath(w)).toBeUndefined()
+  // A new text is added, and the whole list is written.
+  expect(await attach($, 'skill_listing', 'SKILL')).toBe('SKILL')
+  expect(w.files.get(path ?? '')).toBe('["ENV","SKILL"]')
+})
+
+test('armed, attachments arriving together write the archive one at a time, ending with the whole list', async ($, on) => {
+  const w = world(on, 's-at-save-parallel', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  let inFlight = 0
+  let overlapped = false
+  w.writeGate = async () => {
+    inFlight += 1
+    if (inFlight > 1) overlapped = true
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    inFlight -= 1
+  }
+  await boot($)
+  await Promise.all([attach($, 'environment', 'ENV'), attach($, 'model', 'MODEL'), attach($, 'skill_listing', 'SKILL')])
+  expect(overlapped).toBe(false)
+  expect(JSON.parse(w.files.get(storedAttachmentsPath(w) ?? '') ?? '[]')).toEqual(['ENV', 'MODEL', 'SKILL'])
+})
+
+test('with CTX_MOD_ATTACH_TO_SYSTEM=0 the archive is neither read nor written', async ($, on) => {
+  const w = world(on, 's-at-off-archive', { CTX_MOD: '1', CTX_MOD_ATTACH_TO_SYSTEM: '0' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  const path = `${slashed(HOME)}/.claude/ctx-mod/attachments/${keyOf('/work')}.json`
+  w.readable.set(path, '["STORED"]')
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  await compact($, 'manual')
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(storedAttachmentsPath(w)).toBeUndefined()
 })
