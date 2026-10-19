@@ -1963,22 +1963,54 @@ test('after a window switch the whitelisted attachments move into the prompt and
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   expect(await attach($, 'skill_listing', 'SKILL-A')).toBe('SKILL-A')
   expect(await attach($, 'skill_listing', 'SKILL-B')).toBe('SKILL-B')
+  expect(await attach($, 'language', 'LANG')).toBe('LANG')
   expect(await attach($, 'date', 'DATE')).toBe('DATE')
 
   await compact($, 'manual')
   const sections = await composeIds($)
   expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:attachments', 'ctx-mod:context'])
-  expect(attachmentText(sections)).toBe('SKILL-A\n\nSKILL-B\n\nENV')
+  // Only the shared types move; the environment is the session's own.
+  expect(attachmentText(sections)).toBe('SKILL-A\n\nSKILL-B\n\nLANG')
+  expect(attachmentText(sections)).not.toContain('ENV')
 
-  // A text the prompt carries is no longer read from the message.
-  expect(await attach($, 'environment', 'ENV')).toBeNull()
+  // A shared text the prompt carries is no longer read from the message.
   expect(await attach($, 'skill_listing', 'SKILL-A')).toBeNull()
-  // A type outside the whitelist stays in the message.
+  expect(await attach($, 'language', 'LANG')).toBeNull()
+  // A type outside the shared set stays in the message.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   expect(await attach($, 'date', 'DATE')).toBe('DATE')
-  // A whitelisted type whose text changed stays, and the next prompt carries it.
+  // A shared type whose text changed stays, and the next prompt carries it.
   expect(await attach($, 'skill_listing', 'SKILL-C')).toBe('SKILL-C')
-  expect(attachmentText(await composeIds($))).toBe('SKILL-A\n\nSKILL-B\n\nSKILL-C\n\nENV')
+  expect(attachmentText(await composeIds($))).toBe('SKILL-A\n\nSKILL-B\n\nSKILL-C\n\nLANG')
   expect(await attach($, 'skill_listing', 'SKILL-C')).toBeNull()
+})
+
+test('after a window switch only the shared types enter the prompt, and the session’s own stay in the message', async ($, on) => {
+  const w = world(on, 's-at-own', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'model', 'MODEL')).toBe('MODEL')
+  expect(await attach($, 'session_context', 'CTX')).toBe('CTX')
+  expect(await attach($, 'skill_listing', 'SKILL')).toBe('SKILL')
+  expect(await attach($, 'language', 'LANG')).toBe('LANG')
+  await compact($, 'manual')
+
+  // The shared types are carried by the prompt.
+  const sections = await composeIds($)
+  expect(attachmentText(sections)).toBe('SKILL\n\nLANG')
+  // The session's own types never enter it.
+  expect(attachmentText(sections)).not.toContain('ENV')
+  expect(attachmentText(sections)).not.toContain('MODEL')
+  expect(attachmentText(sections)).not.toContain('CTX')
+  // The hook returns them unchanged, so the message still carries them.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'model', 'MODEL')).toBe('MODEL')
+  expect(await attach($, 'session_context', 'CTX')).toBe('CTX')
+  // The shared texts the prompt carries leave the message.
+  expect(await attach($, 'skill_listing', 'SKILL')).toBeNull()
+  expect(await attach($, 'language', 'LANG')).toBeNull()
 })
 
 test('a subagent’s attachments pass through untouched and a side analysis carries none', async ($, on) => {
@@ -1987,17 +2019,17 @@ test('a subagent’s attachments pass through untouched and a side analysis carr
   attachmentBottom(on)
   await boot($)
   await personRequest($, '整理一下', 'person-1')
-  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'language', 'LANG')).toBe('LANG')
   await compact($, 'manual')
-  expect(attachmentText(await composeIds($))).toBe('ENV')
+  expect(attachmentText(await composeIds($))).toBe('LANG')
 
-  // A subagent's own environment is its own: it is neither dropped nor moved.
-  expect(await attach($, 'environment', 'ENV', 'a1')).toBe('ENV')
+  // A subagent's own language is its own: it is neither dropped nor moved.
+  expect(await attach($, 'language', 'LANG', 'a1')).toBe('LANG')
   // A side analysis prompt carries no attachments.
   expect((await composeIds($, ['lean', 'analysis'])).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
   // The main prompt still carries the text, and the main message still leaves it out.
-  expect(attachmentText(await composeIds($))).toBe('ENV')
-  expect(await attach($, 'environment', 'ENV')).toBeNull()
+  expect(attachmentText(await composeIds($))).toBe('LANG')
+  expect(await attach($, 'language', 'LANG')).toBeNull()
 })
 
 test('with CTX_MOD_ATTACH_TO_SYSTEM=0 the attachments are left alone', async ($, on) => {
@@ -2027,17 +2059,19 @@ test('armed, the next process carries the stored attachments from its first syst
   const w = world(on, 's-at-stored', { CTX_MOD: '1' })
   promptBottoms(on)
   const path = await archiveFrom($, on, w, [['environment', 'ENV'], ['skill_listing', 'SKILL']])
-  expect(path.startsWith(`${slashed(HOME)}/.claude/ctx-mod/attachments/`)).toBe(true)
+  expect(path.startsWith(slashed(HOME) + '/.claude/ctx-mod/attachments/')).toBe(true)
   expect(path.endsWith('/s-at-stored.json')).toBe(true)
 
   await boot($)
-  // The first main prompt already carries the archive, before this process sees anything.
+  // The first main prompt already carries the archive's shared types, before this process sees anything.
   const sections = await composeIds($)
   expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:attachments', 'ctx-mod:context'])
-  expect(attachmentText(sections)).toBe('SKILL\n\nENV')
-  // A text the prompt carries leaves the message.
-  expect(await attach($, 'environment', 'ENV')).toBeNull()
+  expect(attachmentText(sections)).toBe('SKILL')
+  expect(attachmentText(sections)).not.toContain('ENV')
+  // A shared text the prompt carries leaves the message.
   expect(await attach($, 'skill_listing', 'SKILL')).toBeNull()
+  // The session's own text stays in the message.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   // A type outside the whitelist stays in the message.
   expect(await attach($, 'date', 'DATE')).toBe('DATE')
   // A side analysis carries no attachments.
@@ -2056,9 +2090,14 @@ test('armed, a damaged, non-string or empty archive is treated as no archive', a
     // The first window stays as it was: nothing moved.
     expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
     expect(await attach($, 'environment', 'ENV')).toBe('ENV')
-    // After a switch the text seen this process still moves, as before.
+    // After a switch the shared text seen this process moves, as before.
+    expect(await attach($, 'skill_listing', 'SKILL')).toBe('SKILL')
     await compact($, 'manual')
-    expect(attachmentText(await composeIds($))).toBe('ENV')
+    const text = attachmentText(await composeIds($))
+    expect(text).toBe('SKILL')
+    expect(text).not.toContain('ENV')
+    // The session's own text is still in the message.
+    expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   }
 })
 
@@ -2079,11 +2118,14 @@ test('after a window switch, a stored text this process did not see leaves the p
   promptBottoms(on)
   await archiveFrom($, on, w, [['environment', 'ENV'], ['skill_listing', 'STALE']])
   await boot($)
-  expect(attachmentText(await composeIds($))).toBe('STALE\n\nENV')
-  expect(await attach($, 'environment', 'ENV')).toBeNull()
-  // STALE was never asked again this process.
+  expect(attachmentText(await composeIds($))).toBe('STALE')
+  // The session's own text stays in the message.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  // STALE was never asked again this process, and the environment is not shared.
   await compact($, 'manual')
-  expect(attachmentText(await composeIds($))).toBe('ENV')
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(attachmentText(await composeIds($))).toBeUndefined()
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
 })
 
 test('armed, a new attachment is stored and an unchanged list is not written again', async ($, on) => {
@@ -2211,15 +2253,17 @@ test('after a window switch, a changed non-incremental text replaces the old one
   attachmentBottom(on)
   await boot($)
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
-  expect(await attach($, 'model', 'MODEL-A')).toBe('MODEL-A')
-  expect(await attach($, 'model', 'MODEL-B')).toBe('MODEL-B')
+  expect(await attach($, 'language', 'LANG-A')).toBe('LANG-A')
+  expect(await attach($, 'language', 'LANG-B')).toBe('LANG-B')
   // The same text again adds nothing.
-  expect(await attach($, 'model', 'MODEL-B')).toBe('MODEL-B')
+  expect(await attach($, 'language', 'LANG-B')).toBe('LANG-B')
 
   await compact($, 'manual')
   const text = attachmentText(await composeIds($))
-  expect(text).toBe('ENV\n\nMODEL-B')
-  expect(text).not.toContain('MODEL-A')
+  expect(text).toBe('LANG-B')
+  expect(text).not.toContain('LANG-A')
+  // The environment is not shared, so it stays in the message.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
 })
 
 test('after a window switch, incremental types keep every text they saw', async ($, on) => {
@@ -2256,9 +2300,12 @@ test('a new session in the same directory starts from the shared archive with on
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   expect(await attach($, 'model', 'Opus 5.5')).toBe('Opus 5.5')
 
-  // After a switch only this process's texts remain, in the fixed order.
+  // After a switch only this process's shared texts remain.
   await compact($, 'manual')
-  expect(attachmentText(await composeIds($))).toBe('SKILL-A\n\nENV\n\nOpus 5.5')
+  const after = attachmentText(await composeIds($))
+  expect(after).toBe('SKILL-A')
+  expect(after).not.toContain('ENV')
+  expect(after).not.toContain('Opus 5.5')
 })
 
 test('the session archive wins over the shared archive', async ($, on) => {
@@ -2267,9 +2314,15 @@ test('the session archive wins over the shared archive', async ($, on) => {
   attachmentBottom(on)
   const attachments = slashed(HOME) + '/.claude/ctx-mod/attachments/'
   w.readable.set(attachments + 's-at-both.json', '[{"type":"environment","text":"SESSION-ENV"},{"type":"skill_listing","text":"SESSION-SKILL"}]')
-  w.readable.set(attachments + 'shared/' + cwdKeyOf('/work') + '.json', '[{"type":"skill_listing","text":"SHARED-SKILL"}]')
+  w.readable.set(attachments + 'shared/unknown-' + cwdKeyOf('/work') + '.json', '[{"type":"skill_listing","text":"SHARED-SKILL"}]')
   await boot($)
-  expect(attachmentText(await composeIds($))).toBe('SESSION-SKILL\n\nSESSION-ENV')
+  const sections = await composeIds($)
+  // The session's listing is carried and the shared one is not.
+  expect(attachmentText(sections)).toBe('SESSION-SKILL')
+  expect(attachmentText(sections)).not.toContain('SHARED-SKILL')
+  expect(attachmentText(sections)).not.toContain('SESSION-ENV')
+  // The session's own text stays in the message.
+  expect(await attach($, 'environment', 'SESSION-ENV')).toBe('SESSION-ENV')
 })
 
 test('the fixed order is the same whatever order the attachments arrived in', async ($, on) => {
@@ -2283,7 +2336,7 @@ test('the fixed order is the same whatever order the attachments arrived in', as
   expect(await attach($, 'environment', 'ENV')).toBe('ENV')
   await compact($, 'manual')
   const first = attachmentText(await composeIds($))
-  expect(first).toBe('SKILL-A\n\nSKILL-B\n\nLANG\n\nENV')
+  expect(first).toBe('SKILL-A\n\nSKILL-B\n\nLANG')
 
   // A second process in the same directory sees the shared archive and arrives in another order.
   for (const [file, text] of [...w.files]) {
