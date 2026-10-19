@@ -642,6 +642,51 @@ const loadClaudeMd = async ($: EngineInterface, cwd: string): Promise<void> => {
   storedClaudeMd = typeof text === 'string' && text.trim() !== '' ? text : undefined
 }
 
+// The process-stable attachments (the environment, the model, the listings) are
+// asked again for the first request of every window, so every window writes
+// them into the message again. At the end of the system prompt they read from
+// cache, but the main prompt is composed before they are asked: the texts seen
+// so far are kept and put into the next window's prompt.
+
+/** The attachment types that stay the same for the process, so may move. */
+const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
+  'environment',
+  'model',
+  'output_style_instructions',
+  'language',
+  'agent_listing_delta',
+  'mcp_instructions_delta',
+  'skill_listing',
+  'remote_session_change',
+  'auto_mode',
+  'session_context',
+])
+
+/** `CTX_MOD_ATTACH_TO_SYSTEM` is not 0: the whitelisted attachments may move. */
+let attachToSystem = false
+/** The whitelisted texts the model read this process, in arrival order, each once. */
+let seenAttachments: string[] = []
+/** The texts the current main system prompt carries, so the message can leave them out. */
+let attachmentsInSystem: string[] = []
+/** A compaction happened: every main compose from now on carries the section. */
+let attachmentsArmed = false
+
+/** Reads the switch at session start; a new process starts with nothing seen. */
+const loadAttachments = async ($: EngineInterface): Promise<void> => {
+  attachToSystem = (await $.env.get('CTX_MOD_ATTACH_TO_SYSTEM')) !== '0'
+  seenAttachments = []
+  attachmentsInSystem = []
+  attachmentsArmed = false
+}
+
+/** After a window switch: the next main compose carries the attachments, so it is composed again. */
+const armAttachments = ($: EngineInterface): void => {
+  if (!attachToSystem) return
+  attachmentsArmed = true
+  attachmentsInSystem = []
+  $.ui.invalidate('prompt.section')
+}
+
 export const register: Register = (on, options) => {
   // The context fires once per conversation and again after a compaction.
   on('prompt.context', async ($, e, next) => {
@@ -673,7 +718,10 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     try {
       enabled = (await $.env.get('CTX_MOD')) === '1'
-      if (enabled) await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
+      if (enabled) {
+        await loadAttachments($).catch(error => logError($, 'attachments', error))
+        await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
+      }
       // The command is always there, so a person who installed the mod and
       // typed /ctx-mod is told how to turn it on instead of meeting an unknown command.
       await $.command.register({
@@ -719,21 +767,50 @@ export const register: Register = (on, options) => {
     if (!enabled) return next(e)
     const result = await next(e)
     try {
-      const claudeMd = isMainCompose(e.traits) && storedClaudeMd !== undefined
+      const main = isMainCompose(e.traits)
+      const claudeMd = main && storedClaudeMd !== undefined
         ? [{ id: 'ctx-mod:claude-md', text: storedClaudeMd, scope: 'session' as const }]
         : []
       if (claudeMd.length > 0) claudeMdInSystem = true
+      // The attachments ride after the files and before the mod's own section,
+      // so the prompt's tail stays the same all window long.
+      const attachments = main && attachToSystem && attachmentsArmed && seenAttachments.length > 0
+        ? [{ id: 'ctx-mod:attachments', text: seenAttachments.join('\n\n'), scope: 'session' as const }]
+        : []
+      // Only a main prompt carries them; a side analysis leaves the set alone.
+      if (main) attachmentsInSystem = attachments.length > 0 ? [...seenAttachments] : []
 
       return {
         ...result,
         sections: [
           ...result.sections,
           ...claudeMd,
+          ...attachments,
           { id: 'ctx-mod:context', text: SYSTEM_TEXT, scope: 'session' as const },
         ],
       }
     } catch (error) {
       logError($, 'prompt.compose', error)
+
+      return result
+    }
+  })
+
+  // The engine asks the process-stable attachments again for every window; once
+  // the system prompt carries a text, the message leaves it out. A subagent's
+  // attachments are its own and pass through.
+  on('prompt.attachment', async ($, e, next) => {
+    if (!enabled || !attachToSystem) return next(e)
+    if (isSubagentCall(e)) return next(e)
+    const result = await next(e)
+    try {
+      if (!ATTACHMENT_TYPES.has(e.type) || result.text === null) return result
+      if (attachmentsInSystem.includes(result.text)) return { text: null }
+      if (!seenAttachments.includes(result.text)) seenAttachments.push(result.text)
+
+      return result
+    } catch (error) {
+      logError($, 'prompt.attachment', error)
 
       return result
     }
@@ -1190,6 +1267,7 @@ export const register: Register = (on, options) => {
         })
         committed = true
         awaitingPrefix = true
+        armAttachments($)
 
         return { messages: [{ role: 'user', text, toolUses: [] }] }
       }
@@ -1215,6 +1293,7 @@ export const register: Register = (on, options) => {
         // When the disk check sent a switch the model asked for down this path, `turn.complete` still has to see it happened.
         if (mine) committed = true
         awaitingPrefix = true
+        armAttachments($)
 
         return { ...result, messages: [...result.messages, { role: 'user', text, toolUses: [] }] }
       }

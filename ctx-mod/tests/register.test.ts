@@ -1876,3 +1876,104 @@ test('with CTX_MOD unset, the files are left alone', async ($, on) => {
   expect(await contextNames($)).toEqual(['claudeMd', 'userEmail'])
   expect(storedPath(w)).toBeUndefined()
 })
+
+// ── process-stable attachments moved into the end of the system prompt ──
+
+/** Core's side of prompt.attachment: the text as the engine rendered it. */
+const attachmentBottom = (on: On): void => {
+  on('prompt.attachment', (_$, e) => ({ text: e.text }))
+}
+
+/** One attachment as a request carries it; agentId makes it a subagent's. */
+const attach = async ($: Engine, type: string, text: string, agentId?: string): Promise<string | null> => {
+  const input: Record<string, unknown> = { type, text, origin: { kind: 'engine' } }
+  if (agentId !== undefined) input.agentId = agentId
+
+  return ((await $.prompt.attachment(input as never)) as { text: string | null }).text
+}
+
+const attachmentText = (sections: readonly { id: string; text: string }[]): string | undefined =>
+  sections.find(section => section.id === 'ctx-mod:attachments')?.text
+
+test('armed, the first window keeps every attachment in the message and adds no section', async ($, on) => {
+  const w = world(on, 's-at-first', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'date', 'DATE')).toBe('DATE')
+  // Nothing was seen when the first prompt was composed, so nothing moved.
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+})
+
+test('after a window switch the whitelisted attachments move into the prompt and leave the message', async ($, on) => {
+  const w = world(on, 's-at-switch', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  await personRequest($, '把解析器改严一点', 'person-1')
+  // The same text twice is kept once; two deltas of one type are both kept.
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBe('SKILL-A')
+  expect(await attach($, 'skill_listing', 'SKILL-B')).toBe('SKILL-B')
+  expect(await attach($, 'date', 'DATE')).toBe('DATE')
+
+  await compact($, 'manual')
+  const sections = await composeIds($)
+  expect(sections.map(s => s.id)).toEqual(['core:intro', 'ctx-mod:attachments', 'ctx-mod:context'])
+  expect(attachmentText(sections)).toBe('ENV\n\nSKILL-A\n\nSKILL-B')
+
+  // A text the prompt carries is no longer read from the message.
+  expect(await attach($, 'environment', 'ENV')).toBeNull()
+  expect(await attach($, 'skill_listing', 'SKILL-A')).toBeNull()
+  // A type outside the whitelist stays in the message.
+  expect(await attach($, 'date', 'DATE')).toBe('DATE')
+  // A whitelisted type whose text changed stays, and the next prompt carries it.
+  expect(await attach($, 'skill_listing', 'SKILL-C')).toBe('SKILL-C')
+  expect(attachmentText(await composeIds($))).toBe('ENV\n\nSKILL-A\n\nSKILL-B\n\nSKILL-C')
+  expect(await attach($, 'skill_listing', 'SKILL-C')).toBeNull()
+})
+
+test('a subagent’s attachments pass through untouched and a side analysis carries none', async ($, on) => {
+  const w = world(on, 's-at-agent', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  await personRequest($, '整理一下', 'person-1')
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  await compact($, 'manual')
+  expect(attachmentText(await composeIds($))).toBe('ENV')
+
+  // A subagent's own environment is its own: it is neither dropped nor moved.
+  expect(await attach($, 'environment', 'ENV', 'a1')).toBe('ENV')
+  // A side analysis prompt carries no attachments.
+  expect((await composeIds($, ['lean', 'analysis'])).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  // The main prompt still carries the text, and the main message still leaves it out.
+  expect(attachmentText(await composeIds($))).toBe('ENV')
+  expect(await attach($, 'environment', 'ENV')).toBeNull()
+})
+
+test('with CTX_MOD_ATTACH_TO_SYSTEM=0 the attachments are left alone', async ($, on) => {
+  const w = world(on, 's-at-off', { CTX_MOD: '1', CTX_MOD_ATTACH_TO_SYSTEM: '0' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  await personRequest($, '整理一下', 'person-1')
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  await compact($, 'manual')
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro', 'ctx-mod:context'])
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+})
+
+test('with CTX_MOD unset the attachments are left alone', async ($, on) => {
+  const w = world(on, 's-at-unset')
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  await compact($, 'manual')
+  expect((await composeIds($)).map(s => s.id)).toEqual(['core:intro'])
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+})
