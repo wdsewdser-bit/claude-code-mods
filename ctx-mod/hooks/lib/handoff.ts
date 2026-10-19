@@ -16,6 +16,9 @@ export type HandoffAction = {
 /** How many agents the handoff lists before it stops naming them. */
 const MAX_AGENTS = 12
 
+/** How many ended agents with a cold cache are named; the rest are only counted. */
+const MAX_COLD_AGENTS = 3
+
 /**
  * The state a noted subagent shows once the engine no longer lists it. It is a
  * state of its own, not one the engine uses, so the handoff sorts it last.
@@ -41,12 +44,19 @@ const rankOf = (state: string): number => {
  */
 export const renderAgents = (agents: readonly AgentNote[]): string => {
   if (agents.length === 0) return ''
-  const ranked = [...agents].sort((left, right) => rankOf(left.state) - rankOf(right.state))
+  // An ended agent whose cache went cold is rarely picked up again: past the first few it is only counted.
+  const isCold = (agent: AgentNote): boolean => agent.state === ENDED_STATE && (agent.cache ?? '').includes('缓存已冷')
+  const coldAll = agents.filter(isCold)
+  const coldKept = new Set(coldAll.slice(0, MAX_COLD_AGENTS))
+  const ranked = [...agents]
+    .filter(agent => !isCold(agent) || coldKept.has(agent))
+    .sort((left, right) => rankOf(left.state) - rankOf(right.state))
+  const cold = coldAll.length - coldKept.size
   const lines = ranked
     .slice(0, MAX_AGENTS)
     .map(agent => `- ${agent.id}（${agent.type}，${agent.state}${agent.cache === undefined ? '' : `；${agent.cache}`}）：${agent.description}`)
   const rest = ranked.length - lines.length
-  if (rest > 0) lines.push(`另有 ${rest} 个未列出，用 ListAgents 查看`)
+  if (rest + cold > 0) lines.push(`另有 ${rest + cold} 个未列出${cold > 0 ? `（其中 ${cold} 个已结束且缓存已冷）` : ''}，用 ListAgents 查看`)
 
   return ['## 子代理', ...lines, AGENT_FOOTER].join('\n')
 }

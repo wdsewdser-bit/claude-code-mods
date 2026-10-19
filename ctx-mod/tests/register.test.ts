@@ -513,13 +513,17 @@ test('armed, history filters by tool_name and never by the envelope tool', async
   expect(textOf(unfiltered)).toContain('needle bash')
 })
 
-test('armed, context new is approved on urgent fill and later calls are refused', async ($, on) => {
+test('armed, context new is approved on urgent fill; calls of the same step run, later steps are refused', async ($, on) => {
   const w = world(on, 's-switch', { CTX_MOD: '1' })
   w.usage.tokens = 340_000
   await boot($)
   await armedWithFreshLedger($, '先看一眼上下文')
   const approved = await callTool($, { tool: 'mcp__ctx-mod__context', tool_use_id: 'ctx-1', action: 'new' })
   expect(textOf(approved)).toContain('已批准')
+  // Sent beside `new` in the same message: it rides along with the switch.
+  const alongside = await callTool($, { tool: 'Read', tool_use_id: 'tu-same', file_path: '/work/a.ts' })
+  expect(textOf(alongside)).not.toContain('换窗口')
+  await step($, 99)
   const later = await callTool($, { tool: 'Read', tool_use_id: 'tu-late', file_path: '/work/b.ts' })
   expect(textOf(later)).toContain('换窗口')
 })
