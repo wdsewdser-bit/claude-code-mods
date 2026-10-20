@@ -18,7 +18,7 @@
 |---|---|---|---|
 | PTC-09 | 先分析：从实验转录里抽出模型实际写的 run_code 程序（E6 有 626 个），统计重复模板（路径处理、行号格式化、grep 后筛选、测试输出解析等）和每段的输出 token。按“净节省 = 少生成和少回传的成本 − 新增说明和执行成本”排出候选 SDK 原语 | 只读分析，产出候选清单，决定 PTC-02/05 是否做、怎么做 | done（8277 个程序，95% 来自 DS 的 delegate PTC SDK，方言为 file_path/lines[]；报告 D:\ptcab\scratch\ptc09
 eport.md。代码侧样板下沉的总天花板约 12% 输出 token，典型会话净省 DS $0.0001、Haiku $0.002；更大的杠杆在回传，其中 read 占回传的 80%。候选按序：test 摘要、带行号文本、紧凑 read、grep 文本、bash 参数可选、read_many（排最后）） |
-| OPS-01 | （提前）统一成本口径和 A/B 夹具，复用 D:\ptcab：按未命中/缓存写/缓存读/输出分列，Haiku 和 DS 各 n≥10 | 后面每项都依赖它 | todo |
+| OPS-01 | （提前）统一成本口径和 A/B 夹具，复用 D:\ptcab：按未命中/缓存写/缓存读/输出分列，Haiku 和 DS 各 n≥10 | 后面每项都依赖它 | 部分完成（2026-10-20，v1.3 复审的 PR-A）：两套本地夹具（D:\ptcab\harness、effab2）开跑前必须用参考解自证，不满分就以 INVALID_GRADER 拒绝启动；测试收集为空时判 INVALID_COLLECTION；状态分 started/valid/completed/timed_out/invalid（按 model/collection/grader/infra 列出原因）；缺 usage 时记为不可用，不记 0；汇总附 27 组权重敏感性矩阵；失败注入回归 60 项和 7 项通过。夹具只在本地，不进仓库。manifest/哈希待补 |
 | PTC-02 | （P2，看 PTC-09 结果）`tools.read_many`：按顺序返回 path/revision/totalLines/coveredRange/truncated/fullRef，带总输出预算 | 多文件只读题：费用中位数 ≤ 现状，重读次数下降 | todo（PTC-09 排第 6，净收益最低） |
 | PTC-04 | 统一 Outcome `{status,data,coverage,refs,diagnostics,sideEffects}`，用适配层包装，不破坏旧返回 | 错误/超时/部分成功的报告准确率；费用不升 | todo |
 | PTC-05 | pytest/vitest 只打印失败摘要（优先解析 JUnit/JSON），完整日志用 ref | 跑测试题：输出字符数下降，质量不降 | 未过闸门，提示已回退（2026-10-19 DS flash task3 A/B 各 n=10：费用中位数 A $0.0167 / B $0.0184（+10%，置换检验 p=0.21），调用 28→31，评分 8/8 对 7.9；测试那一步回传少 33%（每次运行约 11.5K 字符），但总回传没降。SDK 里的 tools.test 和 read .text 保留，没写进提示就没有成本；B 版提示存为 D:\ptcab\scratch\ptc-only-system.v6-test.md，数据见 abtest/summary-run1.txt） |
@@ -58,17 +58,25 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 ## 2026-10-20 新增
 | ID | 内容 | 状态 |
 |---|---|---|
-| CTX-03 | 换窗阈值改为 250/300/350K（上下文上限 433K，减去压缩预留后约 400K） | done |
-| EFF-01 | 自适应思考强度：常驻 low，模型用 effort 工具自己升到 high/xhigh，每轮开始重置，报错时至少 medium，上限 xhigh。已用真 haiku 证实切换 effort 不断缓存 | dropped（2026-10-20：真 haiku 三组题 A/B：ptc11v2 n=20 low 比 medium 省 18.4%、分数不降；三道算法题 pilot 全满分；两道 20 多个文件的遗留代码题 n=8 两边各 1 次同类失误，其余满分，low 省 15–42%。自适应插件 46 次运行从未升档、还有额外开销。改为 Haiku 执行类子代理默认 low。） |
+| CTX-05 | 换窗阈值改为 250/300/350K（原编号与上面的 CTX-03 context preview 重复，v1.3 复审后改号）（上下文上限 433K，减去压缩预留后约 400K） | done |
+| EFF-01 | 自适应思考强度：常驻 low，模型用 effort 工具自己升到 high/xhigh，每轮开始重置，报错时至少 medium，上限 xhigh。已用真 haiku 证实切换 effort 不断缓存 | dropped（2026-10-20：真 haiku 三组题 A/B：ptc11v2 n=20 low 比 medium 省 18.4%、分数不降；三道算法题 pilot 全满分；两道 20 多个文件的遗留代码题 n=8 两边各 1 次同类失误，其余满分，low 省 15–42%。自适应插件 46 次运行从未升档、还有额外开销。改为 Haiku 执行类子代理默认 low。）。补充：100 分长程题 long3（禁用 Agent/delegate，n=5/组，修好跨盘评分 bug 后全部有效）medium 86.8、low 88.8，分数 +2.0（p=0.37）；units low 多 17.6%（p=0.56，27 组权重下都在 +15~+19%，没有翻号）。结论：难题上 low 不掉分但也不省，维持 low） |
 | FORK-01 | 读取量大的子任务放进 fork 子代理，读取结果留在 fork 里，主会话只收报告 | doing（真 haiku 实测：fork 第一次请求完整命中主会话前缀，只新写约 570 token。但 fork 固定继承主会话模型，每步都带全部上下文：比主会话自己做省约一半，比精简子代理（第一次请求 7–10K）和 DS 都贵。只适合需要上下文、不好写 brief 的排查，优先级降低。开关是 CLAUDE_CODE_FORK_SUBAGENT，本机 settings 设为 0） |
 | RED-01 | 大工具输出先交给 Haiku 压成带原文引用的回执（参照 SoL-Pi 的 Evidence-Preserving Reducer），引用逐字核对，不通过就保留原文 | dropped（2026-10-20：Top 30 会话里 232 个大输出只占 1.82M 字符，就算压缩免费，毛节省也只有总额度的 0.51%，净省 0.24–0.44%。注意：压缩率 7.5× 和核对通过率 90% 是 DS 环境里被映射成的 deepseek-v4.1-flash 跑出来的，不是 Haiku） |
 | REF-01 | 调研 SoL-Pi 的 Action Fusion、ObservationPack、Online Context Compact，以及 facebookresearch/context-language-models，判断能否移植 | done（ObservationPack：引擎在发请求前不能改写消息，订阅缓存写读比约 50，移植不了。Action Fusion：Edit→Bash 只占请求的 1.02%，不做。OCC：经济判断 ctx-mod 的 judgeSwitch 已经有了，可借鉴的是完成边界触发换窗，预期 0–3%，见 CTX-04。CLM：省钱靠服务端 KV 重定位，Claude 没有；它让模型自己写摘要也没赢过现成的摘要方案（47.3 对 47.8）。可借鉴的是入口截断加存盘（TRUNC-01）、预算提醒、交接加索引和勿重试清单） |
-| TRUNC-01 | session.append 入口截断大 Bash 输出：≥20KB 时留头 6KB 加尾 3KB，全文进 history，取回按 4KB 分页 | todo（估算：毛节省 6.5%，排除 cat/sed/head 后 5.1%，扣掉取回后 3.5–5.5%；样本混有 Read/MCP，偏乐观。40KB 阈值只有约 1.1%。PTC-10 的教训是截断读取会让调用次数变多，必须先过 A/B 闸门） |
+| TRUNC-01 | session.append 入口截断大 Bash 输出：≥20KB 时留头 6KB 加尾 3KB，全文进 history，取回按 4KB 分页 | dropped（2026-10-20 影子评估，15 天 6655 条 Claude 侧 Bash 结果：CC 已把约 10–12KB 以上的输出落盘，上下文只留 2KB 预览，仍超过 20KB 留在上下文里的只有 4 条。毛省 0.435%，扣掉补读后净省 0.002–0.02%；若取代现有预览反而多花 0.084%。原先 3.5–5.5% 的估算没考虑落盘机制。报告在 D:\ptcab\scratch	runc01eport.md） |
 | CTX-04 | 换窗时机加上“账本任务完成”这个边界，参照 OCC：按边界间隔推算剩余请求数，缓存债务结转 | todo（预期 0–3%，主要改善切点质量） |
 | RD-02 | read-dedup 覆盖主会话 Bash 单条纯读取（cat / sed -n / head -n，可带 cd 前缀），与 Read 共用记录，只在范围完全相同且文件未改时替换，沿用 300 字符门槛 | done（2026-10-20：43/43；真实冒烟大文件第二次返回桩、小文件原样；转录统计这类重复约占 Claude 额度 0.35%） |
 | DLG-01 | delegate：resume 不传 mode/ptc 时沿用该代理上次的设置；启动前检查 cwd，不存在直接报错 | done（仅本地插件，不在本仓库；20/20） |
 | GUARD-01 | 子代理续用守门：新建时记下 ~/.claude/agents/<type>.md 的哈希，续用时（agent.spawn 的 e.resume）比对，变了就拒绝并提示新建 | todo（低优先级：缓存审计里改了代理工具后续用只占约 0.7%；接口拿不到工具列表，只能比对定义文件） |
-| AUD-01 | 审计（2026-10-20，近 15 天转录）：Claude 侧缓存未命中损失 5.6%（闲置超 1h 7.56M、换窗/压缩 2.56M、工具集变化 1.90M、fast 0.88M），未发现 CC 缓存 bug；无写入介入的重复读取 1.0%（同范围 0.27%），重复跑测试 0 次 | done |
+| AUD-01 | 审计（2026-10-20，近 15 天转录）：Claude 侧缓存未命中损失 5.6%（闲置超 1h 7.56M、换窗/压缩 2.56M、工具集变化 1.90M、fast 0.88M，合计 12.90M，其余约 1.43M 未归因），未发现 CC 缓存 bug；无写入介入的重复读取 1.0%（同范围 0.27%），重复跑测试 0 次 | done |
+
+## v1.3 复审后（2026-10-20）
+
+| ID | 内容 | 状态 |
+|---|---|---|
+| LONG-04 | 更难的长程题：在 long3 基础上加 A7–A10 高难 bug（至少 2 个题面不提），目标是 haiku low 只拿 60–70 分，用来重新检验 low/medium | 进行中 |
+| GUARD-01b | 先修配置说明和代理 frontmatter 不一致的地方（reviewer 已统一按定义用 high），再审计工具清单指纹 | todo（排在 CTX-04 之前） |
+| EXP-DS-DIAG | 同一批含隐蔽 bug 的题：DS 直接执行，对比 DS 先诊断再执行（可选再加 Claude 审查） | todo（DS 不占 Claude 额度，排在 LONG-04 之后） |
 
 ## 已决定不做
 | ID | 原因 |
