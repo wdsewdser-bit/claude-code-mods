@@ -440,6 +440,18 @@ test('armed, a subagent call of every tool is refused as main-thread only', asyn
   expect(w.files.size).toBe(0)
 })
 
+test('armed, the context status ends with the history write counters', async ($, on) => {
+  const w = world(on, 's-stats', { CTX_MOD: '1' })
+  await boot($)
+  await callTool($, { tool: 'Read', tool_use_id: 'tu-stats', file_path: '/work/a.ts' })
+  await toolResult($, 'tu-stats', 'row-stats', 'the file body')
+  await w.clock.settle()
+
+  const status = textOf(await callTool($, { tool: 'mcp__ctx-mod__context', tool_use_id: 'ctx-stats', action: 'status' }))
+  expect(status).toMatch(/history 写入：逻辑 [\d.]+ KB \/ 实际 [\d.]+ KB（WAF=[\d.]+），写盘 \d+ 次/)
+  expect(status.trimEnd().split('\n').pop()).toContain('history 写入')
+})
+
 test('armed, a tool result that carries non-text blocks is left exactly as it came', async ($, on) => {
   world(on, 's-mixed', { CTX_MOD: '1' })
   await boot($)

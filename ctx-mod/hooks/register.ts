@@ -570,7 +570,7 @@ const TOOLS = [
   {
     name: 'history',
     description:
-      '检索或读取完整历史。action 为 "search" 时按条件查历史编号，为 "read" 时按编号读原文。工具结果末尾形的 [#123] 就是历史编号。读原文时 field 填 "input" 可以看到那次工具调用的完整参数（子代理的任务原文、发出的消息、完整的命令）。搜索默认不显示引擎自己塞进来的背景信息（附件、钩子上下文、备注）；要找它们就用 door 指定，如 "attachment"、"hook-context"、"note"。搜索不指定 window 时默认搜最近 3 个窗口；这几个窗口里没有命中会自动往更早的窗口找，找到有命中的窗口就停，结果末尾会写明实际搜了哪些窗口，没搜的窗口用 window 指定。',
+      '检索或读取完整历史。action 为 "search" 时按条件查历史编号，为 "read" 时按编号读原文。工具结果末尾形的 [#123] 就是历史编号。读原文时 field 填 "input" 可以看到那次工具调用的完整参数（子代理的任务原文、发出的消息、完整的命令）。搜索默认不显示引擎自己塞进来的背景信息（附件、钩子上下文、备注）；要找它们就用 door 指定，如 "attachment"、"hook-context"、"note"。搜索不指定 window 时默认搜最近 3 个窗口；这几个窗口里没有命中会自动往更早的窗口找，找到有命中的窗口就停，结果末尾会写明实际搜了哪些窗口，没搜的窗口用 window 指定。命中只存在于被截断字段的原文时，结果会标出 [overflow text offset=N]（调用参数则标为 input），用 read 的 offset 从那里读全文。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1025,7 +1025,7 @@ export const register: Register = (on, options) => {
 
       return input.action === 'new'
         ? session.requestSwitch(input, env)
-        : { result: session.status(env) }
+        : { result: `${session.status(env)}\n${session.historyWriteStats()}` }
     } catch (error) {
       logError($, 'tool.call context', error)
 

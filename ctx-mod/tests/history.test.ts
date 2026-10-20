@@ -23,7 +23,7 @@ import {
   toolGroupOf,
 } from '../hooks/lib/history.ts'
 import { groupsWanted } from '../hooks/lib/history.ts'
-import type { SearchQuery } from '../hooks/lib/history.ts'
+import type { OverflowFailure, SearchQuery } from '../hooks/lib/history.ts'
 import type { HistoryRecord } from '../hooks/lib/types.ts'
 
 const row = (seq: number, over: Partial<HistoryRecord> = {}): HistoryRecord => ({
@@ -243,6 +243,150 @@ describe('search', () => {
     expect(search(own, { query: '', window: 1 }).map(hit => hit.seq)).toEqual([11])
     expect(search(own, { query: 'needle', tool: 'mcp__ctx-mod__history' }).map(hit => hit.seq)).toEqual([10])
     expect(readRecord(own, 10)).toMatchObject({ found: true, tool: 'mcp__ctx-mod__history' })
+  })
+
+  test('finds a word only in a clipped field\'s overflow, and says where it is', async () => {
+    const text = `${'a'.repeat(250_000)}deep-needle${'b'.repeat(500)}`
+    const stored = clipRecord(row(7, { text }))
+    const parts = splitParts(text).parts
+    const reads: string[] = []
+    const hits = await search([stored], { query: 'deep-needle' }, async (seq, field, part) => {
+      reads.push(`${seq}:${field}:${part}`)
+
+      return field === 'text' ? parts[part] ?? null : null
+    })
+
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.overflow).toEqual({ field: 'text', offset: 250_000 })
+    expect(hits[0]?.excerpt).toContain('deep-needle')
+    expect(reads).toEqual(['7:text:0'])
+  })
+
+  test('does not read overflow when the row matches inline', async () => {
+    const stored = clipRecord(row(8, { text: `inline-needle${'a'.repeat(250_000)}` }))
+    let reads = 0
+    const hits = await search([stored], { query: 'inline-needle' }, async () => {
+      reads += 1
+
+      return null
+    })
+
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.overflow).toBeUndefined()
+    expect(reads).toBe(0)
+  })
+
+  test('keeps newest-first order and limit when hits come from inline and overflow alike', async () => {
+    const long = (seq: number): HistoryRecord =>
+      clipRecord(row(seq, { text: `${'a'.repeat(250_000)}needle-${seq}` }))
+    const rows = [long(1), row(2, { text: 'needle inline' }), long(3), row(4, { text: 'needle inline' })]
+    const reads: number[] = []
+    const reader = async (seq: number): Promise<string> => {
+      reads.push(seq)
+
+      return `${'a'.repeat(250_000)}needle-${seq}`
+    }
+
+    const first = await search(rows, { query: 'needle', limit: 3 }, reader)
+    expect(first.map(hit => hit.seq)).toEqual([4, 3, 2])
+    expect(first[1]?.overflow).toEqual({ field: 'text', offset: 250_000 })
+    // The oldest row was never reached, so its overflow was never read.
+    expect(reads).toEqual([3])
+
+    reads.length = 0
+    const all = await search(rows, { query: 'needle' }, reader)
+    expect(all.map(hit => hit.seq)).toEqual([4, 3, 2, 1])
+    expect(reads).toEqual([3, 1])
+  })
+
+  test('skips a missing overflow part, keeps the later parts and reports the gap', async () => {
+    const stored = row(7, {
+      text: 'a'.repeat(250_000),
+      overflow: { text: { chars: 2_500_000, parts: 3 } },
+    })
+    const filler = (length: number): string => 'f'.repeat(length)
+    const last = filler(500_000 - 'deep-needle'.length) + 'deep-needle'
+    const failures: OverflowFailure[] = []
+    const hits = await search(
+      [stored],
+      { query: 'deep-needle' },
+      async (seq, field, part) => (part === 1 ? null : part === 2 ? last : filler(1_000_000)),
+      { onOverflowError: failure => failures.push(failure) },
+    )
+
+    expect(hits[0]?.overflow).toEqual({ field: 'text', offset: 2_500_000 - 'deep-needle'.length })
+    expect(failures).toEqual([{ seq: 7, field: 'text', part: 1, reason: 'missing' }])
+  })
+
+  test('skips a truncated part, reports it, and never joins it to the next part', async () => {
+    const stored = row(7, {
+      text: 'a'.repeat(250_000),
+      overflow: { text: { chars: 2_500_000, parts: 3 } },
+    })
+    const failures: OverflowFailure[] = []
+    const reader = async (seq: number, field: string, part: number): Promise<string> => {
+      if (part === 0) return ('f'.repeat(1_000_000 - 2) + 'AB').slice(0, 500_000)
+      if (part === 1) return 'CD' + 'f'.repeat(1_000_000 - 2)
+
+      return 'f'.repeat(500_000)
+    }
+
+    // 'AB' and 'CD' would look contiguous only if the truncated part were joined blindly.
+    const across = await search([stored], { query: 'ABCD' }, reader, { onOverflowError: failure => failures.push(failure) })
+    expect(across).toHaveLength(0)
+    expect(failures).toEqual([
+      { seq: 7, field: 'text', part: 0, reason: 'truncated', expected: 1_000_000, actual: 500_000 },
+    ])
+
+    // The part after the damaged one is still searched, at its own absolute offset.
+    const later = await search([stored], { query: 'CDffff' }, reader, { onOverflowError: () => {} })
+    expect(later[0]?.overflow).toEqual({ field: 'text', offset: 1_000_000 })
+  })
+
+  test('reports a throwing reader instead of failing the whole search', async () => {
+    const stored = row(7, {
+      text: 'a'.repeat(250_000),
+      overflow: { text: { chars: 2_500_000, parts: 3 } },
+    })
+    const failures: OverflowFailure[] = []
+    const hits = await search(
+      [stored],
+      { query: 'deep-needle' },
+      async (seq, field, part) => {
+        if (part === 1) throw new Error('EIO')
+        if (part === 2) return 'f'.repeat(500_000 - 'deep-needle'.length) + 'deep-needle'
+
+        return 'f'.repeat(1_000_000)
+      },
+      { onOverflowError: failure => failures.push(failure) },
+    )
+
+    expect(hits[0]?.overflow).toEqual({ field: 'text', offset: 2_500_000 - 'deep-needle'.length })
+    expect(failures).toEqual([{ seq: 7, field: 'text', part: 1, reason: 'unreadable' }])
+  })
+
+  test('a throwing failure reporter does not break the search', async () => {
+    const stored = row(7, {
+      text: 'a'.repeat(250_000),
+      overflow: { text: { chars: 2_500_000, parts: 3 } },
+    })
+    const hits = await search(
+      [stored],
+      { query: 'deep-needle' },
+      async (seq, field, part) => {
+        if (part === 0) return null
+        if (part === 1) return 'f'.repeat(1_000_000 - 'deep-needle'.length) + 'deep-needle'
+
+        return 'f'.repeat(500_000)
+      },
+      {
+        onOverflowError: () => {
+          throw new Error('reporter failed')
+        },
+      },
+    )
+
+    expect(hits[0]?.overflow).toEqual({ field: 'text', offset: 2_000_000 - 'deep-needle'.length })
   })
 })
 

@@ -198,6 +198,15 @@ const closeLog = () => {
 const logf = (...a) => { const s = a.map(fmt).join(" "); lines.push(s); if (logFd !== null) { try { fs.writeSync(logFd, s + NL); } catch {} } };
 const cons = { log: logf, error: logf, warn: logf, info: logf };
 const readState = {};
+// Content revision: first 16 hex chars of sha256(file bytes). Unlike readState it is stable across run_code processes.
+const revOf = (f) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex").slice(0, 16);
+const revKey = (p) => { const r = abs(p); return WIN ? r.toLowerCase() : r; };
+const checkRevision = (expected, f, label) => {
+  if (expected === undefined || expected === null) return;
+  if (typeof expected !== "string" || expected === "") throw E("INVALID_ARGUMENT", "expectedRevision must be a non-empty string", "Pass the value returned by tools.revision.");
+  let cur; try { cur = revOf(f); } catch (e) { if (e.code === "ENOENT") throw E("STALE", "file no longer exists: " + label + " (nothing was written)", "Re-read the file with tools.read and get the current revision with tools.revision."); throw e; }
+  if (cur !== expected) throw E("STALE", "revision mismatch for " + label + ": expected " + expected + ", current " + cur + " (nothing was written)", "Re-read the file with tools.read and get the current revision with tools.revision.");
+};
 
 // ---------- atomic write ----------
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -227,6 +236,59 @@ const atomicWrite = (f, data) => {
     renameRetry(t, target);
   } catch (e) { try { fs.unlinkSync(t); } catch {} throw e; }
 };
+
+// ---------- cross-process write lock (only for writes that carry expectedRevision) ----------
+// One lock file per canonical target path in the system temp dir. open(..., "wx") is atomic on every platform, so
+// exactly one process can hold it. A crashed process leaves its lock behind, so a lock older than 30 s is taken over.
+const LOCK_DIR = path.join(os.tmpdir(), "cc-ptc-locks");
+const LOCK_WAIT_MS = 2000, LOCK_STALE_MS = 30000;
+const lockKeyOf = (f) => {
+  let r = f;
+  try { r = fs.realpathSync.native(f); } catch { try { r = path.join(fs.realpathSync.native(path.dirname(f)), path.basename(f)); } catch {} }
+  r = path.resolve(r).split(path.sep).join("/");
+  return WIN ? r.toLowerCase() : r; // Windows: same file through any case / slash spelling -> same key
+};
+const lockPathOf = (f) => path.join(LOCK_DIR, crypto.createHash("sha256").update(lockKeyOf(f)).digest("hex").slice(0, 32) + ".lock");
+const releaseLock = (lp) => { try { fs.unlinkSync(lp); } catch {} };
+const acquireLock = (lp, f) => {
+  fs.mkdirSync(LOCK_DIR, { recursive: true });
+  const start = Date.now();
+  for (;;) {
+    let fd = null;
+    try { fd = fs.openSync(lp, "wx"); }
+    catch (e) { if (e.code !== "EEXIST") throw sysErr(e); }
+    if (fd !== null) {
+      try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now(), file: rel(f) })); } catch {}
+      try { fs.closeSync(fd); } catch {}
+      return lp;
+    }
+    let st = null;
+    try { st = fs.statSync(lp); } catch (e) { if (e.code === "ENOENT") continue; throw sysErr(e); }
+    if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+      // Rename the stale lock aside first: only one process can win the rename, so only one takes it over.
+      const aside = lp + "." + process.pid + "." + crypto.randomBytes(4).toString("hex") + ".stale";
+      try { fs.renameSync(lp, aside); try { fs.unlinkSync(aside); } catch {} } catch {}
+      continue;
+    }
+    if (Date.now() - start >= LOCK_WAIT_MS) throw E("LOCKED", "could not acquire the write lock for " + rel(f) + " within " + LOCK_WAIT_MS + " ms (nothing was written)", "Another run_code process is writing the same file; retry after it finishes. A lock left by a crashed process is taken over after 30 s.");
+    sleepMs(10 + Math.floor(Math.random() * 20));
+  }
+};
+// Locks are taken in sorted lock-path order so two multi-file callers cannot deadlock; every acquired lock is released.
+const withFileLocks = (files, fn) => {
+  const seen = new Map();
+  for (const f of files) { const lp = lockPathOf(f); if (!seen.has(lp)) seen.set(lp, f); }
+  const pairs = [...seen].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const held = [];
+  try {
+    for (const [lp, f] of pairs) held.push(acquireLock(lp, f));
+    return fn();
+  } finally {
+    for (let i = held.length - 1; i >= 0; i--) releaseLock(held[i]);
+  }
+};
+// The legacy (no expectedRevision) write paths never lock; only revision-guarded writes do.
+const withRevisionLock = (f, expected, fn) => (expected === undefined || expected === null ? fn() : withFileLocks([f], fn));
 
 // ---------- credential guard: OFF by default, enabled with env PTC_DENY_CREDENTIALS=1 (tools.bash is never restricted) ----------
 const CRED_ON = process.env.PTC_DENY_CREDENTIALS === "1";
@@ -314,6 +376,12 @@ tools.read = ({ path: p, offset = 0, limit, numbered = false } = {}) => {
   // numbered: "N: text" with the file's real 1-based line numbers (CR stripped)
   return numbered ? part.map((x, i) => (offset + i + 1) + ": " + x.replace(/\r$/, "")).join(NL) : part.join(NL);
 };
+tools.revision = (a) => {
+  const p = typeof a === "string" ? a : (A(a, "revision"), a.path);
+  reqStr(p, "path"); credGuard(p);
+  const f = abs(p);
+  try { return revOf(f); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "file not found: " + p, "Check the path with tools.glob."); throw e; }
+};
 tools.write = (a) => {
   A(a, "write"); reqStr(a.path, "path");
   if (typeof a.content !== "string") throw E("INVALID_ARGUMENT", "content must be a string", "Pass content as a string.");
@@ -330,19 +398,24 @@ tools.edit = (a) => {
   if (typeof old !== "string" || old === "") throw E("INVALID_ARGUMENT", "old must be a non-empty string", "Pass the exact text to replace.");
   if (typeof nw !== "string") throw E("INVALID_ARGUMENT", "new must be a string", "Pass the replacement text.");
   const f = abs(p);
-  let st;
-  try { st = fs.statSync(f); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "file not found: " + p, "Check the path with tools.glob."); throw e; }
-  if (readState[f] !== undefined && st.mtimeMs !== readState[f]) throw E("STALE", "file changed since it was read: " + p, "Re-read the file with tools.read and redo the edit.");
-  const t = fs.readFileSync(f, "utf8");
-  const n = t.split(old).length - 1;
-  if (n === 0) throw E("NOT_FOUND", "old string not found in " + p, "Re-read the file and copy the exact text (whitespace and line endings matter).");
-  countCheck(a.expect, n, "expect", p);
-  if (n > 1 && !all) throw E("NOT_UNIQUE", "old string matches " + n + " places in " + p, "Add surrounding context to make it unique, or pass all:true (with expect:<count>).");
-  const lines = all ? lineNosOf(t, old) : lineNosOf(t, old).slice(0, 1);
-  atomicWrite(f, all ? t.split(old).join(nw) : t.replace(old, () => nw));
-  readState[f] = fs.statSync(f).mtimeMs;
-  noteWrite("edit", rel(f), lines.length, lines);
-  return { replaced: lines.length, lines };
+  // With expectedRevision the check and the write are one critical section: a second process that passed the same
+  // revision must wait, then re-check and see STALE instead of silently overwriting this write.
+  return withRevisionLock(f, a.expectedRevision, () => {
+    let st;
+    try { st = fs.statSync(f); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "file not found: " + p, "Check the path with tools.glob."); throw e; }
+    if (readState[f] !== undefined && st.mtimeMs !== readState[f]) throw E("STALE", "file changed since it was read: " + p, "Re-read the file with tools.read and redo the edit.");
+    checkRevision(a.expectedRevision, f, p);
+    const t = fs.readFileSync(f, "utf8");
+    const n = t.split(old).length - 1;
+    if (n === 0) throw E("NOT_FOUND", "old string not found in " + p, "Re-read the file and copy the exact text (whitespace and line endings matter).");
+    countCheck(a.expect, n, "expect", p);
+    if (n > 1 && !all) throw E("NOT_UNIQUE", "old string matches " + n + " places in " + p, "Add surrounding context to make it unique, or pass all:true (with expect:<count>).");
+    const lines = all ? lineNosOf(t, old) : lineNosOf(t, old).slice(0, 1);
+    atomicWrite(f, all ? t.split(old).join(nw) : t.replace(old, () => nw));
+    readState[f] = fs.statSync(f).mtimeMs;
+    noteWrite("edit", rel(f), lines.length, lines);
+    return { replaced: lines.length, lines };
+  });
 };
 tools.bash = (a) => {
   A(a, "bash"); reqStr(a.command, "command");
@@ -370,7 +443,9 @@ tools.bash = (a) => {
   if (r.error && r.error.code === "ENOENT") r = cp.spawnSync(command, Object.assign({ shell: true }, o));
   if (r.error && r.error.code === "ENOBUFS") throw E("OUTPUT_LIMIT", "command output exceeded 256MB", "Redirect output to a file or filter it in the command.");
   if (r.error && r.error.code === "ETIMEDOUT") return { code: null, stdout: r.stdout || "", stderr: r.stderr || "", timedOut: true };
-  return { code: r.status, stdout: r.stdout, stderr: r.stderr };
+  const res = { code: r.status, stdout: r.stdout, stderr: r.stderr };
+  if (r.error) res.error = String(r.error.message || r.error);
+  return res;
 };
 
 // tools.job: query a background bash started by tools.bash({background:true}); jobs live in the scope dir and
@@ -646,6 +721,16 @@ const looseForFinder = (pattern) => {
 tools.replace = guard((a) => {
   A(a, "replace");
   const { pattern, replacement, path: root, glob, flags = "", dryRun = false } = a;
+  let expRev = null;
+  if (a.expectedRevision !== undefined && a.expectedRevision !== null) {
+    const m = a.expectedRevision;
+    if (typeof m !== "object" || Array.isArray(m)) throw E("INVALID_ARGUMENT", "expectedRevision must be an object mapping path -> revision", "Pass {path: revision} using values from tools.revision.");
+    expRev = new Map();
+    for (const k of Object.keys(m)) {
+      if (typeof m[k] !== "string" || m[k] === "") throw E("INVALID_ARGUMENT", "expectedRevision[" + k + "] must be a non-empty string", "Pass the value returned by tools.revision.");
+      expRev.set(revKey(k), m[k]);
+    }
+  }
   reqStr(pattern, "pattern");
   if (typeof replacement !== "string") throw E("INVALID_ARGUMENT", "replacement must be a string", "Use JS replacement syntax ($1, $&).");
   if (typeof flags !== "string" || !/^[dgimsuvy]*$/.test(flags)) throw E("INVALID_ARGUMENT", "flags must be JS RegExp flags", "Use a subset of dgimsuvy.");
@@ -688,24 +773,31 @@ tools.replace = guard((a) => {
   // phase 2: STALE-check every file to be written, then write; on any failure restore the already written files
   if (!dryRun) {
     const todo = found.filter((x) => x.nt !== null);
-    for (const x of todo) {
-      let m; try { m = fs.statSync(x.f).mtimeMs; } catch { m = -1; }
-      if (m !== x.mtime) throw E("STALE", "file changed during replace: " + rel(x.f) + " (nothing was written)", "Re-run tools.replace.", { rolledBack: false, written: [] });
-    }
-    const written = []; let cur = null;
-    try {
-      for (const x of todo) { cur = x; atomicWrite(x.f, x.nt); written.push(x); }
-    } catch (e) {
-      const pe = sysErr(e), restored = [], restoreFailed = [];
-      for (const w of written.slice().reverse()) { try { atomicWrite(w.f, w.buf); restored.push(rel(w.f)); } catch { restoreFailed.push(rel(w.f)); } }
-      const rolledBack = restoreFailed.length === 0;
-      throw E(rolledBack ? (pe.code || "RESULT_UNKNOWN") : "RESULT_UNKNOWN",
-        "write failed at " + rel(cur.f) + " (" + String(pe.message).replace(/^\[\w+\]\s*/, "") + "); " + (rolledBack ? "rolledBack=true, restored " + restored.length + " file(s)" : "rolledBack=false, could not restore: " + restoreFailed.join(", ")),
-        rolledBack ? "No files were changed; fix the cause (locked/read-only file?) and re-run." : "Inspect the files listed in restoreFailed; they hold the new content.",
-        { rolledBack, restored, restoreFailed, failedFile: rel(cur.f) });
-    }
-    for (const x of todo) { try { readState[x.f] = fs.statSync(x.f).mtimeMs; } catch {} }
-    for (const x of todo) noteWrite("replace", rel(x.f), x.n, x.lines);
+    const writeAll = () => {
+      for (const x of todo) {
+        let m; try { m = fs.statSync(x.f).mtimeMs; } catch { m = -1; }
+        if (m !== x.mtime) throw E("STALE", "file changed during replace: " + rel(x.f) + " (nothing was written)", "Re-run tools.replace.", { rolledBack: false, written: [] });
+        const want = expRev && expRev.get(revKey(x.f));
+        if (want !== undefined && revOf(x.f) !== want) throw E("STALE", "revision mismatch for " + rel(x.f) + ": expected " + want + ", current " + revOf(x.f) + " (nothing was written)", "Re-read the file with tools.read and get the current revision with tools.revision.", { rolledBack: false, written: [] });
+      }
+      const written = []; let cur = null;
+      try {
+        for (const x of todo) { cur = x; atomicWrite(x.f, x.nt); written.push(x); }
+      } catch (e) {
+        const pe = sysErr(e), restored = [], restoreFailed = [];
+        for (const w of written.slice().reverse()) { try { atomicWrite(w.f, w.buf); restored.push(rel(w.f)); } catch { restoreFailed.push(rel(w.f)); } }
+        const rolledBack = restoreFailed.length === 0;
+        throw E(rolledBack ? (pe.code || "RESULT_UNKNOWN") : "RESULT_UNKNOWN",
+          "write failed at " + rel(cur.f) + " (" + String(pe.message).replace(/^\[\w+\]\s*/, "") + "); " + (rolledBack ? "rolledBack=true, restored " + restored.length + " file(s)" : "rolledBack=false, could not restore: " + restoreFailed.join(", ")),
+          rolledBack ? "No files were changed; fix the cause (locked/read-only file?) and re-run." : "Inspect the files listed in restoreFailed; they hold the new content.",
+          { rolledBack, restored, restoreFailed, failedFile: rel(cur.f) });
+      }
+      for (const x of todo) { try { readState[x.f] = fs.statSync(x.f).mtimeMs; } catch {} }
+      for (const x of todo) noteWrite("replace", rel(x.f), x.n, x.lines);
+    };
+    // With expectedRevision this is one guarded multi-file write: every lock is taken (in sorted order, so two
+    // callers cannot deadlock) before the revision checks, and released however the write ends.
+    if (expRev) withFileLocks(todo.map((x) => x.f), writeAll); else writeAll();
   }
   const res = { files: found.length, matches, changed, items, dryRun: !!dryRun, finder };
   if (skipped.length) res.skipped = skipped;
@@ -1101,7 +1193,7 @@ tools.batch = guard((a) => {
   return summary(job);
 });
 
-// ---------- DSH-compatible bindings (read/write/edit/glob/grep/bash/job_output) ----------
+// ---------- DSH-compatible bindings (read/write/edit/glob/grep/bash/job_output, plus test) ----------
 // Same names, parameters and return shapes as DeepSeek's DSH tools. They live in tools.dsh always; when the
 // caller sets input.dsh (delegate ptc-only: PTC_RUN_SDK_IN_PROMPT=1) they also take over the top-level
 // names read/write/edit/glob/grep/bash, because the system prompt there declares those names with DSH shapes.
@@ -1110,6 +1202,10 @@ class ToolCallError extends Error {
   constructor(toolName, message) { super(message); this.name = "ToolCallError"; this.toolName = toolName; }
 }
 const DSH_READ_LIMIT = 2000, DSH_LINE_CAP = 2000, DSH_GLOB_MAX = 1000, DSH_GREP_MAX = 200, DSH_OUT_TAIL = 30000;
+// PTC_RUN_DSH_READ_LIMIT (passed as input.dshReadLimit): a positive integer that becomes the default read limit for
+// calls that pass no limit. Unset => exactly the old behaviour (2000). An explicit limit keeps its own 2000-line cap.
+const DSH_READ_DEFAULT = Number.isInteger(input.dshReadLimit) && input.dshReadLimit > 0 ? input.dshReadLimit : DSH_READ_LIMIT;
+const DSH_READ_LIMITED = Number.isInteger(input.dshReadLimit) && input.dshReadLimit > 0;
 const dshArgs = (name, a) => { if (a === null || typeof a !== "object" || Array.isArray(a)) throw E("INVALID_ARGUMENT", name + " expects one object argument", "Pass an object, e.g. tools." + name + "({...})."); return a; };
 const dshStr = (v, n) => { if (typeof v !== "string" || v === "") throw E("INVALID_ARGUMENT", n + " must be a non-empty string", "Fix '" + n + "'."); return v; };
 const dshOptInt = (v, n, min) => { if (v === undefined || v === null) return undefined; if (typeof v !== "number" || !Number.isFinite(v) || v < min) throw E("INVALID_ARGUMENT", n + " must be a number >= " + min, "Fix '" + n + "'."); return Math.floor(v); };
@@ -1123,7 +1219,8 @@ const dshWrap = (name, fn) => async (a) => {
 const dsh = {};
 dsh.read = dshWrap("read", (a) => {
   const p = dshStr(a.file_path, "file_path"); credGuard(p);
-  const off = dshOptInt(a.offset, "offset", 1) || 1, lim = dshOptInt(a.limit, "limit", 1) || DSH_READ_LIMIT;
+  const explicit = dshOptInt(a.limit, "limit", 1);
+  const off = dshOptInt(a.offset, "offset", 1) || 1, lim = explicit === undefined ? DSH_READ_DEFAULT : explicit;
   const f = abs(p), st = fs.statSync(f);
   if (st.isDirectory()) throw E("INVALID_ARGUMENT", "path is a directory: " + p, "Use glob to list files.");
   const t = fs.readFileSync(f, "utf8");
@@ -1131,7 +1228,20 @@ dsh.read = dshWrap("read", (a) => {
   const all = t.split(/\r?\n/);
   if (all.length > 1 && all[all.length - 1] === "") all.pop();
   const lines = all.slice(off - 1, off - 1 + lim).map((s, i) => ({ number: off + i, text: s.length > DSH_LINE_CAP ? s.slice(0, DSH_LINE_CAP) + "...[line truncated]" : s }));
-  return { path: rel(f), offset: off, lines, totalLines: all.length };
+  const r = { path: rel(f), offset: off, lines, totalLines: all.length };
+  const end = off - 1 + lines.length;
+  if (explicit === undefined && DSH_READ_LIMITED && end < all.length) {
+    r.more = "lines " + off + "-" + end + " of " + all.length + " shown; read with offset=" + (end + 1) + " for more";
+    // Also as a last pseudo-line, so code that only prints lines still shows the cut. kind:"notice" and number:null
+    // mark it as not being part of the file; real lines never carry kind.
+    lines.push({ number: null, kind: "notice", text: "... [" + (all.length - end) + " more lines not shown; file has " + all.length + " lines; read with offset=" + (end + 1) + "]" });
+  }
+  // text: the same lines as "N: text" (a notice line has no number). Non-enumerable so JSON.stringify / console.log
+  // output is unchanged (no doubled payload).
+  Object.defineProperty(r, "text", { get() { return lines.map((l) => (l.kind ? l.text : l.number + ": " + l.text)).join(NL); }, enumerable: false });
+  // content: only the file's real lines, joined with \n (no notice, no line numbers), so it can be parsed or edited.
+  Object.defineProperty(r, "content", { get() { return lines.filter((l) => !l.kind).map((l) => l.text).join(NL); }, enumerable: false });
+  return r;
 });
 dsh.write = dshWrap("write", (a) => {
   const p = dshStr(a.file_path, "file_path");
@@ -1223,6 +1333,151 @@ dsh.bash = dshWrap("bash", (a) => {
   const r = legacyBash({ command: a.command, cwd: c, timeoutMs, env: a.env });
   return { kind: "foreground", exitCode: r.code === undefined ? null : r.code, signal: null, timedOut: !!r.timedOut, aborted: false, timeoutMs, stdout: spillTail(String(r.stdout || "")), stderr: spillTail(String(r.stderr || "")) };
 });
+// tools.test: run a test command through the bash path and return a compact summary instead of the raw stream.
+// Parsing is conservative: status comes from the exit code first, counts only from explicit summary lines, and an
+// unrecognised framework stays "unknown" with a tail (never an error).
+const TEST_TAIL_LINES = 40, TEST_DETAIL_LINES = 15, TEST_DEFAULT_MS = 300000;
+const lastLines = (s, n) => { const a = String(s).replace(/\r/g, "").split(NL); while (a.length && a[a.length - 1] === "") a.pop(); return a.slice(-n).join(NL); };
+const detailAfter = (ls, i) => {
+  const out = [];
+  for (let j = i + 1; j < ls.length && out.length < TEST_DETAIL_LINES; j++) {
+    const l = ls[j];
+    if (/^\s*(not ok \d|ok \d|# |FAIL\s|× |● |PASS\s|✖ |ℹ )/.test(l)) break;
+    if (!l.trim()) { if (out.length) break; continue; }
+    if (/^\s*(---|\.\.\.)\s*$/.test(l) || /^\s*(duration_ms|type|location|failureType|code|stack|\.\.\.)\s*:/.test(l)) continue;
+    out.push(l.trim());
+  }
+  return out.join(NL);
+};
+const dedupeFailures = (fs) => {
+  const m = new Map();
+  for (const f of fs) { const e = m.get(f.name); if (!e) m.set(f.name, f); else if (!e.detail && f.detail) e.detail = f.detail; }
+  return [...m.values()];
+};
+const countsFrom = (s) => {
+  const c = {}, re = /(\d+)\s+(passed|failed|errors?|skipped|todo)\b/g; let m;
+  while ((m = re.exec(s))) { if (m[2] === "todo") continue; const k = m[2].startsWith("error") ? "errors" : m[2]; c[k] = (c[k] || 0) + Number(m[1]); }
+  return c;
+};
+const parsePytest = (out) => {
+  const ls = out.split(/\r?\n/); let counts = null;
+  for (const l of ls) {
+    if (/\d+ (?:passed|failed|errors?|skipped)\b/.test(l) && (/\bin \d+(?:\.\d+)?s/.test(l) || /^\s*=+.*=+\s*$/.test(l))) {
+      const c = countsFrom(l); if (Object.keys(c).length) counts = c;
+    }
+  }
+  const sec = new Map(); let cur = null;
+  for (const l of ls) {
+    const h = l.match(/^_+\s+(.+?)\s+_+$/);
+    if (h) { cur = h[1].trim(); sec.set(cur, []); continue; }
+    if (!cur) continue;
+    const e = l.match(/^E\s+(.*)$/);
+    if (e) { if (sec.get(cur).length < TEST_DETAIL_LINES) sec.get(cur).push(e[1]); }
+    else if (/^=+\s.*=+\s*$/.test(l) || /^FAILED\s/.test(l)) cur = null;
+  }
+  const failures = [];
+  for (const l of ls) {
+    const m = l.match(/^FAILED\s+(\S+)(?:\s+-\s+(.*))?$/);
+    if (!m) continue;
+    const d = sec.get(m[1].split("::").pop());
+    failures.push({ name: m[1], detail: d && d.length ? d.join(NL) : (m[2] || "").trim() });
+  }
+  if (!failures.length) for (const [n, d] of sec) if (d.length) failures.push({ name: n, detail: d.join(NL) });
+  return counts || failures.length ? { counts: counts || undefined, failures } : null;
+};
+const parseNodeTest = (out) => {
+  const ls = out.split(/\r?\n/), counts = {}; let found = false;
+  for (const l of ls) {
+    // TAP ("# pass 1") and the spec reporter ("ℹ pass 1", the default when stdout is a pipe on recent Node).
+    const m = l.match(/^[#ℹ]\s*(pass|fail|skipped)\s+(\d+)\s*$/);
+    if (m) { found = true; counts[m[1] === "pass" ? "passed" : m[1] === "fail" ? "failed" : "skipped"] = Number(m[2]); }
+  }
+  const failures = [];
+  for (let i = 0; i < ls.length; i++) {
+    const m = ls[i].match(/^\s*not ok \d+ - (.+)$/);
+    if (m) failures.push({ name: m[1].trim(), detail: detailAfter(ls, i) });
+  }
+  let spec = false;
+  for (let i = 0; i < ls.length; i++) {
+    if (/failing tests:/.test(ls[i])) { spec = true; continue; }
+    if (!spec) continue;
+    const m = ls[i].match(/^\s*✖\s+(.+?)(?:\s+\([\d.]+m?s\))?\s*$/);
+    if (m) failures.push({ name: m[1].trim(), detail: detailAfter(ls, i) });
+  }
+  return found || failures.length ? { counts: Object.keys(counts).length ? counts : undefined, failures } : null;
+};
+const parseJsTest = (out) => {
+  const ls = out.split(/\r?\n/); let counts = null;
+  for (const l of ls) {
+    const m = l.match(/^\s*Tests:\s+(.+)$/) || l.match(/^\s*Tests\s{2,}(.+)$/);
+    if (!m) continue;
+    const c = countsFrom(m[1]); if (Object.keys(c).length) counts = c;
+  }
+  const fail = [], cases = [];
+  for (let i = 0; i < ls.length; i++) {
+    let m = ls[i].match(/^\s*FAIL\s+(.+)$/);
+    if (m) { fail.push({ name: m[1].trim(), detail: detailAfter(ls, i) }); continue; }
+    m = ls[i].match(/^\s*[×●]\s+(.+)$/);
+    if (m) cases.push({ name: m[1].trim().replace(/\s+\d+(?:\.\d+)?m?s$/, ""), detail: detailAfter(ls, i) });
+  }
+  const failures = fail.length ? fail : cases; // vitest repeats each failure as "× name"; prefer the "FAIL path > name" line
+  return counts || failures.length ? { counts: counts || undefined, failures } : null;
+};
+// msys-style workdirs ("/c/x", "/tmp/..."): convert before spawning. /tmp is resolved with cygpath when available;
+// otherwise the caller gets an explicit error instead of a confusing ENOENT.
+const msysWorkdir = (w) => {
+  if (!WIN || typeof w !== "string" || w.charAt(0) !== "/") return w;
+  const m = /^\/([A-Za-z])(?:\/(.*))?$/.exec(w);
+  if (m) return m[1].toUpperCase() + ":/" + (m[2] || "");
+  if (/^\/tmp(?:\/|$)/.test(w)) {
+    let out = "";
+    try { const r = cp.spawnSync(BASH, ["-c", 'cygpath -w -- "$1"', "x", w], { encoding: "utf8", timeout: 5000, windowsHide: true }); if (!r.error && r.status === 0) out = String(r.stdout || "").trim(); } catch {}
+    if (out) return out;
+    throw E("INVALID_ARGUMENT", "workdir is an MSYS path that cannot be converted: " + w, "Pass a Windows path (e.g. C:/...) or a path relative to the working directory.");
+  }
+  return w;
+};
+dsh.test = dshWrap("test", (a) => {
+  const command = dshStr(a.command, "command");
+  const timeoutMs = dshOptInt(a.timeoutMs, "timeoutMs", 1) || TEST_DEFAULT_MS;
+  const maxFailures = a.maxFailures === undefined ? 10 : dshOptInt(a.maxFailures, "maxFailures", 0);
+  const outputPath = path.join(os.tmpdir(), "ptc-test-" + crypto.randomBytes(4).toString("hex") + ".txt");
+  const finish = (res) => {
+    res.outputPath = outputPath;
+    // Compatibility alias: readable as fullOutput, but non-enumerable so JSON.stringify only shows outputPath.
+    Object.defineProperty(res, "fullOutput", { get() { return res.outputPath; }, enumerable: false, configurable: true });
+    return res;
+  };
+  const startError = (msg) => { try { fs.writeFileSync(outputPath, ""); } catch {} return finish({ status: "error", exitCode: null, failures: [], error: msg, tail: "(no output)" }); };
+  let c = cwd;
+  try {
+    if (a.workdir !== undefined) c = abs(msysWorkdir(dshStr(a.workdir, "workdir")));
+    if (!fs.statSync(c).isDirectory()) return startError("workdir is not a directory: " + c);
+  } catch (e) {
+    return startError(String((e && e.message) || e));
+  }
+  const r = legacyBash({ command, cwd: c, timeoutMs });
+  const out = String(r.stdout || "") + (r.stderr ? NL + String(r.stderr) : "");
+  try { fs.writeFileSync(outputPath, out); } catch {}
+  const p = parsePytest(out) || parseNodeTest(out) || parseJsTest(out) || { counts: undefined, failures: [] };
+  const counts = p.counts, failures = dedupeFailures(p.failures);
+  const exitCode = r.code === undefined ? null : r.code;
+  let status, error;
+  if (r.timedOut) status = "timeout";
+  else if (r.error) { status = "error"; error = "command failed to start: " + r.error; }
+  else if (exitCode === 0) status = "passed";
+  else if (failures.length || (counts && (counts.failed > 0 || counts.errors > 0))) status = counts && counts.errors > 0 && !counts.failed && !failures.length ? "error" : "failed";
+  else status = "unknown";
+  // No output means the command never produced a parseable result: report an error, never a bare unknown.
+  if (status === "unknown" && !out.trim()) { status = "error"; error = "command produced no output (exit code " + exitCode + ")"; }
+  if (status === "error" && !error) error = "test command reported errors";
+  const res = { status, exitCode };
+  if (error) res.error = error;
+  if (counts && Object.keys(counts).length) res.counts = counts;
+  res.failures = failures.slice(0, maxFailures);
+  if (status === "unknown" || status === "error" || (status === "failed" && !res.failures.length)) res.tail = lastLines(out, TEST_TAIL_LINES) || "(no output)";
+  return finish(res);
+});
 dsh.job_output = dshWrap("job_output", (a) => {
   const id = checkId(dshStr(a.job_id, "job_id"));
   const mf = path.join(bgDir, id + ".json");
@@ -1245,13 +1500,14 @@ dsh.job_output = dshWrap("job_output", (a) => {
 });
 const legacyBash = tools.bash;
 tools.dsh = dsh;
+tools.test = dsh.test; // normal mode gets the same summary shape (same fields, same parsing)
 if (RO) { // read-only mode: everything that writes or runs a command is refused (legacy and DSH shapes alike)
   const roMsg = (k) => "[POLICY_DENIED] tools." + k + " is disabled in read-only mode";
   const roNext = "This run_code is read-only: use read, glob, grep and ref.*; report the change or command instead of making it.";
-  for (const k of ["write", "edit", "replace", "batch", "bash", "parallel", "job", "job_output"]) tools[k] = () => { throw new PtcError("POLICY_DENIED", "tools." + k + " is disabled in read-only mode", roNext); };
-  for (const k of ["write", "edit", "bash", "job_output"]) dsh[k] = async () => { const e = new ToolCallError(k, roMsg(k) + " (" + roNext + ")"); e.code = "POLICY_DENIED"; throw e; };
+  for (const k of ["write", "edit", "replace", "batch", "bash", "parallel", "job", "job_output", "test"]) tools[k] = () => { throw new PtcError("POLICY_DENIED", "tools." + k + " is disabled in read-only mode", roNext); };
+  for (const k of ["write", "edit", "bash", "job_output", "test"]) dsh[k] = async () => { const e = new ToolCallError(k, roMsg(k) + " (" + roNext + ")"); e.code = "POLICY_DENIED"; throw e; };
 }
-if (input.dsh) for (const k of ["read", "write", "edit", "glob", "grep", "bash", "job_output"]) tools[k] = dsh[k];
+if (input.dsh) for (const k of ["read", "write", "edit", "glob", "grep", "bash", "job_output", "test"]) tools[k] = dsh[k];
 
 // ---------- run user code ----------
 for (const k of Object.keys(tools)) if (k !== "dsh" && !(input.dsh && k in dsh)) tools[k] = guard(tools[k]);
