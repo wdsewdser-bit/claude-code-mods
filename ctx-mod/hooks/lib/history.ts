@@ -252,6 +252,11 @@ export type SearchHit = {
   /** The tool call's input summary, when the row has one. */
   input?: string
   excerpt: string
+  /**
+   * Set when the match was only in a clipped field's overflow file: the field it is in
+   * and its absolute character offset in the original, for a `history read` to start at.
+   */
+  overflow?: { field: 'text' | 'args'; offset: number }
 }
 
 const EXCERPT_PAD = 80
@@ -316,7 +321,129 @@ const excerptAround = (text: string, at: number, width: number): string =>
  * a search is about the work, and a tool filter is how they are still found.
  * The engine's background rows are skipped the same way unless a door is named.
  */
-export const search = (rows: readonly HistoryRecord[], query: SearchQuery): SearchHit[] => {
+/** Reads one part of a field whose original was set aside; null when it cannot be had. */
+export type OverflowReader = (seq: number, field: 'text' | 'args', part: number) => Promise<string | null>
+
+/**
+ * One overflow part that could not be searched: the reader said it was absent,
+ * threw, or handed back a length that does not match the row's own metadata.
+ * A search skips that file, says so through `SearchOptions.onOverflowError`,
+ * and still searches the row's other parts and every other row.
+ */
+export type OverflowFailure = {
+  seq: number
+  field: 'text' | 'args'
+  part: number
+  reason: 'missing' | 'unreadable' | 'truncated'
+  /** For `truncated`: the characters the metadata promised and what the file held. */
+  expected?: number
+  actual?: number
+}
+
+/** What an asynchronous search reports besides its hits. */
+export type SearchOptions = {
+  /** Told once per part a search had to skip; a throwing reporter never breaks the search. */
+  onOverflowError?: (failure: OverflowFailure) => void
+}
+
+/** A match that only survived in the overflow files: the field and its absolute offset in the original. */
+type OverflowMatch = { field: 'text' | 'args'; offset: number; excerpt: string }
+
+/** How many characters one part of a field holds, from the row's own metadata. */
+const partSpan = (overflow: Overflow, part: number): number =>
+  (part + 1 < overflow.parts ? partStart(overflow, part + 1) : overflow.chars) - partStart(overflow, part)
+
+/**
+ * The first occurrence of `needle` in a field's overflow files. Parts are read one at a
+ * time, and a match that straddles a part boundary is still found: the last few
+ * characters of the previous part are kept in front of the next one, and the offset
+ * is measured against the original field, not the part.
+ */
+const overflowMatch = async (
+  row: HistoryRecord,
+  needle: string,
+  readOverflow: OverflowReader,
+  onFailure?: (failure: OverflowFailure) => void,
+): Promise<OverflowMatch | null> => {
+  const report = (failure: OverflowFailure): void => {
+    try {
+      onFailure?.(failure)
+    } catch {
+      // A reporter must never change what a search finds.
+    }
+  }
+  const overlap = needle.length - 1
+  for (const field of ['text', 'args'] as const) {
+    const overflow = row.overflow?.[field]
+    if (overflow === undefined) continue
+    let tail = ''
+    for (let part = 0; part < overflow.parts; part += 1) {
+      const span = partSpan(overflow, part)
+      let text: string | null
+      try {
+        text = await readOverflow(row.seq, field, part)
+      } catch {
+        // One unreadable file must not fail the whole search: skip it and say so.
+        report({ seq: row.seq, field, part, reason: 'unreadable' })
+        // The next part does not continue this one, so a match across the gap would be a lie.
+        tail = ''
+        continue
+      }
+      if (text === null) {
+        report({ seq: row.seq, field, part, reason: 'missing' })
+        tail = ''
+        continue
+      }
+      // A part whose length is not what the row promised would shift every offset after it.
+      if (text.length !== span) {
+        report({ seq: row.seq, field, part, reason: 'truncated', expected: span, actual: text.length })
+        tail = ''
+        continue
+      }
+      const probe = tail + text
+      const at = probe.toLowerCase().indexOf(needle)
+      if (at >= 0) {
+        return {
+          field,
+          offset: partOrigin(overflow, part) - tail.length + at,
+          excerpt: excerptAround(probe, at, needle.length),
+        }
+      }
+      tail = overlap <= 0 ? '' : text.slice(-overlap)
+    }
+  }
+
+  return null
+}
+
+/**
+ * Literal, case-insensitive search over the records, newest first. An empty
+ * query skips text matching and only applies the filters, so it doubles as
+ * "what happened in this window". Every field is read defensively: the callers
+ * cast a model's tool input straight to `SearchQuery`, so a missing or wrongly
+ * typed field means "no filter", never a throw and never a widened answer.
+ * This mod's own tool rows are skipped unless the caller names a tool filter:
+ * a search is about the work, and a tool filter is how they are still found.
+ * The engine's background rows are skipped the same way unless a door is named.
+ *
+ * Without `readOverflow` the function is pure and synchronous. Given a reader,
+ * it returns a promise and also looks inside a clipped field's overflow files,
+ * but only for a row whose inline fields did not match, so an ordinary search
+ * never pays for them. Such a hit carries the absolute offset in the original.
+ */
+export function search(rows: readonly HistoryRecord[], query: SearchQuery): SearchHit[]
+export function search(
+  rows: readonly HistoryRecord[],
+  query: SearchQuery,
+  readOverflow: OverflowReader,
+  options?: SearchOptions,
+): Promise<SearchHit[]>
+export function search(
+  rows: readonly HistoryRecord[],
+  query: SearchQuery,
+  readOverflow?: OverflowReader,
+  options?: SearchOptions,
+): SearchHit[] | Promise<SearchHit[]> {
   const limit = searchLimit(query.limit)
   const window = windowFilter(query.window)
   const role = roleFilter(query.role)
@@ -326,47 +453,78 @@ export const search = (rows: readonly HistoryRecord[], query: SearchQuery): Sear
   const filterPath = textFilter(query.path)
   const needle = (typeof query.query === 'string' ? query.query : '').toLowerCase()
   const pathNeedle = filterPath === undefined ? undefined : flattenPath(filterPath)
-  const hits: SearchHit[] = []
+  const ordered = [...rows].sort((a, b) => b.seq - a.seq)
 
-  for (const row of [...rows].sort((a, b) => b.seq - a.seq)) {
-    if (hits.length >= limit) break
-    if (window !== undefined && row.window !== window) continue
-    if (role !== undefined && row.role !== role) continue
-    if (tool !== undefined && row.tool !== tool) continue
-    if (skipOwn && isOwnRow(row)) continue
-    if (door !== undefined ? row.door !== door : isBackgroundRow(row)) continue
+  const wanted = (row: HistoryRecord): boolean => {
+    if (window !== undefined && row.window !== window) return false
+    if (role !== undefined && row.role !== role) return false
+    if (tool !== undefined && row.tool !== tool) return false
+    if (skipOwn && isOwnRow(row)) return false
+    if (door !== undefined ? row.door !== door : isBackgroundRow(row)) return false
     if (pathNeedle !== undefined) {
-      if (row.path === undefined || !flattenPath(row.path).includes(pathNeedle)) continue
+      if (row.path === undefined || !flattenPath(row.path).includes(pathNeedle)) return false
     }
 
-    let excerpt: string
-    if (needle === '') {
-      excerpt = oneLine(row.text.slice(0, EXCERPT_HEAD))
-    } else {
-      const at = row.text.toLowerCase().indexOf(needle)
-      // A word that only survived in the call's arguments, or in their summary, still
-      // matches: the point of those fields is to find a past call by what it was asked.
-      const inArgs = at < 0 ? (row.args ?? '').toLowerCase().indexOf(needle) : -1
-      const inInput = at < 0 && inArgs < 0 ? (row.input ?? '').toLowerCase().indexOf(needle) : -1
-      if (at < 0 && inArgs < 0 && inInput < 0) continue
-      excerpt =
-        at >= 0
-          ? excerptAround(row.text, at, needle.length)
-          : inArgs >= 0
-            ? excerptAround(row.args ?? '', inArgs, needle.length)
-            : excerptAround(row.input ?? '', inInput, needle.length)
-    }
+    return true
+  }
 
+  /** The excerpt when the row's own fields match, or null when only its overflow might. */
+  const inlineExcerpt = (row: HistoryRecord): string | null => {
+    if (needle === '') return oneLine(row.text.slice(0, EXCERPT_HEAD))
+    const at = row.text.toLowerCase().indexOf(needle)
+    // A word that only survived in the call's arguments, or in their summary, still
+    // matches: the point of those fields is to find a past call by what it was asked.
+    const inArgs = at < 0 ? (row.args ?? '').toLowerCase().indexOf(needle) : -1
+    const inInput = at < 0 && inArgs < 0 ? (row.input ?? '').toLowerCase().indexOf(needle) : -1
+    if (at < 0 && inArgs < 0 && inInput < 0) return null
+
+    return at >= 0
+      ? excerptAround(row.text, at, needle.length)
+      : inArgs >= 0
+        ? excerptAround(row.args ?? '', inArgs, needle.length)
+        : excerptAround(row.input ?? '', inInput, needle.length)
+  }
+
+  const hitOf = (row: HistoryRecord, excerpt: string, overflow?: OverflowMatch): SearchHit => {
     const hit: SearchHit = { seq: row.seq, window: row.window, role: row.role, excerpt }
     if (row.tool !== undefined) hit.tool = row.tool
     if (row.path !== undefined) hit.path = row.path
     if (row.input !== undefined) hit.input = row.input
     if (row.door !== undefined) hit.door = row.door
     if (row.name !== undefined) hit.name = row.name
-    hits.push(hit)
+    if (overflow !== undefined) hit.overflow = { field: overflow.field, offset: overflow.offset }
+
+    return hit
   }
 
-  return hits
+  if (readOverflow === undefined) {
+    const hits: SearchHit[] = []
+    for (const row of ordered) {
+      if (hits.length >= limit) break
+      if (!wanted(row)) continue
+      const excerpt = inlineExcerpt(row)
+      if (excerpt !== null) hits.push(hitOf(row, excerpt))
+    }
+
+    return hits
+  }
+
+  return (async (): Promise<SearchHit[]> => {
+    const hits: SearchHit[] = []
+    for (const row of ordered) {
+      if (hits.length >= limit) break
+      if (!wanted(row)) continue
+      const excerpt = inlineExcerpt(row)
+      if (excerpt !== null) {
+        hits.push(hitOf(row, excerpt))
+        continue
+      }
+      const found = await overflowMatch(row, needle, readOverflow, options?.onOverflowError)
+      if (found !== null) hits.push(hitOf(row, found.excerpt, found))
+    }
+
+    return hits
+  })()
 }
 
 export type ReadResult =
@@ -643,6 +801,14 @@ export const repliesAnswered = (
   return answered
 }
 
+/** What the queue tells its owner: a write that landed, and a push folded into one not yet started. */
+export type QueueHooks = {
+  /** Called after a write succeeds, with its UTF-8 size. */
+  onWrite?: (path: string, bytes: number) => void
+  /** Called when a push is merged into a same-path push that has not started yet. */
+  onCoalesce?: (path: string) => void
+}
+
 /** One whole-file write waiting its turn. */
 type Job = {
   path: string
@@ -671,6 +837,7 @@ export type Queue = {
 export const createQueue = (
   write: (path: string, text: string) => Promise<void>,
   onError?: (path: string, error: unknown) => void,
+  hooks?: QueueHooks,
 ): Queue => {
   const pending: Job[] = []
   const idlers: (() => void)[] = []
@@ -708,6 +875,13 @@ export const createQueue = (
         } catch (error) {
           report(job.path, error)
         } finally {
+          if (ok) {
+            try {
+              hooks?.onWrite?.(job.path, byteLength(job.text))
+            } catch {
+              // A counter must never change what the queue reports.
+            }
+          }
           // Settled on either path, so no push is ever left hanging.
           job.finish(ok)
         }
@@ -722,6 +896,11 @@ export const createQueue = (
     const open = pending.find(job => job.path === path)
     if (open !== undefined) {
       open.text = text
+      try {
+        hooks?.onCoalesce?.(path)
+      } catch {
+        // A counter must never change what the queue reports.
+      }
       return open.done
     }
 

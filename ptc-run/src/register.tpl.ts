@@ -26,12 +26,12 @@ const PARTIAL_READER = 'const fs=require("fs"),path=require("path"),os=require("
 
 const DESC_PARTS = [
   'Run a JavaScript async-function body in a sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch work (loops, grep+aggregate, edits). timeoutMs is the whole-program timeout (default 300000 ms, max 1800000). root:"D:/abs/dir" makes relative paths, path-less glob/grep and cwd-less bash use that existing absolute directory (tools.root exposes it).',
-  'Paths: relative to cwd (or root). On big trees give glob/grep a path or specific pattern. Errors carry .code/.nextAction and "[CODE]" prefix: INVALID_ARGUMENT NOT_FOUND NOT_UNIQUE COUNT_MISMATCH STALE EXISTS POLICY_DENIED BUSY OUTPUT_LIMIT RG_UNAVAILABLE RESULT_UNKNOWN.',
-  'tools.read({path,offset?,limit?,numbered?}) (numbered:true -> "N: text" lines with real line numbers). tools.write({path,content}); tools.edit({path,old,new,all?,expect?}) -> {replaced,lines} (atomic; STALE is checked only if this same program read the file first; with all:true pass expect:<count you mean to change>, a different count writes nothing and throws COUNT_MISMATCH).',
+  'Paths: relative to cwd (or root). On big trees give glob/grep a path or specific pattern. Errors carry .code/.nextAction and "[CODE]" prefix: INVALID_ARGUMENT NOT_FOUND NOT_UNIQUE COUNT_MISMATCH STALE LOCKED EXISTS POLICY_DENIED BUSY OUTPUT_LIMIT RG_UNAVAILABLE RESULT_UNKNOWN.',
+  'tools.read({path,offset?,limit?,numbered?}) (numbered:true -> "N: text" lines with real line numbers). tools.revision({path}) -> 16-hex sha256 prefix of the file content; pass it as expectedRevision to tools.edit (or as {path: revision} to tools.replace) to get STALE and write nothing if the content changed since (works across run_code calls). tools.write({path,content}); tools.edit({path,old,new,all?,expect?,expectedRevision?}) -> {replaced,lines} (atomic; the mtime STALE check still applies only if this same program read the file first; expectedRevision adds a cross-call content check; revision-guarded writes also take a cross-process lock (one writer at a time; LOCKED after ~2 s, a lock left by a crash is taken over after 30 s); with all:true pass expect:<count you mean to change>, a different count writes nothing and throws COUNT_MISMATCH).',
   'tools.glob({pattern?:string|string[],path?,sort?:"path"|"modified",details?,offset?,limit?=5000}) and tools.grep({pattern,path?,glob?,ignoreCase?,outputMode?:"content"|"files_with_matches"|"count",before?,after?,multiline?,offset?=0,limit?=500}) -> {items,total,complete,nextOffset} (ripgrep: .gitignore honoured; skips hidden, node_modules, target, .venv, files>2MB). glob items: path, or {path,size,mtime} with details. grep items: {file,line,text<=300} (+uncounted context:true rows), {file,count}, or paths.',
-  'tools.replace({pattern(JS regex; lookaround, \\1, named groups ok),replacement($1 ok),path?,glob?,flags?,dryRun?,maxReplacements?,expect?}) -> {files,matches,changed,items:[{file,count,lines}],dryRun} (expect: total matches you mean to change; a different count writes nothing and throws COUNT_MISMATCH). Any write that changed several places is listed at the top of the output with its line numbers: check each one was intended.',
+  'tools.replace({pattern(JS regex; lookaround, \\1, named groups ok),replacement($1 ok),path?,glob?,flags?,dryRun?,maxReplacements?,expect?,expectedRevision?}) -> {files,matches,changed,items:[{file,count,lines}],dryRun} (expect: total matches you mean to change; a different count writes nothing and throws COUNT_MISMATCH). Any write that changed several places is listed at the top of the output with its line numbers: check each one was intended.',
   'tools.batch({action:"plan"|"run"|"resume"|"list",operations:[{op:"copy"|"move"|"remove",path,to?}],protect?:string[],root?,toRoot?,id?}): root-relative "/" paths (to is relative to toRoot if given: another dir/drive), <=512 ops, no overwrite, destination parent must exist, no links, protect untouched; preflighted first. plan only journals; run needs operations; resume takes only id (unknown items: checked, not redone); list shows jobs. -> {id,status:"completed"|"partial"|"failed"|"planned",done,failed,unknown,total,detailsRef}.',
-  'tools.bash({command,cwd?,timeoutMs?,env?,background?})->{code,stdout,stderr}; background:true returns {id} immediately, then tools.job({id,wait?,tailChars?=4000})->{done,code,stdout,stderr} (jobs survive run_code calls; 2h cap). await tools.parallel([{command,cwd?,timeoutMs?,env?}],{concurrency?=4,<=16}) runs <=64 bash calls -> [{code,stdout,stderr,timedOut?}] in order. Child processes default to PYTHONUTF8=1 and PYTHONIOENCODING=utf-8; an explicit env wins.',
+  'tools.bash({command,cwd?,timeoutMs?,env?,background?})->{code,stdout,stderr}; background:true returns {id} immediately, then tools.job({id,wait?,tailChars?=4000})->{done,code,stdout,stderr} (jobs survive run_code calls; 2h cap). await tools.parallel([{command,cwd?,timeoutMs?,env?}],{concurrency?=4,<=16}) runs <=64 bash calls -> [{code,stdout,stderr,timedOut?}] in order. Child processes default to PYTHONUTF8=1 and PYTHONIOENCODING=utf-8; an explicit env wins. tools.test({command,workdir?,timeoutMs?=300000,maxFailures?=10}) runs a test command through the same bash path -> {status:"passed"|"failed"|"error"|"timeout"|"unknown",exitCode,counts?,failures,tail?,error?,outputPath} (pytest/vitest/jest/node --test parsed conservatively): print that summary instead of piping test output; when status is "error", read error and tail, and outputPath is the path to the full output (read it with tools.read).',
   'ref.put(v)->id; ref.page(id,{offset,limit,fields,equals,maxBytes=16384})->{total,offset,items,nextOffset,complete,omitted} (OUTPUT_LIMIT if one row exceeds maxBytes; also reads detailsRef); ref.text(id,{from,to}) returns a slice of the saved text; ref.release(id). Refs: per session, 24h. Output over ~8000 chars (or maxChars, <=50000) keeps about the first 70% and last 30% (cut on line boundaries); the marker names the omitted output lines and the exact ref.text(id,{from,to}) call that returns them',
 ]
 const DESC = DESC_PARTS.join(' ')
@@ -54,7 +54,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'run_code',
       description: ro ? (sdkInPrompt ? DESC_SHORT_RO : DESC_RO) : sdkInPrompt ? DESC_SHORT : DESC,
-      isDeferred: true,
+      isDeferred: false,
       inputSchema: {
         type: 'object',
         properties: {
@@ -102,6 +102,8 @@ export const register: Register = on => {
       // keep the default scope
     }
     const timeoutMs = Math.min(Math.max(Math.trunc(input.timeoutMs ?? 300000), 1000), 1800000)
+    const readLimitRaw = ((await $.env.get('PTC_RUN_DSH_READ_LIMIT')) || '').trim()
+    const dshReadLimit = /^\d+$/.test(readLimitRaw) && Number(readLimitRaw) > 0 ? Number(readLimitRaw) : undefined
     const logName = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
     const readPartial = async () => {
       try {
@@ -123,7 +125,7 @@ export const register: Register = on => {
         (ro ? '\n（只读模式：不会修改项目文件）' : '') + '\n' + ops + '\n' + (parsed.out || '（无输出）')
     }
     try {
-      const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, logName, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
+      const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, logName, dshReadLimit, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
       const r = await $.process.run(['node', '-e', BOOT], {
         cwd,
         stdin: ro

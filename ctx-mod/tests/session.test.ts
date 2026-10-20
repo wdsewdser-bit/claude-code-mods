@@ -2471,8 +2471,10 @@ describe('a field too long for its row', () => {
     expect(tail).toContain('共 300000 字符')
     expect(tail.endsWith('xxxxxEND')).toBe(true)
     expect(tail).not.toContain('还有后续')
-    // The search only covers the head.
-    expect((await session.historyTool({ action: 'search', query: 'xxxEND' })).result).toBe('没有匹配。')
+    // The search reaches the overflow when the head does not match, and says where.
+    const found = (await session.historyTool({ action: 'search', query: 'xxxEND' })).result
+    expect(found).toContain('xxxEND')
+    expect(found).toContain('[overflow text offset=299994]')
   })
 
   test('reads across a part boundary, and a pair that straddles it stays whole', async () => {
@@ -2517,6 +2519,33 @@ describe('a field too long for its row', () => {
     expect(lost).toContain('yyyyyyyy')
   })
 
+  test('search skips a missing part and says which one instead of failing', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 't1', role: 'tool', tool: 'Read', text: `${'y'.repeat(249_990)}SEARCH-ONLY` })
+    await session.flush()
+    box.files.delete(`${DIR}/big-1-text-0.txt`)
+
+    const found = await session.historyTool({ action: 'search', query: 'SEARCH-ONLY' })
+    expect(found.isError).toBeUndefined()
+    expect(found.result).toContain('没有匹配')
+    expect(found.result).toContain('#1 的 overflow text 第 0 段文件缺失，已跳过')
+  })
+
+  test('search skips a truncated part and says it was cut short', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    const text = `${'y'.repeat(249_990)}TRUNCATED-TAIL`
+    await session.record({ uuid: 't1', role: 'tool', tool: 'Read', text })
+    await session.flush()
+    const path = `${DIR}/big-1-text-0.txt`
+    box.files.set(path, (box.files.get(path) ?? '').slice(0, 1000))
+
+    const found = await session.historyTool({ action: 'search', query: 'TRUNCATED-TAIL' })
+    expect(found.isError).toBeUndefined()
+    expect(found.result).toContain(`内容被截短（1000/${text.length} 字符）`)
+    expect(found.result).toContain('已跳过')
+  })
   test('a part that failed to write is reported, kept in memory and written by the next flush', async () => {
     const box = makeIo()
     let isBroken = true
@@ -2551,6 +2580,25 @@ describe('a field too long for its row', () => {
     const row = await session.record({ uuid: 'u2', role: 'user', text: '新' })
     expect(row.seq).toBe(5)
     expect(row.window).toBe(1)
+  })
+})
+
+describe('history write amplification counters', () => {
+  test('after several appends the physical bytes are at least the logical bytes', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    for (let index = 0; index < 5; index += 1) {
+      await session.record({ uuid: `u${index}`, role: 'user', text: `第 ${index} 行 ${'x'.repeat(200)}` })
+    }
+    await session.flush()
+
+    const line = session.historyWriteStats()
+    expect(line).toMatch(/^history 写入：逻辑 [\d.]+ KB \/ 实际 [\d.]+ KB（WAF=[\d.]+），写盘 \d+ 次/)
+    const logical = Number(/逻辑 ([\d.]+) KB/.exec(line)?.[1])
+    const physical = Number(/实际 ([\d.]+) KB/.exec(line)?.[1])
+    expect(logical).toBeGreaterThan(0)
+    expect(physical).toBeGreaterThanOrEqual(logical)
+    expect(Number(/写盘 (\d+) 次/.exec(line)?.[1])).toBeGreaterThan(0)
   })
 })
 
