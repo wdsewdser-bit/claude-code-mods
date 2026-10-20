@@ -81,6 +81,28 @@ const fileAt = (w: World, tail: string): string | undefined => {
   return undefined
 }
 
+/** All history rows of one window, legacy parts and per-record segments alike, in seq order. */
+const historyText = (w: World, window: number): string => {
+  const head = `history-w${String(window).padStart(3, '0')}`
+  const rows: { seq: number; line: string }[] = []
+  for (const [path, text] of w.files) {
+    const name = path.slice(path.lastIndexOf('/') + 1)
+    if (!name.startsWith(head)) continue
+    const rest = name.slice(head.length)
+    if (!rest.startsWith('.') && !rest.startsWith('-')) continue
+    if (!name.endsWith('.jsonl')) continue
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue
+      try {
+        const row = JSON.parse(line) as { seq?: number }
+        rows.push({ seq: typeof row.seq === 'number' ? row.seq : 0, line })
+      } catch {
+        // A damaged line is not a row, as on disk.
+      }
+    }
+  }
+  return rows.sort((left, right) => left.seq - right.seq).map(row => row.line).join('\n')
+}
 const namesEndingWith = (w: World, tail: string): string[] =>
   [...w.files.keys()].filter(path => path.endsWith(tail))
 
@@ -475,7 +497,7 @@ test('armed, a tool result row is numbered and its text reaches the window shard
   const stored = await toolResult($, 'tu-read', 'row-1', 'the file body')
   expect(JSON.stringify(stored)).toContain('[#1]')
   await w.clock.settle()
-  const shard = fileAt(w, 'history-w001.jsonl')
+  const shard = historyText(w, 1)
   expect(shard).toBeDefined()
   expect(shard ?? '').toContain('the file body')
 })
@@ -506,7 +528,7 @@ test('armed, a prompt row that was never submitted is not a person request', asy
   expect(booked.isError).not.toBe(true)
   await w.clock.settle()
   expect(requestRefs(w)).toEqual([0])
-  expect(fileAt(w, 'history-w001.jsonl') ?? '').not.toContain('isPerson')
+  expect(historyText(w, 1) ?? '').not.toContain('isPerson')
   const named = await callTool(
     $,
     ledger({ tool_use_id: 'ledger-stray-2', task_id: 't1', title: '解析器', status: 'in_progress', text: '继续', next_step: '接着做', request_ref: 1 }),
@@ -535,7 +557,7 @@ test('armed, history filters by tool_name and never by the envelope tool', async
 
 test('armed, context new is approved on urgent fill; calls of the same step run, later steps are refused', async ($, on) => {
   const w = world(on, 's-switch', { CTX_MOD: '1' })
-  w.usage.tokens = 340_000
+  w.usage.tokens = 350_000
   await boot($)
   await armedWithFreshLedger($, '先看一眼上下文')
   const approved = await callTool($, { tool: 'mcp__ctx-mod__context', tool_use_id: 'ctx-1', action: 'new' })
@@ -665,7 +687,7 @@ test('armed, a deferred tool loaded and used but never measured as a rebuild is 
   await callTool($, { tool: 'mcp__computer-use__screenshot', tool_use_id: 'tu-shot' })
   await toolResult($, 'tu-shot', 'row-shot', 'screen captured')
   await w.clock.settle()
-  const shard = fileAt(w, 'history-w001.jsonl') ?? ''
+  const shard = historyText(w, 1) ?? ''
   expect(shard).toContain('已加载：mcp__computer-use__screenshot、WebFetch')
   expect(shard).toContain('"loaded":["mcp__computer-use__screenshot","WebFetch"]')
 
@@ -779,7 +801,7 @@ const bookable = async ($: Engine, w: World, id: string): Promise<boolean> => {
   expect(booked.isError).not.toBe(true)
   await w.clock.settle()
 
-  return (requestRefs(w).at(-1) ?? 0) !== 0 && (fileAt(w, 'history-w001.jsonl') ?? '').includes('"isPerson":true')
+  return (requestRefs(w).at(-1) ?? 0) !== 0 && (historyText(w, 1) ?? '').includes('"isPerson":true')
 }
 
 const promptFrom = async ($: Engine, text: string, id: string, origin: { kind: string }): Promise<void> => {
@@ -849,7 +871,7 @@ test('armed, a coordinator’s hand-off is a task’s source but nobody’s requ
 
   await w.clock.settle()
   expect(requestRefs(w)).toEqual([1, 1])
-  const shard = fileAt(w, 'history-w001.jsonl') ?? ''
+  const shard = historyText(w, 1) ?? ''
   expect(shard).toContain('"origin":"unclassified"')
   expect(shard).not.toContain('"isPerson":true')
 
@@ -935,7 +957,7 @@ test('armed, a queued_command typed mid-turn that opens with a tag is the person
     'r-qt',
   )
   await w.clock.settle()
-  expect(fileAt(w, 'history-w001.jsonl') ?? '').toContain('"isPerson":true')
+  expect(historyText(w, 1) ?? '').toContain('"isPerson":true')
   expect(await bookable($, w, 'qt')).toBe(true)
 })
 
@@ -1015,7 +1037,7 @@ test('armed, an automatic compaction with a stale ledger keeps core and adds the
 
 test('armed, the turn after an approved switch runs the compact command', async ($, on) => {
   const w = world(on, 's-turn', { CTX_MOD: '1' })
-  w.usage.tokens = 340_000
+  w.usage.tokens = 350_000
   await boot($)
   await armedWithFreshLedger($, '先看一眼上下文')
   const approved = await callTool($, { tool: 'mcp__ctx-mod__context', tool_use_id: 'ctx-1', action: 'new' })
@@ -1026,7 +1048,7 @@ test('armed, the turn after an approved switch runs the compact command', async 
 
 test('armed, a compact that threw leaves the next tool call free', async ($, on) => {
   const w = world(on, 's-threw', { CTX_MOD: '1' })
-  w.usage.tokens = 340_000
+  w.usage.tokens = 350_000
   w.runError = new Error('the compact command blew up')
   await boot($)
   await armedWithFreshLedger($, '先看一眼上下文')
@@ -1145,7 +1167,7 @@ test('armed, the conversation the mod never saw is imported when the session ope
   await w.clock.settle()
   const found = await callTool($, history({ tool_use_id: 'hist-old', action: 'search', query: '解析器改严' }))
   expect(textOf(found)).toContain('早先的请求：把解析器改严一点')
-  expect(fileAt(w, 'history-w001.jsonl')).toContain('把解析器改严')
+  expect(historyText(w, 1)).toContain('把解析器改严')
 })
 
 test('armed, /ctx-mod switch answers at once and asks for the compaction on the clock', async ($, on) => {
@@ -1215,7 +1237,7 @@ test('armed, /ctx-mod switch with nothing to hand over changes no window', async
 // `command.run` alone, above. The test is kept here for when the bottom can.
 // test('armed, the compact the turn end ran is answered by the mod, not by core', async ($, on) => {
 //   const w = world(on, 's-turn-answer', { CTX_MOD: '1' })
-//   w.usage.tokens = 340_000
+//   w.usage.tokens = 350_000
 //   w.compactsOnRun = true
 //   await boot($)
 //   await armedWithFreshLedger($, '先看一眼上下文')
@@ -1505,7 +1527,7 @@ test('armed, rows from the other doors are filed with their door, and a notice i
   await otherDoor($, 'delivery', { type: 'user', role: 'user', content: [] }, 'r-6')
   await w.clock.settle()
 
-  const shard = fileAt(w, 'history-w001.jsonl') ?? ''
+  const shard = historyText(w, 1) ?? ''
   expect(shard).toContain('"door":"delivery"')
   expect(shard).toContain('"door":"compaction"')
   expect(shard).toContain('"name":"nested_memory"')
@@ -1536,18 +1558,18 @@ test('armed, a background attachment repeated unchanged in a window is filed onc
   await otherDoor($, 'attachment', styleText('BGSTYLE-A'), 'bg-2')
   await otherDoor($, 'attachment', styleText('BGSTYLE-A'), 'bg-3')
   await w.clock.settle()
-  expect(countOf(fileAt(w, 'history-w001.jsonl') ?? '', 'BGSTYLE-A')).toBe(1)
+  expect(countOf(historyText(w, 1) ?? '', 'BGSTYLE-A')).toBe(1)
 
   await otherDoor($, 'attachment', styleText('BGSTYLE-B'), 'bg-4')
   await w.clock.settle()
-  const shard = fileAt(w, 'history-w001.jsonl') ?? ''
+  const shard = historyText(w, 1) ?? ''
   expect(countOf(shard, 'BGSTYLE-A')).toBe(1)
   expect(countOf(shard, 'BGSTYLE-B')).toBe(1)
 
   // Back to the first body: it is not the last one filed any more, so it is a change.
   await otherDoor($, 'attachment', styleText('BGSTYLE-A'), 'bg-5')
   await w.clock.settle()
-  expect(countOf(fileAt(w, 'history-w001.jsonl') ?? '', 'BGSTYLE-A')).toBe(2)
+  expect(countOf(historyText(w, 1) ?? '', 'BGSTYLE-A')).toBe(2)
 })
 
 test('armed, the same background body is filed again the first time it shows in a new window', async ($, on) => {
@@ -1562,8 +1584,8 @@ test('armed, the same background body is filed again the first time it shows in 
   await otherDoor($, 'attachment', styleText('BGSTYLE-W'), 'bg-w2')
   await otherDoor($, 'attachment', styleText('BGSTYLE-W'), 'bg-w3')
   await w.clock.settle()
-  expect(countOf(fileAt(w, 'history-w001.jsonl') ?? '', 'BGSTYLE-W')).toBe(1)
-  expect(countOf(fileAt(w, 'history-w002.jsonl') ?? '', 'BGSTYLE-W')).toBe(1)
+  expect(countOf(historyText(w, 1) ?? '', 'BGSTYLE-W')).toBe(1)
+  expect(countOf(historyText(w, 2) ?? '', 'BGSTYLE-W')).toBe(1)
 })
 
 test('armed, only background rows are deduplicated: identical deliveries are all filed', async ($, on) => {
@@ -1573,7 +1595,7 @@ test('armed, only background rows are deduplicated: identical deliveries are all
   await otherDoor($, 'delivery', delivery, 'd-1')
   await otherDoor($, 'delivery', delivery, 'd-2')
   await w.clock.settle()
-  expect(countOf(fileAt(w, 'history-w001.jsonl') ?? '', 'DELIVERED-SAME')).toBe(2)
+  expect(countOf(historyText(w, 1) ?? '', 'DELIVERED-SAME')).toBe(2)
 })
 
 test('armed, a message typed mid-turn that arrives as a queued_command is the person’s own request', async ($, on) => {
@@ -1588,7 +1610,7 @@ test('armed, a message typed mid-turn that arrives as a queued_command is the pe
   )
   // The words are the person's own in the row, not the engine's wrapper around them.
   await w.clock.settle()
-  const shard = fileAt(w, 'history-w001.jsonl') ?? ''
+  const shard = historyText(w, 1) ?? ''
   expect(shard).toContain('"isPerson":true')
   expect(shard).toContain('"name":"queued_command"')
   expect(shard).not.toContain('用户在回合中追加')
@@ -1615,7 +1637,7 @@ test('armed, a mid-turn message the engine files under the delivery door is the 
     'r-qd',
   )
   await w.clock.settle()
-  const rows = (fileAt(w, 'history-w001.jsonl') ?? '')
+  const rows = (historyText(w, 1) ?? '')
     .split('\n')
     .filter(line => line.includes('"name":"queued_command"'))
     .map(line => JSON.parse(line) as { isPerson?: boolean; door?: string; text?: string })
@@ -1635,7 +1657,7 @@ test('armed, a queued_command that matches no submitted words is an ordinary row
     'r-n',
   )
   await w.clock.settle()
-  const shard = fileAt(w, 'history-w001.jsonl') ?? ''
+  const shard = historyText(w, 1) ?? ''
   expect(shard).toContain('task-notification')
   expect(shard).not.toContain('isPerson')
   const booked = await callTool(
@@ -1665,7 +1687,7 @@ test('armed, an Agent task and a long command are kept whole and read back with 
   const bash = textOf(await callTool($, history({ tool_use_id: 'hist-b', action: 'read', seq: 2, field: 'input' })))
   expect(bash).toContain('only-in-the-command')
   expect(await searchHistory($, { query: 'only-in-the-task-text' })).toContain('#1 w1 tool [Agent]')
-  expect(fileAt(w, 'history-w001.jsonl')).toContain('"callId":"tu-agent"')
+  expect(historyText(w, 1)).toContain('"callId":"tu-agent"')
 })
 
 test('armed, a tool result with an image leaves a note in the row', async ($, on) => {
@@ -1679,7 +1701,7 @@ test('armed, a tool result with an image leaves a note in the row', async ($, on
     uuid: 'row-img',
   })
   await w.clock.settle()
-  expect(fileAt(w, 'history-w001.jsonl')).toContain('[非文本内容：image×1]')
+  expect(historyText(w, 1)).toContain('[非文本内容：image×1]')
 })
 
 test('armed, the engine messages after the last recorded one are filed when the session opens again', async ($, on) => {

@@ -23,15 +23,21 @@ export const limitOf = (autoCompactThreshold: number | undefined, config: Config
 export const percentOf = (tokens: number, limit: number): number =>
   limit <= 0 ? 0 : Math.floor((tokens / limit) * 100)
 
+/** No reminder may sit closer than this to the limit: the ledger entries and the switch need the room. */
+const REMINDER_MARGIN = 30_000
+
+/** A configured fill, held at least REMINDER_MARGIN below the limit. */
+const fillOf = (configured: number, limit: number): number =>
+  Math.max(1, Math.min(configured, limit - REMINDER_MARGIN))
+
 /**
- * How loud the reminder is: a high percent outranks a task boundary, and the
- * boundary only counts once there are enough tokens for a switch to be worth it.
+ * How loud the reminder is: absolute fills, so the same thresholds hold at any
+ * limit, with a high fill outranking a task boundary.
  */
 export const levelOf = (tokens: number, limit: number, config: Config): Level => {
-  const percent = percentOf(tokens, limit)
-  if (percent >= config.urgentPct) return 'urgent'
-  if (percent >= config.softPct) return 'soft'
-  if (percent >= config.boundaryPct) return 'boundary'
+  if (tokens >= fillOf(config.urgentTokens, limit)) return 'urgent'
+  if (tokens >= fillOf(config.softTokens, limit)) return 'soft'
+  if (tokens >= fillOf(config.boundaryTokens, limit)) return 'boundary'
 
   return 'none'
 }

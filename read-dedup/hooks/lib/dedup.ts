@@ -42,6 +42,36 @@ export function normPath(p: unknown): string | undefined {
   return isDrive || isUnc ? s.toLowerCase() : s
 }
 
+/**
+ * Absolute or cwd-relative path -> an absolute path with slashes unified and '.'/'..' resolved, case kept
+ * (normPath folds case for the comparison key). Undefined when it cannot be made absolute.
+ */
+export function resolvePath(cwd: unknown, p: unknown): string | undefined {
+  if (typeof p !== 'string' || p === '') return undefined
+  const s = p.replace(/\\/g, '/')
+  const isAbs = /^[A-Za-z]:\//.test(s) || s.startsWith('//') || s.startsWith('/')
+  let full: string
+  if (isAbs) full = s
+  else {
+    if (typeof cwd !== 'string' || cwd === '') return undefined
+    full = cwd.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + s
+  }
+  const drive = /^[A-Za-z]:/.exec(full)
+  const unc = drive === null && full.startsWith('//')
+  const prefix = drive !== null ? full.slice(0, 2) : unc ? '//' : ''
+  const out: string[] = []
+  for (const seg of full.slice(prefix.length).split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') {
+      out.pop()
+      continue
+    }
+    out.push(seg)
+  }
+  if (out.length === 0 && prefix === '') return '/'
+  return prefix + '/' + out.join('/')
+}
+
 // ---------- parsing ----------
 
 /**
@@ -374,4 +404,32 @@ export function resultStillHolds(text: string, probe: string): boolean {
   if (text.trim() === '') return false
   if (CLEARED.test(text)) return false
   return probe === '' || text.includes(probe)
+}
+
+/** Text of a tool_result block's content (string or text blocks). */
+function blockText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.map(c => (c && typeof c === 'object' && typeof (c as { text?: unknown }).text === 'string' ? (c as { text: string }).text : '')).join('')
+}
+
+/** Whether every tool_use_id in `ids` still has its (uncleared) result in the Messages-API rows `messages`. */
+export function contextHasResults(messages: unknown[], ids: string[], probes: Map<string, string>): boolean {
+  const want = new Set(ids)
+  if (want.size === 0) return true
+  const ok = new Set<string>()
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue
+    const msg = m as { role?: unknown; content?: unknown }
+    if (msg.role !== 'user' || !Array.isArray(msg.content)) continue
+    for (const block of msg.content) {
+      if (!block || typeof block !== 'object') continue
+      const b = block as { type?: unknown; tool_use_id?: unknown; is_error?: unknown; content?: unknown }
+      if (b.type !== 'tool_result') continue
+      const tid = b.tool_use_id
+      if (typeof tid !== 'string' || !want.has(tid) || b.is_error === true) continue
+      if (resultStillHolds(blockText(b.content), probes.get(tid) ?? '')) ok.add(tid)
+    }
+  }
+  return ok.size === want.size
 }

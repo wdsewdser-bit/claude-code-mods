@@ -84,6 +84,12 @@
       "description": "Show the keeper's state in the status line.",
       "default": true
     },
+    "shadowMode": {
+      "type": "boolean",
+      "title": "Shadow mode (record, never send)",
+      "description": "Record each keepalive the keeper would have sent as a would_have_keepalive event, and record the real gap until the next request, without sending anything. Off by default; existing keepalive behavior is unchanged.",
+      "default": false
+    },
     "bridgeEnabled": {
       "type": "boolean",
       "title": "Quota bridge",

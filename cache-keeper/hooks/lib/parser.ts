@@ -1,4 +1,10 @@
 import type { CacheSplit, Usage } from './pricing.ts'
+import {
+  applyPrefixRow,
+  initialPrefix,
+  prefixSnapshot,
+} from './prefix.ts'
+import type { PrefixSnapshot } from './prefix.ts'
 
 /** One model request, as the transcript's rows for it agree on it. */
 export type TranscriptRequest = {
@@ -16,6 +22,12 @@ export type TranscriptRequest = {
   split: CacheSplit | null
   isSplitConsistent: boolean
   cacheMissReason: string | null
+  /** Tokens the engine says this miss cost, when it said so. */
+  cacheMissedTokens: number | null
+  /** Order of the request's first assistant row in the transcript. */
+  order: number
+  /** The prefix as it stood just before the request. */
+  prefix: PrefixSnapshot
   rowCount: number
 }
 
@@ -49,9 +61,14 @@ type Candidate = {
   isTopNonZero: boolean
   isConsistent: boolean
   signature: string
+  prefix: PrefixSnapshot
 }
 
-const readCandidate = (row: Row, order: number): Candidate | undefined => {
+const readCandidate = (
+  row: Row,
+  order: number,
+  prefix: PrefixSnapshot,
+): Candidate | undefined => {
   const message = row.message
   if (!isRecord(message) || !isRecord(message.usage)) return undefined
   if (message.model === '<synthetic>') return undefined
@@ -91,6 +108,7 @@ const readCandidate = (row: Row, order: number): Candidate | undefined => {
       split === null ||
       Math.abs(usage.cache_creation_input_tokens - splitTotal) <= 1,
     signature: JSON.stringify([usage, split]),
+    prefix,
   }
 }
 
@@ -106,17 +124,33 @@ const better = (a: Candidate, b: Candidate): Candidate => {
   return a.order > b.order ? a : b
 }
 
-const missReason = (candidate: Candidate): string | null => {
+type MissInfo = { type: string | null; missedTokens: number | null }
+
+const missReasonOf = (candidate: Candidate): MissInfo => {
   const diagnostics = candidate.message.diagnostics
   if (isRecord(diagnostics)) {
-    const found = text(diagnostics.cache_miss_reason)
-    if (found !== null) return found
+    const raw = diagnostics.cache_miss_reason
+    const found = text(raw)
+    if (found !== null) return { type: found, missedTokens: null }
+    // Newer engines write an object here: { type, cache_missed_input_tokens }.
+    if (isRecord(raw)) {
+      const type = text(raw.type)
+      const missed = raw.cache_missed_input_tokens
+      if (type !== null) {
+        return {
+          type,
+          missedTokens:
+            typeof missed === 'number' && Number.isFinite(missed) ? missed : null,
+        }
+      }
+    }
   }
 
-  return (
-    text(candidate.row.cache_miss_reason) ??
-    text(candidate.row.cacheMissReason)
-  )
+  const top =
+    text(candidate.row.cache_miss_reason) ?? text(candidate.row.cacheMissReason)
+  if (top !== null) return { type: top, missedTokens: null }
+
+  return { type: null, missedTokens: null }
 }
 
 /**
@@ -129,6 +163,7 @@ export const parseTranscript = (jsonl: string): ParseResult => {
   let assistantRows = 0
   let parseErrors = 0
   let order = 0
+  let prefix = initialPrefix()
   for (const line of jsonl.split('\n')) {
     if (line.trim() === '') continue
     let row: unknown
@@ -138,8 +173,10 @@ export const parseTranscript = (jsonl: string): ParseResult => {
       parseErrors += 1
       continue
     }
-    if (!isRecord(row) || row.type !== 'assistant') continue
-    const candidate = readCandidate(row, order)
+    if (!isRecord(row)) continue
+    prefix = applyPrefixRow(prefix, row)
+    if (row.type !== 'assistant') continue
+    const candidate = readCandidate(row, order, prefixSnapshot(prefix))
     order += 1
     if (candidate === undefined) continue
     assistantRows += 1
@@ -159,6 +196,8 @@ export const parseTranscript = (jsonl: string): ParseResult => {
   let inconsistentUsageCount = 0
   for (const [key, group] of groups) {
     const chosen = group.reduce(better)
+    const first = group[0] ?? chosen
+    const miss = missReasonOf(chosen)
     const informative = group.filter(one => one.isTopNonZero)
     if (new Set(informative.map(one => one.signature)).size > 1) {
       dedupeWarningCount += 1
@@ -188,7 +227,10 @@ export const parseTranscript = (jsonl: string): ParseResult => {
         : chosen.usage,
       split: chosen.split,
       isSplitConsistent: chosen.isConsistent && !isZeroedWrite,
-      cacheMissReason: missReason(chosen),
+      cacheMissReason: miss.type,
+      cacheMissedTokens: miss.missedTokens,
+      order: first.order,
+      prefix: first.prefix,
       rowCount: group.length,
     })
   }

@@ -61,22 +61,28 @@ describe('usage arithmetic', () => {
     expect(percentOf(1_000, 0)).toBe(0)
   })
 
-  test('levelOf steps through none, boundary, soft and urgent at their edges', () => {
-    const at = (tokens: number): Level => levelOf(tokens, LIMIT, DEFAULTS)
-    // boundary is 75% of 367k, soft 83%, urgent 88%.
+  test('levelOf steps through none, boundary, soft and urgent at their absolute fills', () => {
+    // At a 400k limit none of the fills is capped, so these are the configured numbers.
+    const at = (tokens: number): Level => levelOf(tokens, 400_000, DEFAULTS)
     expect(at(0)).toBe('none')
-    expect(at(275_249)).toBe('none')
-    expect(at(275_250)).toBe('boundary')
-    expect(at(304_609)).toBe('boundary')
-    expect(at(304_610)).toBe('soft')
-    expect(at(322_959)).toBe('soft')
-    expect(at(322_960)).toBe('urgent')
-    // At the 400k limit a 433k compaction window gives: 300k, 332k and 352k.
-    expect(levelOf(299_999, 400_000, DEFAULTS)).toBe('none')
-    expect(levelOf(300_000, 400_000, DEFAULTS)).toBe('boundary')
-    expect(levelOf(332_000, 400_000, DEFAULTS)).toBe('soft')
-    expect(levelOf(352_000, 400_000, DEFAULTS)).toBe('urgent')
-    expect(at(367_000)).toBe('urgent')
+    expect(at(249_999)).toBe('none')
+    expect(at(250_000)).toBe('boundary')
+    expect(at(299_999)).toBe('boundary')
+    expect(at(300_000)).toBe('soft')
+    expect(at(349_999)).toBe('soft')
+    expect(at(350_000)).toBe('urgent')
+    expect(at(400_000)).toBe('urgent')
+  })
+
+  test('no fill sits closer than 30k to the limit', () => {
+    // A 300k limit caps soft and urgent at 270k, so 270k is already urgent.
+    expect(levelOf(249_999, 300_000, DEFAULTS)).toBe('none')
+    expect(levelOf(250_000, 300_000, DEFAULTS)).toBe('boundary')
+    expect(levelOf(269_999, 300_000, DEFAULTS)).toBe('boundary')
+    expect(levelOf(270_000, 300_000, DEFAULTS)).toBe('urgent')
+    // A 280k limit caps every fill at 250k: the first one is urgent.
+    expect(levelOf(249_999, 280_000, DEFAULTS)).toBe('none')
+    expect(levelOf(250_000, 280_000, DEFAULTS)).toBe('urgent')
   })
 
   test('describeFill names the window even without a token count', () => {
@@ -93,17 +99,19 @@ describe('judgeSwitch', () => {
   test('prices the saving per request against the cost of rebuilding the cache', () => {
     const at3 = judgeSwitch({ ...base, remainingRequests: 3 }, DEFAULTS)
     expect(at3.savingPerRequest).toBe(6_500)
-    expect(at3.switchCost).toBe(15_000)
-    expect(at3.breakEvenRequests).toBe(15_000 / 6_500)
-    expect(Math.round(at3.breakEvenRequests * 10_000) / 10_000).toBe(2.3077)
+    // A write is billed at 1.25: 15k tokens of handoff and reread.
+    expect(at3.switchCost).toBe(18_750)
+    expect(at3.breakEvenRequests).toBe(18_750 / 6_500)
+    expect(Math.round(at3.breakEvenRequests * 10_000) / 10_000).toBe(2.8846)
     expect(at3.isWorth).toBe(false)
     expect(at3.reason).toContain('6500')
-    expect(at3.reason).toContain('15000')
+    expect(at3.reason).toContain('18750')
 
-    const at4 = judgeSwitch({ ...base, remainingRequests: 4 }, DEFAULTS)
-    expect(at4.isWorth).toBe(true)
-    // 4 requests is past 2.31 break-even but not past 2.31 * 1.5 = 3.46.
-    expect(Math.round(at4.breakEvenRequests * DEFAULTS.breakEvenSafety * 10_000) / 10_000).toBe(3.4615)
+    // 4 requests is past 2.88 break-even but not past 2.88 * 1.5 = 4.33.
+    expect(judgeSwitch({ ...base, remainingRequests: 4 }, DEFAULTS).isWorth).toBe(false)
+    const at5 = judgeSwitch({ ...base, remainingRequests: 5 }, DEFAULTS)
+    expect(at5.isWorth).toBe(true)
+    expect(Math.round(at5.breakEvenRequests * DEFAULTS.breakEvenSafety * 10_000) / 10_000).toBe(4.3269)
   })
 
   test('a switch that saves nothing never pays off', () => {
@@ -115,7 +123,7 @@ describe('judgeSwitch', () => {
     // A thin saving still needs its 600 requests back, so it stays not worth it.
     const thin = judgeSwitch({ ...base, before: 41_000, remainingRequests: 100 }, DEFAULTS)
     expect(thin.savingPerRequest).toBe(25)
-    expect(thin.breakEvenRequests).toBe(600)
+    expect(thin.breakEvenRequests).toBe(750)
     expect(thin.isWorth).toBe(false)
   })
 })

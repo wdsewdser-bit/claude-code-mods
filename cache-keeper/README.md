@@ -110,6 +110,39 @@ node scripts/analyze-transcript.ts <session.jsonl>
 node scripts/analyze-transcript.ts --report <dataDir>
 ```
 
+## 解释一次缓存未命中（CACHE-01）
+
+```bash
+node scripts/explain-cache.ts <session.jsonl>            # 或 --session <id> 在 ~/.claude/projects 下找
+node scripts/explain-cache.ts <session.jsonl> --json     # 机器可读
+node scripts/explain-cache.ts <session.jsonl> --tail 20  # 只看最后 20 个请求
+```
+
+逐个请求列出：工具清单 hash、系统提示 hash / 字符数、插件集 hash（MCP + skills，能拿到多少算多少）、`cache_read` / `cache_creation`、缓存是否命中、距上次请求的间隔、TTL，以及未命中的原因。原因分三级：
+
+- **observed**：transcript 里直接可见。`message.diagnostics.cache_miss_reason`、工具清单 hash 变化、系统提示 hash 变化、插件集 hash 变化、`previous_message_not_found`（服务端驱逐）。
+- **inferred**：只能推断。距上次请求超过 TTL、模型变化、客户端版本变化。
+- **unknown**：没有可见原因，或该会话的 transcript 根本没带前缀信息。拿不到的字段标 `unknown`，不猜。
+
+hash 的输入是 transcript 里的 `prompt_snapshot`、`deferred_tools_record` / `deferred_tools_delta`、`mcp_instructions_delta`、`skill_listing`。没有工具定义时工具 hash 按名字算（`toolHashBasis: names`），两者都没有就是 `none`；插件集同理（`mcp+skills` / `mcp` / `skills` / `none`）。系统提示只存 hash 和长度，不存正文。
+
+## 影子模式与净收益（CACHE-02）
+
+`shadowMode`（默认 `false`）：不发送任何保活请求，只把"这次本该保活"记成 `kind: shadow` / `result: would_have_keepalive` 的事件；用户下一次请求到来时再记一行 `kind: recovery`，带 `shadow_recovery_sec`（距上一次请求的真实间隔）。影子模式不改动真实保活的状态（`lastActivityAt`、`idleKeepalives`、失败计数、暂停原因），关掉开关后行为与原来一致；子代理的 would-have 也会记录（带 `agent_id`）。
+
+统计脚本（Node 24+，只读 transcript，可选读事件目录）：
+
+```bash
+node scripts/keepalive-net.ts                                   # 最近 200 个转录
+node scripts/keepalive-net.ts --sort size --max-files 40        # 最长的会话
+node scripts/keepalive-net.ts --events ~/.claude/cache-keeper   # 附带影子事件统计
+node scripts/keepalive-net.ts --prices '[["opus-5-5",{"input":4,"write5m":5,"write1h":8,"read":0.2,"output":20}]]'
+```
+
+对每一对相邻请求：间隔超过 TTL、前缀 ≥ `--min-prefix`（默认 40000）才计入；按 keeper 的阈值（5m 245 s / 1h 3120 s）模拟最多 `--max-idle` 次保活。省下的钱 = 下一次请求实际写入的 `cache_creation_input_tokens` ×（写价 − 读价），且只在下一次请求没有命中缓存时计；成本 = 每次保活按读价读整段前缀 + 少量输入/输出。价格是 API 等价 USD / 百万 token，默认值在脚本顶部，来源 platform.claude.com/docs/en/about-claude/pricing（2026-10-08 读取），可用 `--prices` 覆盖。
+
+大转录默认按 `--max-bytes`（12 MB）和 `--max-total-bytes`（200 MB）跳过，跳过的数量会打印出来；要覆盖更多就调大这两个值。`--ttl auto` 用线程里最后一次可见的 5m/1h 拆分，mixed 按 1h；没有拆分时按 5m，并在输出里给出 `ttlDefaultedGaps`。
+
 ## 已知限制
 
 - fork 请求不写进 transcript，所以 keeper 行拿不到 5m/1h 拆分；它极少写缓存，写了就按该 session 的 TTL 计价（`cost_basis` 会标 `assumed-*`）。
