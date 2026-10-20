@@ -28,7 +28,7 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 | PTC-07 | grep 结果 queryRef 分页 + 快照指纹，文件变了标 snapshot_stale | 大搜索翻页不重跑 rg | todo |
 | PTC-03 | （暂缓，不删）`tools.fanout` 有界并发（只读优先，bash 默认串行除非 readOnly），单项超时、取消、部分成功 | 并发/取消/partial 测试通过；混合任务耗时下降 | todo |
 | PTC-08 | `flow` DAG（dependsOn） | 先看 PTC-03 后模型是否常写依赖逻辑 | todo |
-| CTX-01b | 按 WAF 结果选追加写或小 segment + manifest | WAF 实降，迁移前后 seq 和 SHA-256 一致 | todo（A-04 建议改为追加写；要先确认 Mods API 能可靠追加） |
+| CTX-01b | 按 WAF 结果选追加写或小 segment + manifest | WAF 实降，迁移前后 seq 和 SHA-256 一致 | done（segment 滚动加 manifest，默认 K=8、B=1MiB；470 条记录时 WAF 141.6→4.96，5000 条冷启动 213ms（旧实现 136ms）；477 个测试全过，含换窗阈值调整） |
 | CTX-03 | context preview：换窗前检查覆盖清单；held.json 显式 recover | 换窗漏项可检出 | todo |
 
 
@@ -44,19 +44,42 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 | A-03 | CTX-02 规模：100、1000、10000 个 overflow 文件，测命中与未命中时的 p50/p95、损坏或缺失文件的情况、读盘字节数 | 延迟可控，不崩溃 | done（正确性：偏移抽样 20/20 正确；缺失、截短、不可读的 part 跳过并提示，之前不可读会让搜索 reject，已修。性能：10000 条超长记录时 p95 为 7–8 秒，但现实里几乎没有超长记录，暂不建索引） |
 | A-04 | CTX-01 采样：短会话、中会话、接近 2 MiB 分片的长会话，分别记录 WAF | 画出 WAF 和分片体积的关系 | done（基准结果：逐条落盘时长会话 WAF=182，每 50 条合并时 8.85；按分片大小分段，0–256K 为 26，1–2M 为 307。建议 CTX-01b 用追加写；报告 batchA\ctx-report.md） |
 | A-05 | 截断提示行改成不污染 lines（例如 kind:"notice"，或只出现在打印出来的文本里）；开关保持默认关闭 | 编辑和拼接时不会把提示行当成源码 | done（提示行改为 kind:"notice"、number:null，新增 content getter；默认关闭） |
-| OPS-02 | 实验完整性：result/grade 和副本放在不同目录；自动统计启动数、完成数、超时数；同时报告均值、中位数和 CI；超时样本计入 | 统计可以复现 | todo |
-| PTC-11 | 短读取策略提示（只改提示，不动 API），换成读取量大、评分不饱和的题，按时间块配对 | 质量不降，净费用下降 | todo |
+| OPS-02 | 实验完整性：result/grade 和副本放在不同目录；自动统计启动数、完成数、超时数；同时报告均值、中位数和 CI；超时样本计入 | 统计可以复现 | done（D:\ptcab\harness，regress 115/0；abrun 加 --parallel，同一时间块的 A/B 成对同时启动） |
+| PTC-11 | 短读取策略提示（只改提示，不动 API），换成读取量大、评分不饱和的题，按时间块配对 | 质量不降，净费用下降 | dropped（2026-10-20 第二版，DS flash，每组 n=20，按时间块配对，40/40 完成。B 相对 A：费用 +1.8%（p=0.84），分数 +3.9（p=0.46），输出 −18.6%（p=0.07），但调用 +18.4%、缓存读 +31.8%，把省下的输出抵消了。不省钱，不采用） |
 
 ## 第 3 批：观测与缓存
 | ID | 内容 | 状态 |
 |---|---|---|
-| CACHE-01 | cache explain：工具清单 hash、系统提示版本、插件集 hash、未命中原因（observed/inferred/unknown） | todo |
-| CACHE-02 | 保活 shadow 模式：记录 would_have_keepalive 和实际恢复间隔，算净收益 | todo |
-| DEDUP-01 | read-dedup 回归：外部修改、CRLF、软链接、大小写路径、重叠区间；记录 savedChars | todo |
+| CACHE-01 | cache explain：工具清单 hash、系统提示版本、插件集 hash、未命中原因（observed/inferred/unknown） | done（hooks/lib/explain.ts、prefix.ts 和 scripts/explain-cache.ts；94/94 测试通过） |
+| CACHE-02 | 保活 shadow 模式：记录 would_have_keepalive 和实际恢复间隔，算净收益 | done（shadowMode 默认 false；scripts/keepalive-net.ts 估算净收益 +$4.90，基于 34 个超过 TTL 的间隔，偏 Opus，样本不是随机抽的） |
+| DEDUP-01 | read-dedup 回归：外部修改、CRLF、软链接、大小写路径、重叠区间；记录 savedChars | done（28/28 通过；撤掉了 mtime 变化时强制返回原文的逻辑，保留 savedChars；新测试 tests/dedup01.test.ts） |
 | SEC-01 | 只读 broker：junction、网络出口、resume 继承配置 | todo |
+
+## 2026-10-20 新增
+| ID | 内容 | 状态 |
+|---|---|---|
+| CTX-03 | 换窗阈值改为 250/300/350K（上下文上限 433K，减去压缩预留后约 400K） | done |
+| EFF-01 | 自适应思考强度：常驻 low，模型用 effort 工具自己升到 high/xhigh，每轮开始重置，报错时至少 medium，上限 xhigh。已用真 haiku 证实切换 effort 不断缓存 | dropped（2026-10-20：真 haiku 三组题 A/B：ptc11v2 n=20 low 比 medium 省 18.4%、分数不降；三道算法题 pilot 全满分；两道 20 多个文件的遗留代码题 n=8 两边各 1 次同类失误，其余满分，low 省 15–42%。自适应插件 46 次运行从未升档、还有额外开销。改为 Haiku 执行类子代理默认 low。） |
+| FORK-01 | 读取量大的子任务放进 fork 子代理，读取结果留在 fork 里，主会话只收报告 | doing（真 haiku 实测：fork 第一次请求完整命中主会话前缀，只新写约 570 token。但 fork 固定继承主会话模型，每步都带全部上下文：比主会话自己做省约一半，比精简子代理（第一次请求 7–10K）和 DS 都贵。只适合需要上下文、不好写 brief 的排查，优先级降低。开关是 CLAUDE_CODE_FORK_SUBAGENT，本机 settings 设为 0） |
+| RED-01 | 大工具输出先交给 Haiku 压成带原文引用的回执（参照 SoL-Pi 的 Evidence-Preserving Reducer），引用逐字核对，不通过就保留原文 | dropped（2026-10-20：Top 30 会话里 232 个大输出只占 1.82M 字符，就算压缩免费，毛节省也只有总额度的 0.51%，净省 0.24–0.44%。注意：压缩率 7.5× 和核对通过率 90% 是 DS 环境里被映射成的 deepseek-v4.1-flash 跑出来的，不是 Haiku） |
+| REF-01 | 调研 SoL-Pi 的 Action Fusion、ObservationPack、Online Context Compact，以及 facebookresearch/context-language-models，判断能否移植 | done（ObservationPack：引擎在发请求前不能改写消息，订阅缓存写读比约 50，移植不了。Action Fusion：Edit→Bash 只占请求的 1.02%，不做。OCC：经济判断 ctx-mod 的 judgeSwitch 已经有了，可借鉴的是完成边界触发换窗，预期 0–3%，见 CTX-04。CLM：省钱靠服务端 KV 重定位，Claude 没有；它让模型自己写摘要也没赢过现成的摘要方案（47.3 对 47.8）。可借鉴的是入口截断加存盘（TRUNC-01）、预算提醒、交接加索引和勿重试清单） |
+| TRUNC-01 | session.append 入口截断大 Bash 输出：≥20KB 时留头 6KB 加尾 3KB，全文进 history，取回按 4KB 分页 | todo（估算：毛节省 6.5%，排除 cat/sed/head 后 5.1%，扣掉取回后 3.5–5.5%；样本混有 Read/MCP，偏乐观。40KB 阈值只有约 1.1%。PTC-10 的教训是截断读取会让调用次数变多，必须先过 A/B 闸门） |
+| CTX-04 | 换窗时机加上“账本任务完成”这个边界，参照 OCC：按边界间隔推算剩余请求数，缓存债务结转 | todo（预期 0–3%，主要改善切点质量） |
+| RD-02 | read-dedup 覆盖主会话 Bash 单条纯读取（cat / sed -n / head -n，可带 cd 前缀），与 Read 共用记录，只在范围完全相同且文件未改时替换，沿用 300 字符门槛 | done（2026-10-20：43/43；真实冒烟大文件第二次返回桩、小文件原样；转录统计这类重复约占 Claude 额度 0.35%） |
+| DLG-01 | delegate：resume 不传 mode/ptc 时沿用该代理上次的设置；启动前检查 cwd，不存在直接报错 | done（仅本地插件，不在本仓库；20/20） |
+| GUARD-01 | 子代理续用守门：新建时记下 ~/.claude/agents/<type>.md 的哈希，续用时（agent.spawn 的 e.resume）比对，变了就拒绝并提示新建 | todo（低优先级：缓存审计里改了代理工具后续用只占约 0.7%；接口拿不到工具列表，只能比对定义文件） |
+| AUD-01 | 审计（2026-10-20，近 15 天转录）：Claude 侧缓存未命中损失 5.6%（闲置超 1h 7.56M、换窗/压缩 2.56M、工具集变化 1.90M、fast 0.88M），未发现 CC 缓存 bug；无写入介入的重复读取 1.0%（同范围 0.27%），重复跑测试 0 次 | done |
 
 ## 已决定不做
 | ID | 原因 |
 |---|---|
 | MEM-01 Project Memory | 与 Claude Code 自带 auto-memory 重复 |
 | Rust 执行器 | 没有证据显示 Node I/O 是瓶颈 |
+| 用完即删（轮末删除旧读取结果） | 受插件接口限制，轮末删除只省 2–4% |
+| 入库时压缩 Bash 输出 | 预估只省约 1% |
+| 混合缓存 TTL | 订阅下 1h 和 5m 的缓存写权重都是 1.25，没有差价 |
+| caveman 式极限压缩子代理输出 | 子代理输出里可见文字只占约 9%（工具参数 70%、思考 21%），压到极限总体也省不到 1%，还可能影响质量和交接 |
+| 实时额度面板 | 用户认为没必要；需要时用一次性审计脚本 |
+| model.fork 旁路提问 | Claude Code 已有 /btw |
+| run_code 内读取去重 | 这类重复几乎都发生在 DS 会话，不占 Claude 额度 |
+| 工具参数无损压缩 | 工具收到的字符必须由模型逐字生成；大头是新文件和一次性脚本，只能靠复用脚本、少用 PowerShell 这类习惯改进 |

@@ -101,6 +101,8 @@ type Config = KeeperConfig & {
   writeCsv: boolean
   writeJson: boolean
   showStatus: boolean
+  /** Record keepalives instead of sending them. Off by default. */
+  shadowMode: boolean
 }
 
 type Tag = {
@@ -171,6 +173,14 @@ type Session = {
   isAnchor: boolean
   /** The expiry of an anchor's cache was already announced; not saved. */
   isAnchorExpiryNoted: boolean
+  /** Shadow mode: the simulated last request, advanced by would-have keepalives. */
+  shadowLastAt: number | null
+  /** Shadow mode: would-have keepalives in the current idle stretch. */
+  shadowKeepalives: number
+  /** Shadow mode: when the last would-have keepalive was due. */
+  shadowWouldHaveAt: number | null
+  /** Shadow mode: would-have keepalives recorded this session. */
+  shadowWouldHave: number
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -221,6 +231,7 @@ const readConfig = (options: PluginOptions): Config => ({
   writeCsv: booleanOf(options.writeCsv, true),
   writeJson: booleanOf(options.writeJson, true),
   showStatus: booleanOf(options.showStatus, true),
+  shadowMode: booleanOf(options.shadowMode, false),
 })
 
 const usageOf = (row: EventRow): Usage => ({
@@ -339,6 +350,10 @@ const boot = async ($: EngineInterface): Promise<Session> => {
     backgroundSeenAt: null,
     isAnchor: false,
     isAnchorExpiryNoted: false,
+    shadowLastAt: null,
+    shadowKeepalives: 0,
+    shadowWouldHaveAt: null,
+    shadowWouldHave: 0,
   }
   carriedEnabled = undefined
 
@@ -358,6 +373,12 @@ const boot = async ($: EngineInterface): Promise<Session> => {
     s.backgroundPending = numberOf(saved.backgroundPending, 0)
     s.backgroundSeenAt =
       typeof saved.backgroundSeenAt === 'number' ? saved.backgroundSeenAt : null
+    s.shadowLastAt =
+      typeof saved.shadowLastAt === 'number' ? saved.shadowLastAt : null
+    s.shadowKeepalives = numberOf(saved.shadowKeepalives, 0)
+    s.shadowWouldHaveAt =
+      typeof saved.shadowWouldHaveAt === 'number' ? saved.shadowWouldHaveAt : null
+    s.shadowWouldHave = numberOf(saved.shadowWouldHave, 0)
     if (isRecord(saved.bridge)) {
       const b = saved.bridge
       s.bridge = {
@@ -458,6 +479,10 @@ const save = async ($: EngineInterface, s: Session): Promise<void> => {
         isAnchor: s.isAnchor,
         backgroundPending: s.backgroundPending,
         backgroundSeenAt: s.backgroundSeenAt,
+        shadowLastAt: s.shadowLastAt,
+        shadowKeepalives: s.shadowKeepalives,
+        shadowWouldHaveAt: s.shadowWouldHaveAt,
+        shadowWouldHave: s.shadowWouldHave,
         bridge: s.bridge,
         cachedPrefixTokens: s.keeper.cachedPrefixTokens,
         consecutiveFailures: s.keeper.consecutiveFailures,
@@ -721,6 +746,52 @@ const probe = async (
   }
 }
 
+// Shadow mode: a keepalive the keeper would have sent, recorded instead of
+// sent. Nothing here touches the real keeper state, so turning shadow mode off
+// resumes the keeper exactly where it was.
+const recordWouldHave = async (
+  $: EngineInterface,
+  s: Session,
+  now: number,
+  ttl: Ttl | null,
+  agentId: string,
+  prefixTokens: number,
+  index: number,
+): Promise<void> => {
+  s.rows.push(
+    rowOf(
+      s,
+      {
+        kind: 'shadow',
+        timestamp: iso(now),
+        source: 'shadow',
+        result: 'would_have_keepalive',
+        notes:
+          agentId === ''
+            ? 'shadow mode: no request sent'
+            : `shadow mode: subagent ${agentId}, no request sent`,
+        agent_id: agentId,
+        api_equivalent_usd: null,
+        cost_basis: '',
+        shadow_would_have: true,
+        shadow_prefix_tokens: prefixTokens,
+        shadow_keepalive_index: index,
+        shadow_ttl: ttl ?? '',
+        shadow_last_would_have_at: null,
+      },
+      ZERO_USAGE,
+      undefined,
+    ),
+  )
+  await flush($, s)
+  await save($, s)
+  $.ui.log(
+    `shadow: would have kept the ${ttl ?? 'unknown'} cache warm (${prefixTokens} tokens)${
+      agentId === '' ? '' : ` for subagent ${agentId}`
+    }`,
+  )
+}
+
 // A subagent's request, as its turn.step showed it: the cache it left behind is
 // the one a later SendMessage to it reads. Answers the row's note.
 const agentStepped = (
@@ -871,6 +942,17 @@ const keepAgents = async (
   if (due === undefined || !s.keeper.enabled || s.agentStopNote !== null) return
   const limits = await limitsNow($)
   if (limits.some(limit => isOverStopLine(limit, config))) return
+  if (config.shadowMode) {
+    const agent = s.agents.get(due)
+    if (agent === undefined) return
+    // Advance its simulated clock so the next would-have waits a full
+    // threshold again, exactly as a delivered ping would have.
+    agent.keepalives += 1
+    agent.lastActivityAt = now
+    s.shadowWouldHave += 1
+    await recordWouldHave($, s, now, s.subagent.ttl, due, agent.prefixTokens, agent.keepalives)
+    return
+  }
   await pingAgent($, s, due, now)
 }
 
@@ -1325,7 +1407,17 @@ const tick = async ($: EngineInterface): Promise<void> => {
         isUnboundedBudget: bridged || isWaitingOnWork || s.isAnchor,
         isPastStopLine: bridged || s.isAnchor,
       })
-      let decision = decide(keeper, now, cfg, [])
+      // Shadow mode schedules from its own simulated clock and budget; the
+      // real keeper is left untouched, so turning the switch off changes
+      // nothing about when it fires.
+      const decisionKeeper = config.shadowMode
+        ? {
+            ...keeper,
+            lastActivityAt: s.shadowLastAt ?? keeper.lastActivityAt,
+            idleKeepalives: s.shadowKeepalives,
+          }
+        : keeper
+      let decision = decide(decisionKeeper, now, cfg, [])
       if (
         s.isAnchor &&
         !s.isAnchorExpiryNoted &&
@@ -1340,9 +1432,9 @@ const tick = async ($: EngineInterface): Promise<void> => {
       if (
         decision.action === 'fire' &&
         bridged &&
-        s.keeper.lastActivityAt !== null &&
+        decisionKeeper.lastActivityAt !== null &&
         s.keeper.ttl !== null &&
-        !needsPing(s.bridge, s.keeper.lastActivityAt, s.keeper.ttl)
+        !needsPing(s.bridge, decisionKeeper.lastActivityAt, s.keeper.ttl)
       ) {
         decision = { action: 'wait', reason: 'not-due' }
       }
@@ -1350,21 +1442,44 @@ const tick = async ($: EngineInterface): Promise<void> => {
         decision = { action: 'wait', reason: 'no-fork-yet' }
       }
       if (decision.action === 'fire') {
-        decision = decide(keeper, now, cfg, await limitsNow($))
+        decision = decide(decisionKeeper, now, cfg, await limitsNow($))
       }
       if (decision.action === 'fire') {
         const usage = await attempt(() => $.session.usage(), undefined)
         if (hasShrunk(usage?.context.tokens, s.keeper.cachedPrefixTokens)) {
-          s.keeper.pausedReason = 'compacted'
-          await save($, s)
+          // Shadow mode observes the same gate without changing the keeper.
+          if (!config.shadowMode) {
+            s.keeper.pausedReason = 'compacted'
+            await save($, s)
+          }
           decision = { action: 'wait', reason: 'paused' }
         }
       }
       if (decision.action === 'stop') {
-        stopKeeper($, s, decision.reason)
-        await save($, s)
+        // Shadow mode never stops the real keeper: it is only watching.
+        if (!config.shadowMode) {
+          stopKeeper($, s, decision.reason)
+          await save($, s)
+        }
       } else if (decision.action === 'fire') {
-        await probe($, s, undefined, 'keepalive')
+        if (config.shadowMode) {
+          const index = s.shadowKeepalives + 1
+          s.shadowKeepalives = index
+          s.shadowLastAt = now
+          s.shadowWouldHaveAt = now
+          s.shadowWouldHave += 1
+          await recordWouldHave(
+            $,
+            s,
+            now,
+            keeper.ttl,
+            '',
+            s.keeper.cachedPrefixTokens,
+            index,
+          )
+        } else {
+          await probe($, s, undefined, 'keepalive')
+        }
       }
       await keepAgents($, s, await $.clock.now())
     }
@@ -1385,7 +1500,14 @@ const statusText = async ($: EngineInterface, s: Session): Promise<string> => {
     isUnboundedBudget: s.isAnchor,
     isPastStopLine: s.isAnchor,
   })
-  const decision = decide(view.keeper, now, view.config, usage?.rateLimits ?? [])
+  const decisionKeeper = config.shadowMode
+    ? {
+        ...view.keeper,
+        lastActivityAt: s.shadowLastAt ?? view.keeper.lastActivityAt,
+        idleKeepalives: s.shadowKeepalives,
+      }
+    : view.keeper
+  const decision = decide(decisionKeeper, now, view.config, usage?.rateLimits ?? [])
   const idle =
     s.keeper.lastActivityAt === null
       ? 'no request seen yet'
@@ -1402,6 +1524,11 @@ const statusText = async ($: EngineInterface, s: Session): Promise<string> => {
           .join(' · ')
   const lines = [
     `keeper ${s.keeper.enabled ? 'on' : 'off'}${s.stopNote === null ? '' : ` (stopped: ${s.stopNote})`} · ${describeKeeper(s.keeper, decision)}`,
+    ...(config.shadowMode
+      ? [
+          `shadow: on · ${s.shadowKeepalives} would-have keepalive(s) this idle stretch · ${s.shadowWouldHave} total · nothing is sent`,
+        ]
+      : []),
     `anchor ${s.isAnchor ? 'on (keepalives unbounded; expiry still ends them)' : 'off'}`,
     `Claude Code ${s.version} · model ${s.model} · effort ${s.effort || 'unknown'}`,
     `TTL requested: ${s.requested.ttl ?? 'automatic'} (${s.requested.reason}) · observed in transcript: ${s.observed ?? 'not yet'} · scheduling by: ${s.keeper.ttl ?? 'unknown'}`,
@@ -1813,7 +1940,40 @@ export const register: Register = (on, options) => {
       const tag = isMain ? s.tags.get(e.turnId) : undefined
       const effort = e.effort === undefined ? '' : String(e.effort)
       let note = ''
+      if (isMain && config.shadowMode && s.shadowKeepalives > 0) {
+        const previousAt = s.keeper.lastActivityAt
+        s.rows.push(
+          rowOf(
+            s,
+            {
+              kind: 'recovery',
+              timestamp: iso(startedAt),
+              source: 'recovery',
+              result: 'recovery',
+              notes: `shadow: ${s.shadowKeepalives} would-have keepalive(s) before this request`,
+              duration_ms: previousAt === null ? null : startedAt - previousAt,
+              shadow_recovery_sec:
+                previousAt === null
+                  ? null
+                  : Math.max(0, Math.round((startedAt - previousAt) / 1000)),
+              shadow_keepalive_index: s.shadowKeepalives,
+              shadow_last_would_have_at: s.shadowWouldHaveAt,
+              shadow_prefix_tokens: s.keeper.cachedPrefixTokens,
+              shadow_ttl: s.keeper.ttl ?? '',
+              api_equivalent_usd: null,
+              cost_basis: '',
+            },
+            ZERO_USAGE,
+            tag,
+          ),
+        )
+      }
       if (isMain) {
+        if (config.shadowMode) {
+          s.shadowKeepalives = 0
+          s.shadowWouldHaveAt = null
+          s.shadowLastAt = startedAt
+        }
         const isChanged =
           s.baseline !== null &&
           (s.baseline.model !== e.model || s.baseline.effort !== effort)

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { createSession, looksLikePerson, stripInjected } from '../hooks/lib/session.ts'
 import type { Env, Io, Session } from '../hooks/lib/session.ts'
-import { shardName } from '../hooks/lib/history.ts'
+import { segmentName, shardName } from '../hooks/lib/history.ts'
 import { openingOf } from '../hooks/lib/handoff.ts'
 import { DEFAULTS, estimateTokens, parseJsonl } from '../hooks/lib/types.ts'
 import type { Config, HistoryRecord, LedgerEntry } from '../hooks/lib/types.ts'
@@ -10,6 +10,23 @@ import type { Config, HistoryRecord, LedgerEntry } from '../hooks/lib/types.ts'
 const DIR = '/ctx'
 
 const shardPath = (window: number, part = 0): string => `${DIR}/${shardName(window, part)}`
+
+/** Every row of one window, legacy parts and per-record segments alike, in seq order. */
+const windowRows = (box: Box, window: number): HistoryRecord[] => {
+  const head = `${DIR}/history-w${String(window).padStart(3, '0')}`
+  const rows: HistoryRecord[] = []
+  for (const [path, text] of box.files) {
+    if (!path.startsWith(head)) continue
+    const rest = path.slice(head.length)
+    if (!rest.startsWith('.') && !rest.startsWith('-')) continue
+    if (!path.endsWith('.jsonl')) continue
+    rows.push(...parseJsonl<HistoryRecord>(text))
+  }
+  return rows.sort((left, right) => left.seq - right.seq)
+}
+
+/** One window's history as the text on disk, all files joined. */
+const windowText = (box: Box, window: number): string => windowRows(box, window).map(row => JSON.stringify(row)).join('\n')
 
 type Box = {
   files: Map<string, string>
@@ -76,7 +93,7 @@ describe('record', () => {
     expect(session.window()).toBe(1)
     await session.flush()
 
-    const rows = parseJsonl<HistoryRecord>(box.files.get(shardPath(1)) ?? '')
+    const rows = windowRows(box, 1)
     expect(rows.map(row => row.seq)).toEqual([1, 2])
     expect(rows[0]?.isPerson).toBe(true)
     expect(rows[1]?.tool).toBe('Read')
@@ -87,7 +104,7 @@ describe('record', () => {
     expect(third.seq).toBe(3)
     expect(reloaded.window()).toBe(1)
     await reloaded.flush()
-    expect(parseJsonl<HistoryRecord>(box.files.get(shardPath(1)) ?? '').map(row => row.seq)).toEqual([1, 2, 3])
+    expect(windowRows(box, 1).map(row => row.seq)).toEqual([1, 2, 3])
   })
 
   test('a damaged meta.json and a damaged line leave the session usable', async () => {
@@ -163,9 +180,10 @@ describe('record', () => {
 
   test('an earlier window that rotated is read back whole after a reload', async () => {
     const box = makeIo()
-    const session = createSession(DIR, box.io, DEFAULTS)
+    // One row per segment keeps the rotation itself under test.
+    const session = createSession(DIR, box.io, { ...DEFAULTS, segmentRecords: 1 })
     await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '第一个请求' })
-    // Each row is about 190 KB, so the twelfth no longer fits and opens part 1.
+    // Every row lands in a segment of its own, however large it is.
     for (let index = 0; index < 12; index += 1) {
       await session.record({ uuid: `big${index}`, role: 'tool', tool: 'Read', text: `ROW${index} ${'x'.repeat(190_000)}` })
     }
@@ -173,11 +191,12 @@ describe('record', () => {
     await session.commitSwitch({ trigger: 'manual', tokensBefore: 90_000, handoffText: '交接' })
     await session.record({ uuid: 'p2', role: 'user', isPerson: true, text: '第二个请求' })
     await session.flush()
-    expect(box.files.has(shardPath(1, 1))).toBe(true)
-    const tailRows = parseJsonl<HistoryRecord>(box.files.get(shardPath(1, 1)) ?? '')
-    expect(tailRows.map(row => row.seq)).toContain(last.seq)
+    expect(box.files.has(`${DIR}/${segmentName(1, last.seq)}`)).toBe(true)
+    expect(windowRows(box, 1).map(row => row.seq)).toContain(last.seq)
+    // Nothing was rotated into a second legacy part.
+    expect(box.files.has(shardPath(1, 1))).toBe(false)
 
-    const reloaded = createSession(DIR, box.io, DEFAULTS)
+    const reloaded = createSession(DIR, box.io, { ...DEFAULTS, segmentRecords: 1 })
     const read = await reloaded.historyTool({ action: 'read', seq: last.seq })
     expect(read.isError).not.toBe(true)
     expect(read.result).toContain('TAILMARK')
@@ -186,7 +205,7 @@ describe('record', () => {
 
   test('the current window is read past the part meta.json names', async () => {
     const box = makeIo()
-    const session = createSession(DIR, box.io, DEFAULTS)
+    const session = createSession(DIR, box.io, { ...DEFAULTS, segmentRecords: 1 })
     await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '第一个请求' })
     await session.flush()
     const stale = box.files.get(`${DIR}/meta.json`) ?? ''
@@ -195,15 +214,15 @@ describe('record', () => {
     }
     const last = await session.record({ uuid: 'tail', role: 'tool', tool: 'Read', text: 'TAILMARK' })
     await session.flush()
-    expect(box.files.has(shardPath(1, 1))).toBe(true)
+    expect(box.files.has(`${DIR}/${segmentName(1, last.seq)}`)).toBe(true)
     box.files.set(`${DIR}/meta.json`, stale)
 
-    const reloaded = createSession(DIR, box.io, DEFAULTS)
+    const reloaded = createSession(DIR, box.io, { ...DEFAULTS, segmentRecords: 1 })
     const record = await reloaded.record({ uuid: 'u9', role: 'assistant', text: '接着写' })
     expect(record.seq).toBe(last.seq + 1)
     await reloaded.flush()
-    // The new row joins part 1; part 0 is not rewritten into a second, larger tail.
-    expect(parseJsonl<HistoryRecord>(box.files.get(shardPath(1, 1)) ?? '').map(row => row.seq)).toContain(record.seq)
+    // The new row gets a segment of its own; the earlier ones are never rewritten.
+    expect(windowRows(box, 1).map(row => row.seq)).toContain(record.seq)
     expect((await reloaded.historyTool({ action: 'read', seq: last.seq })).result).toContain('TAILMARK')
   })
 
@@ -222,25 +241,56 @@ describe('record', () => {
 })
 
 describe('reminder', () => {
-  test('soft and urgent each fire once per window, and urgent never back-fills soft', async () => {
+  const at = (tokens: number, limit = 400_000) => env(tokens, limit)
+
+  test('three absolute fills, each said once per window', async () => {
     const box = makeIo()
     const session = createSession(DIR, box.io, DEFAULTS)
 
-    // Below soft nothing is said, however close: the window is meant to be used.
-    expect(session.reminder(env(82_000))).toBeNull()
-    expect(session.reminder(env(87_000))).toContain('上下文已用 87%（87k/100k）')
-    expect(session.reminder(env(87_000))).toBeNull()
-    expect(session.reminder(env(93_000))).toContain('请立刻')
-    expect(session.reminder(env(93_000))).toBeNull()
+    // Below 250k nothing is said, however close: the window is meant to be used.
+    expect(session.reminder(at(249_999))).toBeNull()
+    expect(session.reminder(at(250_000))).toContain('上下文已用 250k/400k。如果当前任务刚告一段落')
+    expect(session.reminder(at(250_000))).toBeNull()
+    expect(session.reminder(at(299_999))).toBeNull()
+    expect(session.reminder(at(300_000))).toContain('上下文已用 300k/400k，再过一段就该换窗口了')
+    expect(session.reminder(at(300_000))).toBeNull()
+    expect(session.reminder(at(349_999))).toBeNull()
+    expect(session.reminder(at(350_000))).toContain('上下文已用 350k/400k，离上限只剩约 50k')
+    expect(session.reminder(at(350_000))).toBeNull()
     expect(session.reminder(env(undefined))).toBeNull()
-    expect(session.reminder(env(10_000))).toBeNull()
+    expect(session.reminder(at(10_000))).toBeNull()
+  })
 
+  test('a window that starts at urgent never back-fills the lower fills', async () => {
+    const box = makeIo()
     const jumped = createSession('/other', box.io, DEFAULTS)
-    expect(jumped.reminder(env(93_000))).toContain('请立刻')
-    expect(jumped.reminder(env(87_000))).toBeNull()
 
-    await session.commitSwitch({ trigger: 'manual', tokensBefore: 93_000, handoffText: '交接内容' })
-    expect(session.reminder(env(87_000))).toContain('上下文已用 87%')
+    expect(jumped.reminder(at(350_000))).toContain('离上限只剩约 50k')
+    expect(jumped.reminder(at(250_000))).toBeNull()
+    expect(jumped.reminder(at(300_000))).toBeNull()
+  })
+
+  test('a new window reminds again', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    expect(session.reminder(at(250_000))).toContain('上下文已用 250k/400k')
+
+    await session.commitSwitch({ trigger: 'manual', tokensBefore: 350_000, handoffText: '交接内容' })
+    expect(session.reminder(at(250_000))).toContain('上下文已用 250k/400k')
+  })
+
+  test('no fill sits closer than 30k to the limit', async () => {
+    const box = makeIo()
+    // At a 300k limit soft and urgent both cap at 270k, so 270k is already urgent.
+    const capped = createSession('/cap', box.io, DEFAULTS)
+    expect(capped.reminder(at(249_999, 300_000))).toBeNull()
+    expect(capped.reminder(at(250_000, 300_000))).toContain('上下文已用 250k/300k。如果当前任务刚告一段落')
+    expect(capped.reminder(at(270_000, 300_000))).toContain('上下文已用 270k/300k，离上限只剩约 30k')
+
+    // At a 280k limit every fill caps at 250k: the first thing said is already urgent.
+    const small = createSession('/small', box.io, DEFAULTS)
+    expect(small.reminder(at(249_999, 280_000))).toBeNull()
+    expect(small.reminder(at(250_000, 280_000))).toContain('上下文已用 250k/280k，离上限只剩约 30k')
   })
 })
 
@@ -348,22 +398,23 @@ describe('ledgerAppend', () => {
     expect(answer.result).toContain('已记录 #L2。')
   })
 
-  test('suggests a switch after a done entry only when nothing is open and the fill is high', async () => {
+  test('suggests a switch after a done entry only when nothing is open and the boundary fill is reached', async () => {
     const box = makeIo()
     const session = await freshSession(box)
     const done = { task_id: 'login-btn', title: '登录页按钮改蓝', status: 'done' as const, text: '改完了', evidence: [2] }
 
-    const early = await session.ledgerAppend(done, env(10_000))
+    const early = await session.ledgerAppend(done, env(10_000, 400_000))
     expect(early.result).toBe('已记录 #L1。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
-    expect(early.result).not.toContain('建议调用 context 工具')
+    expect(early.result).not.toContain('上下文已用')
 
-    // The suggestion waits for 75% of the limit: a finished task alone is no reason to switch.
-    const middle = await session.ledgerAppend({ ...done, task_id: 'login-btn-2' }, env(74_000))
+    // The suggestion waits for 250k: a finished task alone is no reason to switch.
+    const middle = await session.ledgerAppend({ ...done, task_id: 'login-btn-2' }, env(249_999, 400_000))
     expect(middle.result).toBe('已记录 #L2。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
 
-    const late = await session.ledgerAppend({ ...done, task_id: 'login-btn-3' }, env(75_000))
-    expect(late.result).toContain('当前没有进行中的任务，上下文已用 75k。')
-    expect(late.result).toContain('建议调用 context 工具（action: "new"）')
+    const late = await session.ledgerAppend({ ...done, task_id: 'login-btn-3' }, env(250_000, 400_000))
+    expect(late.result).toContain('上下文已用 250k/400k。如果当前任务刚告一段落')
+    // The same sentence is never repeated by the reminder that follows the tool call.
+    expect(session.reminder(env(250_000, 400_000))).toBeNull()
   })
 })
 
@@ -585,8 +636,8 @@ describe('buildHandoff and commitSwitch', () => {
     await session.flush()
     // notePrefix only touches memory; the next queued meta write is what carries it to disk.
     expect(readMeta(box).lastPrefix).toBe(50_000 - estimateTokens(handoff))
-    expect(parseJsonl<HistoryRecord>(box.files.get(shardPath(2)) ?? '').map(row => row.seq)).toEqual([3])
-    expect(parseJsonl<HistoryRecord>(box.files.get(shardPath(1)) ?? '')).toHaveLength(2)
+    expect(windowRows(box, 2).map(row => row.seq)).toEqual([3])
+    expect(windowRows(box, 1)).toHaveLength(2)
   })
 
   test('two switches with the first write still in flight keep both event lines', async () => {
@@ -1965,7 +2016,7 @@ describe('writes that fail', () => {
     expect(answer.result).toContain('已记录 #L1')
     expect(answer.result).toContain('没能写进磁盘')
     await session.flush()
-    expect(session.unsaved()).toEqual([shardName(1, 0), 'ledger.jsonl', 'meta.json'].sort())
+    expect(session.unsaved()).toEqual([segmentName(1, 1), 'ledger.jsonl', 'meta.json'].sort())
     expect(box.files.size).toBe(0)
   })
 
@@ -1999,7 +2050,7 @@ describe('writes that fail', () => {
     control.failing = () => false
     await session.flush()
     expect(session.unsaved()).toEqual([])
-    expect(parseJsonl<HistoryRecord>(box.files.get(shardPath(1)) ?? '').map(row => row.seq)).toEqual([1])
+    expect(windowRows(box, 1).map(row => row.seq)).toEqual([1])
     expect(readLedger(box).map(one => one.task_id)).toEqual(['t1'])
     expect(readMeta(box).window).toBe(1)
   })
@@ -2372,7 +2423,7 @@ describe('rows from the other doors', () => {
     await session.record({ uuid: 'h1', role: 'user', door: 'hook-context', text: '钩子给的 out.txt 上下文' })
     await session.flush()
 
-    const rows = parseJsonl<HistoryRecord>(box.files.get(shardPath(1)) ?? '')
+    const rows = windowRows(box, 1)
     expect(rows.map(row => row.door)).toEqual(['delivery', 'attachment', 'attachment', 'hook-context'])
     expect(rows[1]?.name).toBe('nested_memory')
 
@@ -2428,7 +2479,7 @@ describe('a tool call’s arguments in full', () => {
     expect(read).toContain(longCommand)
     expect(read).toContain('description: 跑一下')
     expect((await session.historyTool({ action: 'read', seq: 1 })).result).toContain('done')
-    expect(parseJsonl<HistoryRecord>(box.files.get(shardPath(1)) ?? '')[0]?.callId).toBe('call-1')
+    expect(windowRows(box, 1)[0]?.callId).toBe('call-1')
 
     const found = (await session.historyTool({ action: 'search', query: 'needle-only-in-args' })).result
     expect(found).toContain('#1 w1 tool [Bash]')
@@ -2465,7 +2516,7 @@ describe('a field too long for its row', () => {
     expect(row.overflow?.text).toEqual({ chars: 300_000, parts: 1 })
     expect(box.files.get(`${DIR}/big-1-text-0.txt`)).toBe(text)
     // Nothing else sees more than the head: the shard row is the clipped one.
-    expect(box.files.get(shardPath(1))).not.toContain('END')
+    expect(windowText(box, 1)).not.toContain('END')
 
     const tail = (await session.historyTool({ action: 'read', seq: 1, offset: 299_990, length: 20 })).result
     expect(tail).toContain('共 300000 字符')
@@ -2619,7 +2670,7 @@ describe('importMessages into a session that has history', () => {
     const tail = [user('停用期间我又提了一个新请求'), { role: 'assistant' as const, text: '收到，这是停用期间的回答。', toolUses: [] }]
     expect(await session.importMessages([...before, ...tail])).toBe(2)
     await session.flush()
-    const rows = parseJsonl<HistoryRecord>(box.files.get(shardPath(1)) ?? '')
+    const rows = windowRows(box, 1)
     expect(rows.map(row => row.text)).toEqual([
       '把解析器改严一点，错误信息也要换掉',
       'listing',
