@@ -18,11 +18,12 @@ import type {
 } from './types.ts'
 import { estimateTokens, isRelay, parseJsonl, toJsonl } from './types.ts'
 import {
-  appendRecord,
+
   byteLength,
+
   clipRecord,
   createQueue,
-  emptyShard,
+
   loadedTools,
   personRequests,
   repliesAnswered,
@@ -31,9 +32,14 @@ import {
   search,
   groupsWanted,
   isOwnRow,
+  manifestName,
   overflowName,
+  parseHistoryText,
+  parseManifest,
   partOrigin,
   partsCovering,
+  segmentName,
+  segmentSeq,
   shardName,
   sliceBounds,
   splitParts,
@@ -46,7 +52,7 @@ import { activityOf, filesOf, locate, pathKey, pathsToRead, relativePath, render
 import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
-import { describeFill, gateSwitch, isCold, judgeSwitch, levelOf, percentOf } from './usage.ts'
+import { describeFill, gateSwitch, isCold, judgeSwitch, levelOf } from './usage.ts'
 
 export type Io = {
   read: (path: string) => Promise<string>
@@ -344,7 +350,7 @@ type State = {
   requestsSinceSwitch: number
   /** Only remembered in memory: a reloaded session has no live turn to measure the cache against. */
   lastRequestAt: number | null
-  reminded: { soft: boolean; urgent: boolean }
+  reminded: { boundary: boolean; soft: boolean; urgent: boolean }
   archive: ArchivePage[]
   activities: FileActivity[]
   roster: AgentSeen[]
@@ -447,7 +453,7 @@ const emptyState = (): State => ({
   switchTimes: [],
   requestsSinceSwitch: 0,
   lastRequestAt: null,
-  reminded: { soft: false, urgent: false },
+  reminded: { boundary: false, soft: false, urgent: false },
   archive: [],
   activities: [],
   roster: [],
@@ -691,7 +697,11 @@ const stateFrom = (raw: Record<string, unknown> | null): State => {
   state.lastPrefix = typeof raw.lastPrefix === 'number' ? raw.lastPrefix : null
   state.lastHandoff = typeof raw.lastHandoff === 'number' ? raw.lastHandoff : null
   const reminded = typeof raw.reminded === 'object' && raw.reminded !== null ? (raw.reminded as Record<string, unknown>) : {}
-  state.reminded = { soft: reminded.soft === true, urgent: reminded.urgent === true }
+  state.reminded = {
+    boundary: reminded.boundary === true,
+    soft: reminded.soft === true,
+    urgent: reminded.urgent === true,
+  }
 
   return state
 }
@@ -790,7 +800,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
    * bytes the shard files actually took. Nothing here changes a write; it only counts.
    */
   const writeStats = { logicalNewBytes: 0, physicalBytesWritten: 0, writeCalls: 0, coalesced: 0 }
-  const isShardPath = (path: string): boolean => /(?:^|[\\/])history-[^\\/]+\.jsonl$/.test(path)
+  const isShardPath = (path: string): boolean => /(?:^|[\\/])history-[^\\/]+(?:\.jsonl|\.manifest\.json)$/.test(path)
   const queue = createQueue(writeThrough, undefined, {
     onWrite: (path, bytes) => {
       if (!isShardPath(path)) return
@@ -807,6 +817,124 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
   const shards = new Map<string, Shard>()
   /** Windows whose every part is in `shards`. */
   const fullWindows = new Set<number>()
+  /** The segment each window's newest rows are in, so the next record can join it. */
+  const activeSegments = new Map<number, string>()
+  /** A segment rolls at either limit; one record larger than the byte cap still lands alone. */
+  const segmentRecords = Math.max(1, Math.floor(config.segmentRecords))
+  const segmentBytes = Math.max(1, config.segmentBytes)
+
+  /** Whether `io.list` works here; null until a load has tried it. */
+  let listWorks: boolean | null = null
+  /** How often the manifest is refreshed when no directory listing is available. */
+  const MANIFEST_EVERY = 64
+
+  /** The directory's file names, or null when this host cannot list it. */
+  const listDir = async (): Promise<readonly string[] | null> => {
+    if (typeof io.list !== 'function') {
+      listWorks = false
+
+      return null
+    }
+    try {
+      const names = await io.list(root)
+      listWorks = true
+
+      return names
+    } catch {
+      listWorks = false
+
+      return null
+    }
+  }
+
+  /** Adds one segment file to memory, and says whether it was there. */
+  const addSegment = async (window: number, seq: number): Promise<boolean> => {
+    const name = segmentName(window, seq)
+    if (shards.has(name)) return true
+    const text = await readText(pathIn(name))
+    if (text === null) return false
+    shards.set(name, { window, part: 0, rows: parseHistoryText(text), bytes: byteLength(text) })
+    const active = activeSegments.get(window)
+    if (active === undefined || seq > (segmentSeq(active, window) ?? 0)) activeSegments.set(window, name)
+
+    return true
+  }
+
+  /**
+   * Reads a window's append-format segments. A directory listing is authoritative
+   * when the host has one. Without it the manifest gives the range, and the seqs
+   * just past it are probed because meta.json is written after every row and may
+   * be newer; with neither, the newest seq meta.json names is probed backwards.
+   */
+  const readSegments = async (window: number): Promise<void> => {
+    const manifestText = await readText(pathIn(manifestName(window)))
+    const manifest = manifestText === null ? null : parseManifest(manifestText, window)
+    if (manifest !== null) {
+      if (manifest.version === 2 && manifest.segments !== undefined) {
+        for (const seq of manifest.segments) await addSegment(window, seq)
+      } else {
+        // A v1 manifest held one record per segment, so every seq in its range is a start.
+        for (let seq = manifest.firstSeq; seq <= manifest.lastSeq; seq += 1) await addSegment(window, seq)
+      }
+    }
+
+    const names = await listDir()
+    if (names !== null) {
+      const seqs = names
+        .map(name => segmentSeq(name, window))
+        .filter((seq): seq is number => seq !== null)
+        .sort((left, right) => left - right)
+      for (const seq of seqs) await addSegment(window, seq)
+
+      return
+    }
+
+    if (manifest !== null) {
+      // The active segment may have grown, and a newer one may have started, after
+      // the manifest was written: read the known segments, then probe past their rows.
+      let misses = 0
+      for (let seq = topSeqOf(window) + 1; misses < 8; seq += 1) {
+        if (await addSegment(window, seq)) misses = 0
+        else misses += 1
+      }
+
+      return
+    }
+
+    // No manifest and no listing: walk back from the newest seq. A segment starts
+    // at its first row, so the gap to the previous start is at most the record cap.
+    let misses = 0
+    const missLimit = segmentRecords + 2
+    for (let seq = state.seq; seq >= 1 && misses < missLimit; seq -= 1) {
+      if (await addSegment(window, seq)) misses = 0
+      else misses += 1
+    }
+  }
+
+  /** Writes down the window's segment starts, so a host without a listing can find it after a crash. */
+  const saveManifest = (window: number): void => {
+    let firstSeq = 0
+    let lastSeq = 0
+    let count = 0
+    const segments: number[] = []
+    for (const [name, shard] of shards) {
+      if (shard.window !== window) continue
+      const start = segmentSeq(name, window)
+      if (start !== null) segments.push(start)
+      for (const row of shard.rows) {
+        if (!Number.isInteger(row.seq) || row.seq < 1) continue
+        if (firstSeq === 0 || row.seq < firstSeq) firstSeq = row.seq
+        if (row.seq > lastSeq) lastSeq = row.seq
+        count += 1
+      }
+    }
+    if (count === 0) return
+    segments.sort((left, right) => left - right)
+    void queue.push(
+      pathIn(manifestName(window)),
+      JSON.stringify({ version: 2, window, firstSeq, lastSeq, count, segments }),
+    )
+  }
   const archives = new Map<number, LedgerEntry[]>()
   /**
    * The events file as this session knows it. Its own reads go straight to the
@@ -922,8 +1050,10 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       const name = shardName(window, parts)
       const text = await readText(pathIn(name))
       if (text === null) break
-      shards.set(name, { window, part: parts, rows: parseJsonl<HistoryRecord>(text), bytes: byteLength(text) })
+      shards.set(name, { window, part: parts, rows: parseHistoryText(text), bytes: byteLength(text) })
     }
+
+    await readSegments(window)
 
     return parts
   }
@@ -979,11 +1109,12 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       const next = state.window + 1
       const isOpened =
         (await readText(pathIn(handoffName(next)))) !== null ||
-        (await readText(pathIn(shardName(next, 0)))) !== null
+        (await readText(pathIn(shardName(next, 0)))) !== null ||
+        (await readText(pathIn(manifestName(next)))) !== null
       if (!isOpened) break
       state.window = next
       state.requestsSinceSwitch = 0
-      state.reminded = { soft: false, urgent: false }
+      state.reminded = { boundary: false, soft: false, urgent: false }
     }
 
     state.part = Math.max(0, (await readWindow(state.window)) - 1)
@@ -1114,8 +1245,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return `（前文已省略，用 history 工具查看 #${row.seq}）\n${row.text.slice(row.text.length - LAST_REPLY_CHARS)}`
   }
 
-  const shardAt = (window: number, part: number): Shard =>
-    shards.get(shardName(window, part)) ?? emptyShard(window, part)
+
+
 
   const record = async (row: RecordInput): Promise<HistoryRecord> => {
     await ensureLoaded()
@@ -1153,13 +1284,36 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     // The row's own share of the shard, newline included: what the write would cost if the
     // whole file never had to be rewritten. Counted whether or not the write lands.
     writeStats.logicalNewBytes += byteLength(JSON.stringify(clipped)) + 1
-    const shard = appendRecord(shardAt(state.window, state.part), clipped).shard
+    state.part = 0
+    const rowBytes = byteLength(JSON.stringify(clipped)) + 1
+    const active = activeSegments.get(state.window)
+    const current = active === undefined ? undefined : shards.get(active)
+    // A segment is rewritten whole each time it grows, so it is filled to its record
+    // or byte cap first: fewer files to open later, the same bytes per record now.
+    const joins =
+      active !== undefined &&
+      current !== undefined &&
+      current.rows.length > 0 &&
+      current.rows.length < segmentRecords &&
+      current.bytes + rowBytes <= segmentBytes
+    const name = joins && active !== undefined ? active : segmentName(state.window, seq)
+    let rows: HistoryRecord[]
+    if (joins && current !== undefined) {
+      current.rows.push(clipped)
+      current.bytes += rowBytes
+      rows = current.rows
+    } else {
+      rows = [clipped]
+      shards.set(name, { window: state.window, part: 0, rows, bytes: rowBytes })
+      activeSegments.set(state.window, name)
+    }
+    fullWindows.add(state.window)
     state.seq = seq
-    state.window = shard.window
-    state.part = shard.part
-    const name = shardName(shard.window, shard.part)
-    shards.set(name, shard)
-    fullWindows.add(shard.window)
+
+
+
+
+
     // The whole original of a clipped field goes out before the row that points at it. A part
     // that fails to land is kept by `writeThrough` like any other file, so `flush` retries it.
     for (const field of ['text', 'args'] as const) {
@@ -1168,7 +1322,10 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
         void queue.push(pathIn(overflowName(seq, field, index)), part)
       })
     }
-    void queue.push(pathIn(name), toJsonl(shard.rows))
+    void queue.push(pathIn(name), toJsonl(rows))
+    // A host that cannot list needs the manifest to find every roll; one that can
+    // find the files itself only keeps the manifest fresh now and then.
+    if (listWorks === false || seq % MANIFEST_EVERY === 0) saveManifest(state.window)
     saveMeta()
 
     return clipped
@@ -1481,25 +1638,40 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     saveMeta()
   }
 
+  /**
+   * The boundary sentence. The reminder and the ledger's "nothing is open any more"
+   * hint share it and its flag, so a task boundary is announced once, not twice.
+   */
+  const boundaryReminder = (env: Env): string | null => {
+    if (env.tokens === undefined) return null
+    if (state.reminded.boundary || state.reminded.soft || state.reminded.urgent) return null
+    state.reminded.boundary = true
+
+    return `上下文已用 ${k(env.tokens)}k/${k(env.limit)}k。如果当前任务刚告一段落（刚完成一项、刚交付结果或在等用户回复），现在换窗口最划算：先把进度写进账本，再调用 context 工具换窗口。如果正在任务中间，就继续，不用理会。`
+  }
+
   const reminder = (env: Env): string | null => {
     if (env.tokens === undefined) return null
     const level = levelOf(env.tokens, env.limit, config)
-    if (level !== 'soft' && level !== 'urgent') return null
-    const pct = percentOf(env.tokens, env.limit)
+
+    if (level === 'boundary') return boundaryReminder(env)
 
     if (level === 'soft') {
       if (state.reminded.soft || state.reminded.urgent) return null
       state.reminded.soft = true
+      state.reminded.boundary = true
 
-      return `上下文已用 ${pct}%（${k(env.tokens)}k/${k(env.limit)}k）。如果当前阶段即将结束，请先把进度写进账本，然后调用 context 工具换窗口；如果正处在一个小步骤中间，先完成这一步。`
+      return `上下文已用 ${k(env.tokens)}k/${k(env.limit)}k，再过一段就该换窗口了。请边做边把进度写进账本，到下一个任务边界就换窗口。`
     }
 
-    if (state.reminded.urgent) return null
+    if (level !== 'urgent' || state.reminded.urgent) return null
     // Urgent carries the whole instruction itself, so a skipped soft is never sent late.
     state.reminded.urgent = true
     state.reminded.soft = true
+    state.reminded.boundary = true
+    const left = Math.max(0, k(env.limit - env.tokens))
 
-    return `上下文已用 ${pct}%。请立刻：1）为每个未完成的任务追加一条账本记录，写明 next_step 和 anchors；2）把已完成的任务标为 done 并附证据；3）调用 context 工具（action: "new"）换窗口。`
+    return `上下文已用 ${k(env.tokens)}k/${k(env.limit)}k，离上限只剩约 ${left}k。请现在开始准备换窗口：1）为每个未完成的任务追加账本记录，写明 next_step 和 anchors；2）把已完成的任务标为 done 并附证据；3）调用 context 工具（action: "new"）。`
   }
 
   const ledgerAppend = async (input: unknown, env: Env): Promise<ToolResult> => {
@@ -1596,9 +1768,11 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       entry.status === 'done' &&
       !stillOpen &&
       env.tokens !== undefined &&
-      levelOf(env.tokens, env.limit, config) !== 'none'
+      levelOf(env.tokens, env.limit, config) === 'boundary'
     ) {
-      result += `\n当前没有进行中的任务，上下文已用 ${k(env.tokens)}k。现在换窗口代价最小，建议调用 context 工具（action: "new"）。`
+      // The same sentence the reminder gives at this fill: whichever comes first says it.
+      const said = boundaryReminder(env)
+      if (said !== null) result += `\n${said}`
     }
 
     return { result }
@@ -2191,10 +2365,11 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       }
     }
 
+    saveManifest(state.window)
     state.window += 1
     state.part = 0
     state.requestsSinceSwitch = 0
-    state.reminded = { soft: false, urgent: false }
+    state.reminded = { boundary: false, soft: false, urgent: false }
     state.switchTimes = [...state.switchTimes, now].filter(at => at > now - 3_600_000)
     state.lastHandoff = estimateTokens(info.handoffText)
     state.pending = null
@@ -2204,8 +2379,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     // The gate's memory is per window: the new one may hold back its own loads again.
     state.gateAsked = []
     state.gateWanted = []
-    const opened = emptyShard(state.window, 0)
-    shards.set(shardName(state.window, 0), opened)
+
+
     fullWindows.add(state.window)
     saveMeta()
   }
