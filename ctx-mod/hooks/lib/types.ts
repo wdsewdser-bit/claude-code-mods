@@ -3,11 +3,13 @@
 export type Config = {
   /** The compaction window to assume when the engine reports no threshold. */
   compactWindow: number
-  /** Percent of the limit past which a finished task is a good moment to switch windows. */
-  boundaryPct: number
-  /** Percent of the limit for the soft and the urgent reminder. */
-  softPct: number
-  urgentPct: number
+  /**
+   * Context fill, in absolute tokens, at which each of the three reminders fires
+   * (boundary, soft, urgent). None is allowed later than 30k below the limit.
+   */
+  boundaryTokens: number
+  softTokens: number
+  urgentTokens: number
   /** A cold cache switches the window only above this fill. */
   coldMinTokens: number
   /** Cache lifetime to assume when cache-keeper's state cannot be read. */
@@ -35,6 +37,10 @@ export type Config = {
   breakEvenSafety: number
   /** Longest `text` one ledger entry may carry, in characters. */
   maxTextChars: number
+  /** Records one history segment holds before a new file is opened. */
+  segmentRecords: number
+  /** Bytes one history segment may reach before a new file is opened; one record may exceed it. */
+  segmentBytes: number
   /** Above this context, a load that rebuilds the cache waits for a window switch first. */
   gateMinTokens: number
   /** When the model asks for a switch, the most tool results allowed after the latest ledger entry. */
@@ -51,12 +57,13 @@ export type Config = {
 
 export const DEFAULTS: Config = {
   compactWindow: 400_000,
-  // Late on purpose: a switch loses working detail, so the window is used nearly
-  // to its end. Urgent still leaves room for the ledger entries before the limit.
-  // Of a 400k limit these are 300k, 332k and 352k.
-  boundaryPct: 75,
-  softPct: 83,
-  urgentPct: 88,
+  // Absolute fills rather than percents, so the same numbers hold whatever limit the
+  // engine reports. Late on purpose: a switch loses working detail, so the window is
+  // used nearly to its end. No fill sits closer than 30k to the limit (usage.ts caps
+  // it there), which leaves urgent room for the ledger entries it asks for.
+  boundaryTokens: 250_000,
+  softTokens: 300_000,
+  urgentTokens: 350_000,
   coldMinTokens: 100_000,
   cacheTtlSec: 3_600,
   noContinueAtPercent: 90,
@@ -70,9 +77,15 @@ export const DEFAULTS: Config = {
   recentActions: 5,
   recentRequests: 3,
   wRead: 0.025,
-  wWrite: 1,
+  // Measured on a subscription: a cache write costs 1.25 times the base read price.
+  wWrite: 1.25,
   breakEvenSafety: 1.5,
   maxTextChars: 1_500,
+  // A segment is rewritten whole for each record it gains, so its size is the
+  // write-amplification knob: K records cost about K/2 segment writes each.
+  // 8 is the measured knee: WAF ~4.5, and 5000 records still load in ~0.2 s.
+  segmentRecords: 8,
+  segmentBytes: 1024 * 1024,
   gateMinTokens: 120_000,
   freshTailSteps: 5,
   autoTailSteps: 25,

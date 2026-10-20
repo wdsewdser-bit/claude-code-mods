@@ -1,12 +1,12 @@
 import type { RateLimit } from './keeper.ts'
 
 export type EventRow = {
-  kind: 'step' | 'keeper' | 'meter'
+  kind: 'step' | 'keeper' | 'meter' | 'shadow' | 'recovery'
   timestamp: string
   experiment_id: string
   replicate: number | null
   session_id: string
-  source: 'user' | 'benchmark' | 'keeper' | 'subagent' | 'meter'
+  source: 'user' | 'benchmark' | 'keeper' | 'subagent' | 'meter' | 'shadow' | 'recovery'
   model: string
   effort: string
   claude_code_version: string
@@ -32,6 +32,18 @@ export type EventRow = {
   step_index: number | null
   agent_id: string
   duration_ms: number | null
+  /** Shadow mode only: this row records a keepalive that was not sent. */
+  shadow_would_have?: boolean
+  /** Shadow mode only: the prefix a would-have keepalive would have read. */
+  shadow_prefix_tokens?: number
+  /** Shadow mode only: seconds from the previous real request to this one. */
+  shadow_recovery_sec?: number | null
+  /** Shadow mode only: the 1-based would-have keepalive in its idle stretch. */
+  shadow_keepalive_index?: number
+  /** Shadow mode only: the TTL the decision was made against. */
+  shadow_ttl?: string
+  /** Shadow mode only: when the last would-have keepalive was due, in ms. */
+  shadow_last_would_have_at?: number | null
 }
 
 export type RunStep = {
@@ -93,6 +105,12 @@ const CSV_COLUMNS = [
   'notes',
   'result',
   'cost_basis',
+  'shadow_would_have',
+  'shadow_prefix_tokens',
+  'shadow_recovery_sec',
+  'shadow_keepalive_index',
+  'shadow_ttl',
+  'shadow_last_would_have_at',
 ] as const
 
 const csvCell = (value: unknown): string => {
@@ -538,7 +556,8 @@ export const summarize = (
 
   const observed = new Map<string, ObservationRow>()
   for (const row of events) {
-    if (row.kind === 'meter' || row.experiment_id !== '') continue
+    if (row.kind === 'meter' || row.kind === 'shadow' || row.kind === 'recovery') continue
+    if (row.experiment_id !== '') continue
     const ttl = row.ttl_observed || row.ttl_requested
     const key = `${row.session_id}\u0000${row.source}\u0000${ttl}`
     const entry = observed.get(key) ?? {

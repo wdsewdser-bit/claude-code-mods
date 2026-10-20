@@ -3,7 +3,7 @@
 // here touches the engine, fs or a clock, so the callers inject the writer and
 // this module stays testable in a bare interpreter.
 
-import { OWN_TOOL_PREFIX } from './types.ts'
+import { OWN_TOOL_PREFIX, parseJsonl } from './types.ts'
 import type { HistoryRecord, Overflow, Role } from './types.ts'
 
 /** Shards rotate well before the engine's 4 MiB read ceiling, so a whole file still reads. */
@@ -38,6 +38,78 @@ const partTag = (part: number): string => {
 /** The file a window's shard part lives in; the caller writes the whole file at once. */
 export const shardName = (window: number, part: number): string =>
   `history-${windowTag(window)}${partTag(part)}.jsonl`
+
+/** The file a segment starts in: its name carries the seq of the segment's first row. */
+export const segmentName = (window: number, seq: number): string =>
+  `history-${windowTag(window)}.s${String(seq).padStart(6, '0')}.jsonl`
+
+/**
+ * The seq a segment file's name carries, or null when the name is not a segment
+ * of this window. A seq may outgrow six digits; it is still read back exactly.
+ */
+export const segmentSeq = (name: string, window: number): number | null => {
+  const head = `history-${windowTag(window)}.s`
+  if (!name.startsWith(head) || !name.endsWith('.jsonl')) return null
+  const digits = name.slice(head.length, -'.jsonl'.length)
+  if (!/^\d+$/.test(digits)) return null
+  const seq = Number(digits)
+
+  return Number.isSafeInteger(seq) && seq > 0 ? seq : null
+}
+
+/** The small file naming a window's segment range, written at checkpoints and window switches. */
+export const manifestName = (window: number): string => `history-${windowTag(window)}.manifest.json`
+
+export type WindowManifest = {
+  version: 1 | 2
+  window: number
+  firstSeq: number
+  lastSeq: number
+  count: number
+  /** Version 2: the first seq of every segment file. Version 1 held one record per segment. */
+  segments?: number[]
+}
+
+/** A manifest read back from disk, or null when it is damaged, foreign or impossible. */
+export const parseManifest = (text: string, window: number): WindowManifest | null => {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (typeof raw !== 'object' || raw === null) return null
+  const one = raw as Partial<WindowManifest>
+  if ((one.version !== 1 && one.version !== 2) || one.window !== window) return null
+  if (!Number.isInteger(one.firstSeq) || !Number.isInteger(one.lastSeq) || !Number.isInteger(one.count)) return null
+  if (one.firstSeq === undefined || one.lastSeq === undefined || one.count === undefined) return null
+  if (one.firstSeq < 1 || one.lastSeq < one.firstSeq || one.count < 0) return null
+  if (one.version === 2) {
+    // A v2 manifest names its segment starts; one that does not is treated as a
+    // v1 range, whose every seq was a start, so older data still opens.
+    const segments = Array.isArray(one.segments)
+      ? one.segments.filter(
+          (seq): seq is number => typeof seq === 'number' && Number.isSafeInteger(seq) && seq > 0,
+        )
+      : []
+    if (segments.length > 0) return { version: 2, window, firstSeq: one.firstSeq, lastSeq: one.lastSeq, count: one.count, segments }
+  }
+
+  return { version: 1, window, firstSeq: one.firstSeq, lastSeq: one.lastSeq, count: one.count }
+}
+
+/**
+ * The rows a history file holds, keeping every complete line and dropping an
+ * unfinished tail. A write cut off mid-line leaves no newline behind, and half
+ * a row must never be read as one; a complete but unparsable line is skipped as
+ * `parseJsonl` always does.
+ */
+export const parseHistoryText = (text: string): HistoryRecord[] => {
+  const end = text.lastIndexOf('\n')
+  if (end < 0) return []
+
+  return parseJsonl<HistoryRecord>(text.slice(0, end + 1))
+}
 
 /**
  * The UTF-8 length of a string, counted code point by code point: TextEncoder
