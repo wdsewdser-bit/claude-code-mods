@@ -39,7 +39,7 @@ import {
   splitParts,
   toolGroupOf,
 } from './history.ts'
-import type { LoadedTool, SearchHit, Shard } from './history.ts'
+import type { LoadedTool, OverflowFailure, SearchHit, Shard } from './history.ts'
 import { archiveName, hasFreshEntry, pageOf, renderHome, stamp, tasksOf, turnPage, validate } from './ledger.ts'
 import type { AnchorCheck, ArchivePage, TaskState } from './ledger.ts'
 import { activityOf, filesOf, locate, pathKey, pathsToRead, relativePath, renderWorkset, snippetsOf } from './workset.ts'
@@ -373,6 +373,8 @@ export type Session = {
   ledgerAppend: (input: unknown, env: Env) => Promise<ToolResult>
   ledgerRead: (input: unknown) => Promise<ToolResult>
   historyTool: (input: unknown) => Promise<ToolResult>
+  /** The history write-amplification counters as one line, for the context tool's status. */
+  historyWriteStats: () => string
   status: (env: Env) => string
   requestSwitch: (input: unknown, env: Env) => ToolResult
   /**
@@ -783,7 +785,23 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       throw problem
     }
   }
-  const queue = createQueue(writeThrough)
+  /**
+   * What the history writes cost, in memory only: the bytes the new rows add and the
+   * bytes the shard files actually took. Nothing here changes a write; it only counts.
+   */
+  const writeStats = { logicalNewBytes: 0, physicalBytesWritten: 0, writeCalls: 0, coalesced: 0 }
+  const isShardPath = (path: string): boolean => /(?:^|[\\/])history-[^\\/]+\.jsonl$/.test(path)
+  const queue = createQueue(writeThrough, undefined, {
+    onWrite: (path, bytes) => {
+      if (!isShardPath(path)) return
+      writeStats.physicalBytesWritten += bytes
+      writeStats.writeCalls += 1
+    },
+    onCoalesce: path => {
+      if (!isShardPath(path)) return
+      writeStats.coalesced += 1
+    },
+  })
   const state = emptyState()
   /** Every shard this session has in memory, the current one included: old windows stay searchable. */
   const shards = new Map<string, Shard>()
@@ -1132,6 +1150,9 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     }
 
     const clipped = clipRecord(full)
+    // The row's own share of the shard, newline included: what the write would cost if the
+    // whole file never had to be rewritten. Counted whether or not the write lands.
+    writeStats.logicalNewBytes += byteLength(JSON.stringify(clipped)) + 1
     const shard = appendRecord(shardAt(state.window, state.part), clipped).shard
     state.seq = seq
     state.window = shard.window
@@ -1672,7 +1693,11 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       hit.door === undefined ? '' : ` <${hit.door}${hit.name === undefined ? '' : `/${hit.name}`}>`
     }${hit.tool === undefined ? '' : ` [${hit.tool}]`}${
       hit.input === undefined ? '' : ` ${hit.input}`
-    }${hit.path === undefined ? '' : ` [${hit.path}]`}：${hit.excerpt}`
+    }${hit.path === undefined ? '' : ` [${hit.path}]`}：${hit.excerpt}${
+      hit.overflow === undefined
+        ? ''
+        : ` [overflow ${hit.overflow.field === 'args' ? 'input' : 'text'} offset=${hit.overflow.offset}]`
+    }`
 
   const historySearch = async (raw: Record<string, unknown>): Promise<ToolResult> => {
     const problems: string[] = []
@@ -1695,10 +1720,33 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     }
     if (problems.length > 0) return errorOf(`history 的输入有问题：\n- ${problems.join('\n- ')}`)
 
+    // A part that is gone or damaged is skipped by the search; the person still has to
+    // learn that this answer is not the whole history, so each failure is said once.
+    const overflowProblems: string[] = []
+    const seenOverflowProblems = new Set<string>()
+    const noteOverflowFailure = (failure: OverflowFailure): void => {
+      const key = `${failure.seq}:${failure.field}:${failure.part}`
+      if (seenOverflowProblems.has(key)) return
+      seenOverflowProblems.add(key)
+      const field = failure.field === 'args' ? 'input' : 'text'
+      const why =
+        failure.reason === 'missing'
+          ? '文件缺失'
+          : failure.reason === 'unreadable'
+            ? '读取失败'
+            : `内容被截短（${failure.actual ?? '?'}/${failure.expected ?? '?'} 字符）`
+      overflowProblems.push(`#${failure.seq} 的 overflow ${field} 第 ${failure.part} 段${why}，已跳过`)
+    }
+    const withOverflowNotes = (text: string): string =>
+      overflowProblems.length === 0 ? text : `${text}\n（${overflowProblems.join('；')}）`
+
     const target = windowField as number | undefined
     const searchIn = async (windows: readonly number[]): Promise<SearchHit[]> => {
       for (const window of windows) await loadWindow(window)
       const wanted = new Set(windows)
+      // An overflow part queued a moment ago is not on disk yet. A search reads one only
+      // for a row that missed inline, so this costs an ordinary search nothing.
+      await queue.idle()
 
       return search(
         allRows().filter(row => wanted.has(row.window)),
@@ -1711,13 +1759,23 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
           door: typeof raw.door === 'string' ? raw.door : undefined,
           limit: raw.limit as number | undefined,
         },
+        async (seq, field, part) => {
+          const path = pathIn(overflowName(seq, field, part))
+
+          return failedWrites.get(path) ?? (await readText(path))
+        },
+        { onOverflowError: noteOverflowFailure },
       )
     }
 
     if (target !== undefined) {
       const found = await searchIn([target])
 
-      return { result: found.length === 0 ? `第 ${target} 个窗口里没有匹配（只搜了这个窗口）。` : found.map(renderHit).join('\n') }
+      return {
+        result: withOverflowNotes(
+          found.length === 0 ? `第 ${target} 个窗口里没有匹配（只搜了这个窗口）。` : found.map(renderHit).join('\n'),
+        ),
+      }
     }
 
     // A miss in the recent windows does not mean it never happened, so older ones are added one at a time until something hits.
@@ -1732,12 +1790,12 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
 
     const span = (from: number, to: number): string => (from === to ? `第 ${from} 个窗口` : `第 ${from}–${to} 个窗口`)
     if (hits.length === 0) {
-      return { result: state.window === 1 ? '没有匹配。' : `${span(1, state.window)}里都没有匹配。` }
+      return { result: withOverflowNotes(state.window === 1 ? '没有匹配。' : `${span(1, state.window)}里都没有匹配。`) }
     }
     const body = hits.map(renderHit).join('\n')
-    if (first === 1) return { result: body }
+    if (first === 1) return { result: withOverflowNotes(body) }
 
-    return { result: `${body}\n（搜了${span(first, state.window)}；${span(1, first - 1)}没搜，要搜用 window 指定）` }
+    return { result: withOverflowNotes(`${body}\n（搜了${span(first, state.window)}；${span(1, first - 1)}没搜，要搜用 window 指定）`) }
   }
 
   const historyRead = async (raw: Record<string, unknown>): Promise<ToolResult> => {
@@ -1847,6 +1905,18 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     const unwritten = unsaved()
 
     return `${describeFill(env.tokens, env.limit, state.window)} · 距上次换窗口 ${state.requestsSinceSwitch} 次请求 · 本小时已换窗口 ${switches} 次 · 进行中任务 ${open} 个${unwritten.length === 0 ? '' : ` · 有 ${unwritten.length} 个文件没写进磁盘`}`
+  }
+
+  /** One line of the write-amplification counters; process-local and never persisted. */
+  const historyWriteStats = (): string => {
+    const kb = (bytes: number): string => (bytes / 1024).toFixed(1)
+    const waf =
+      writeStats.logicalNewBytes === 0
+        ? '0.00'
+        : (writeStats.physicalBytesWritten / writeStats.logicalNewBytes).toFixed(2)
+    const merged = writeStats.coalesced === 0 ? '' : `，合并 ${writeStats.coalesced} 次`
+
+    return `history 写入：逻辑 ${kb(writeStats.logicalNewBytes)} KB / 实际 ${kb(writeStats.physicalBytesWritten)} KB（WAF=${waf}），写盘 ${writeStats.writeCalls} 次${merged}`
   }
 
   /** Whether the current page of the ledger carries an entry made after the latest person prompt. */
@@ -2210,6 +2280,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     ledgerAppend,
     ledgerRead,
     historyTool,
+    historyWriteStats,
     status,
     blocksCalls,
     requestSwitch,
