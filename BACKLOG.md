@@ -18,7 +18,7 @@
 |---|---|---|---|
 | PTC-09 | 先分析：从实验转录里抽出模型实际写的 run_code 程序（E6 有 626 个），统计重复模板（路径处理、行号格式化、grep 后筛选、测试输出解析等）和每段的输出 token。按“净节省 = 少生成和少回传的成本 − 新增说明和执行成本”排出候选 SDK 原语 | 只读分析，产出候选清单，决定 PTC-02/05 是否做、怎么做 | done（8277 个程序，95% 来自 DS 的 delegate PTC SDK，方言为 file_path/lines[]；报告 D:\ptcab\scratch\ptc09
 eport.md。代码侧样板下沉的总天花板约 12% 输出 token，典型会话净省 DS $0.0001、Haiku $0.002；更大的杠杆在回传，其中 read 占回传的 80%。候选按序：test 摘要、带行号文本、紧凑 read、grep 文本、bash 参数可选、read_many（排最后）） |
-| OPS-01 | （提前）统一成本口径和 A/B 夹具，复用 D:\ptcab：按未命中/缓存写/缓存读/输出分列，Haiku 和 DS 各 n≥10 | 后面每项都依赖它 | 部分完成（2026-10-20，v1.3 复审的 PR-A）：两套本地夹具（D:\ptcab\harness、effab2）开跑前必须用参考解自证，不满分就以 INVALID_GRADER 拒绝启动；测试收集为空时判 INVALID_COLLECTION；状态分 started/valid/completed/timed_out/invalid（按 model/collection/grader/infra 列出原因）；缺 usage 时记为不可用，不记 0；汇总附 27 组权重敏感性矩阵；失败注入回归 60 项和 7 项通过。夹具只在本地，不进仓库。manifest/哈希待补 |
+| OPS-01 | （提前）统一成本口径和 A/B 夹具，复用 D:\ptcab：按未命中/缓存写/缓存读/输出分列，Haiku 和 DS 各 n≥10 | 后面每项都依赖它 | 部分完成（2026-10-20，v1.3 复审的 PR-A）：两套本地夹具（D:\ptcab\harness、effab2）开跑前必须用参考解自证，不满分就以 INVALID_GRADER 拒绝启动；测试收集为空时判 INVALID_COLLECTION；状态分 started/valid/completed/timed_out/invalid（按 model/collection/grader/infra 列出原因）；缺 usage 时记为不可用，不记 0；汇总附 27 组权重敏感性矩阵；失败注入回归 60 项和 7 项通过。夹具只在本地，不进仓库。manifest/哈希待补：每次运行记 CC 版本、工具 schema 哈希、插件哈希、真实上游模型（防 haiku 被映射成 deepseek），见 OPS-02 |
 | PTC-02 | （P2，看 PTC-09 结果）`tools.read_many`：按顺序返回 path/revision/totalLines/coveredRange/truncated/fullRef，带总输出预算 | 多文件只读题：费用中位数 ≤ 现状，重读次数下降 | todo（PTC-09 排第 6，净收益最低） |
 | PTC-04 | 统一 Outcome `{status,data,coverage,refs,diagnostics,sideEffects}`，用适配层包装，不破坏旧返回 | 错误/超时/部分成功的报告准确率；费用不升 | todo |
 | PTC-05 | pytest/vitest 只打印失败摘要（优先解析 JUnit/JSON），完整日志用 ref | 跑测试题：输出字符数下降，质量不降 | 未过闸门，提示已回退（2026-10-19 DS flash task3 A/B 各 n=10：费用中位数 A $0.0167 / B $0.0184（+10%，置换检验 p=0.21），调用 28→31，评分 8/8 对 7.9；测试那一步回传少 33%（每次运行约 11.5K 字符），但总回传没降。SDK 里的 tools.test 和 read .text 保留，没写进提示就没有成本；B 版提示存为 D:\ptcab\scratch\ptc-only-system.v6-test.md，数据见 abtest/summary-run1.txt） |
@@ -54,6 +54,9 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 | CACHE-02 | 保活 shadow 模式：记录 would_have_keepalive 和实际恢复间隔，算净收益 | done（shadowMode 默认 false；scripts/keepalive-net.ts 估算净收益 +$4.90，基于 34 个超过 TTL 的间隔，偏 Opus，样本不是随机抽的） |
 | DEDUP-01 | read-dedup 回归：外部修改、CRLF、软链接、大小写路径、重叠区间；记录 savedChars | done（28/28 通过；撤掉了 mtime 变化时强制返回原文的逻辑，保留 savedChars；新测试 tests/dedup01.test.ts） |
 | SEC-01 | 只读 broker：junction、网络出口、resume 继承配置 | todo |
+| CACHE-03 | （2026-10-21 GPT 评审采纳）接 OTel api_request 的 cache_creation_5m_tokens / cache_creation_1h_tokens（2.1.300 起，本机 2.1.306 的 claude.exe 已确认），排除 CC 自带的空闲压缩（CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS） | done（评审前提有误：report.ts 早就读转录里实测的 ephemeral_5m/1h，不是推算。空闲压缩在转录里也是 trigger=auto，内部的 precomputed 标记不落盘（469 条边界 0 次），只能推断：auto 且压缩前空闲 ≥50 分钟 → inferred:idle_compact；带 precomputed → observed（前瞻）。历史转录里没有一例真实样本；5m TTL 的空闲压缩会漏判；report.ts 的实验 CSV 不含这一项。101/101 测试通过） |
+| OPS-02 | （GPT 评审采纳）实验 manifest 补全（见 OPS-01）+ mod 兼容性自检：启动时记录已注册事件名、工具 schema 哈希，事件缺失时安全降级并提示，不静默失效 | done（manifest：D:/ptcab/harness/manifest.py，effab2 有逐字节一致的副本；写一次即不可变，actualModel 和预期不符时判 invalid:model；toolSchemaHash 拿不到 input_schema，恒为 null，另记 toolNamesHash；harness 17 项单测 + 68 项回归通过。自检：scripts/mod-compat-check.ts 只做静态报告，发现 cache-keeper register.tsx:610 用到的 $.plugin.root 在 claude.exe 里找不到，待确认是不是误报；“运行时缺事件就降级”还没做。effab2 在 %TEMP% 下，可能被清理） |
+| PTC-10 | （GPT 评审采纳）PTC 效率指标：压缩比 = 内部原始结果字节 ÷ 返回给模型字节；工作密度 = 内部操作数 ÷ run_code 生成 token。先用 PTC-09 的语料离线算，区分真聚合和“JS 包一层 Read” | done（8234 个程序，整体压缩比约 2.11（估算）。单次调用原样回传的：Claude 端 6.4%，DS 端 14.7%，但样板只占代码的 4.7%，回传的内容模型本来就要看；DS 会话 96% 只有 run_code 可用，“单次读别用 run_code”没法落实。同会话精确重复读只占 0.3%。结论：不改提示，不加原语。报告 D:/ptcab/scratch/ptc10/report.md） |
 
 ## 2026-10-20 新增
 | ID | 内容 | 状态 |
