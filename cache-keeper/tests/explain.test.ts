@@ -56,6 +56,20 @@ const write = (tokens: number): Usage => ({
   cache_creation_input_tokens: tokens,
 })
 
+// A compaction boundary as the engine writes it: trigger and token counts,
+// no word on whether the session was idle.
+const boundary = (
+  atMs: number,
+  meta: Record<string, unknown>,
+): Record<string, unknown> => ({
+  type: 'system',
+  subtype: 'compact_boundary',
+  uuid: `b-${atMs}`,
+  timestamp: new Date(atMs).toISOString(),
+  isSidechain: false,
+  compactMetadata: meta,
+})
+
 describe('explainTranscript', () => {
   test('names a visible tool-list change as the observed cause of a miss', () => {
     const text = jsonl([
@@ -172,5 +186,90 @@ describe('explainTranscript', () => {
     expect(result.rows[1]!.result).toBe('hit')
     expect(result.rows[1]!.reasons).toHaveLength(0)
     expect(result.rows[1]!.verdict).toBe('none')
+  })
+
+  test('names an idle compaction the engine marked as precomputed', () => {
+    const text = jsonl([
+      assistant('r1', BASE, write(1_000)),
+      boundary(BASE + 600_000, {
+        trigger: 'auto',
+        preTokens: 250_000,
+        precomputed: true,
+      }),
+      assistant('r2', BASE + 660_000, write(400)),
+    ])
+
+    const result = explainTranscript(text)
+    const second = result.rows[1]!
+    const idle = second.reasons.find(reason => reason.code === 'idle_compact')
+    expect(idle?.level).toBe('observed')
+    expect(second.reasons.map(reason => reason.code)).toContain('compaction')
+    expect(second.compaction?.isPrecomputed).toBe(true)
+    expect(result.summary.idleCompacts).toBe(1)
+  })
+
+  test('infers an idle compaction from a long idle before an auto boundary', () => {
+    const text = jsonl([
+      assistant('r1', BASE, write(1_000)),
+      boundary(BASE + 3_600_000, {
+        trigger: 'auto',
+        preTokens: 300_000,
+        postTokens: 1_200,
+      }),
+      assistant('r2', BASE + 3_660_000, write(400)),
+    ])
+
+    const result = explainTranscript(text)
+    const second = result.rows[1]!
+    const idle = second.reasons.find(reason => reason.code === 'idle_compact')
+    expect(idle?.level).toBe('inferred')
+    expect(second.compaction).toEqual({
+      trigger: 'auto',
+      preTokens: 300_000,
+      idleSec: 3_600,
+      isPrecomputed: false,
+    })
+    expect(result.summary.compactions).toBe(1)
+    expect(result.summary.idleCompacts).toBe(1)
+  })
+
+  test('does not call a short idle before an auto compaction an idle compaction', () => {
+    const text = jsonl([
+      assistant('r1', BASE, write(1_000)),
+      boundary(BASE + 120_000, { trigger: 'auto', preTokens: 300_000 }),
+      assistant('r2', BASE + 150_000, write(400)),
+    ])
+
+    const result = explainTranscript(text)
+    const codes = result.rows[1]!.reasons.map(reason => reason.code)
+    expect(codes).toContain('compaction')
+    expect(codes).not.toContain('idle_compact')
+  })
+
+  test('keeps a manual compaction after a long idle a plain compaction', () => {
+    const text = jsonl([
+      assistant('r1', BASE, write(1_000)),
+      boundary(BASE + 5_400_000, { trigger: 'manual', preTokens: 300_000 }),
+      assistant('r2', BASE + 5_460_000, write(400)),
+    ])
+
+    const result = explainTranscript(text)
+    const codes = result.rows[1]!.reasons.map(reason => reason.code)
+    expect(codes).toContain('compaction')
+    expect(codes).not.toContain('idle_compact')
+  })
+
+  test('a boundary before the previous request does not explain a later miss', () => {
+    const text = jsonl([
+      boundary(BASE - 60_000, { trigger: 'auto', preTokens: 300_000 }),
+      assistant('r1', BASE, write(1_000)),
+      assistant('r2', BASE + 10_000, write(1_100)),
+    ])
+
+    const result = explainTranscript(text)
+    expect(result.rows[1]!.compaction).toBeNull()
+    expect(result.rows[1]!.reasons.map(reason => reason.code)).not.toContain(
+      'compaction',
+    )
   })
 })

@@ -133,6 +133,53 @@ describe('parseTranscript', () => {
     expect(parsed.parseErrors).toBe(1)
     expect(parsed.requests[1]?.cacheMissReason).toBe('system_changed')
   })
+
+  test('reads a compaction boundary with its trigger and position', () => {
+    const parsed = parseTranscript(
+      [
+        row({ usage: WRITE_1H }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'compact_boundary',
+          timestamp: '2026-10-06T01:00:00.000Z',
+          isSidechain: false,
+          compactMetadata: {
+            trigger: 'auto',
+            preTokens: 250_000,
+            postTokens: 1_200,
+            precomputed: true,
+          },
+        }),
+        row({ id: 'msg_2', request: 'req_2', usage: WRITE_1H }),
+      ].join('\n'),
+    )
+    expect(parsed.compactions).toHaveLength(1)
+    expect(parsed.compactions[0]).toMatchObject({
+      trigger: 'auto',
+      preTokens: 250_000,
+      postTokens: 1_200,
+      isPrecomputed: true,
+      isSidechain: false,
+      timestamp: '2026-10-06T01:00:00.000Z',
+    })
+    expect(parsed.requests[1]!.line).toBeGreaterThan(parsed.compactions[0]!.line)
+  })
+
+  test('a boundary without compactMetadata is still a boundary', () => {
+    const parsed = parseTranscript(
+      [
+        JSON.stringify({ type: 'system', subtype: 'compact_boundary' }),
+        row({ usage: WRITE_1H }),
+      ].join('\n'),
+    )
+    expect(parsed.compactions[0]).toMatchObject({
+      trigger: null,
+      preTokens: null,
+      postTokens: null,
+      isPrecomputed: false,
+    })
+    expect(parsed.requests).toHaveLength(1)
+  })
 })
 
 describe('matchSplits', () => {
