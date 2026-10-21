@@ -1,7 +1,7 @@
 import { classifyUsage, observedTtl } from './classify.ts'
 import type { ProbeResult } from './classify.ts'
 import { parseTranscript } from './parser.ts'
-import type { ParseResult, TranscriptRequest } from './parser.ts'
+import type { ParseResult, TranscriptCompaction, TranscriptRequest } from './parser.ts'
 import type { PrefixSnapshot } from './prefix.ts'
 import type { Ttl } from './pricing.ts'
 
@@ -32,6 +32,14 @@ export type ExplainRow = {
   readShare: number | null
   ttl: Ttl | null
   gapSec: number | null
+  /** The compaction boundary between the previous request of this thread and this one. */
+  compaction: {
+    trigger: string | null
+    preTokens: number | null
+    /** Idle seconds before the boundary was written, when both timestamps are known. */
+    idleSec: number | null
+    isPrecomputed: boolean
+  } | null
   explicitMissReason: string | null
   cacheMissedTokens: number | null
   reasons: ExplainReason[]
@@ -49,6 +57,10 @@ export type ExplainSummary = {
   inferred: number
   unknown: number
   noMiss: number
+  /** Requests with a compaction boundary since the previous request of their thread. */
+  compactions: number
+  /** Requests whose miss is put down to an idle compaction. */
+  idleCompacts: number
   unknownPrefixFields: {
     systemPrompt: number
     toolList: number
@@ -64,6 +76,13 @@ export type ExplainResult = {
 
 const TTL_MS: Record<Ttl, number> = { '5m': 300_000, '1h': 3_600_000 }
 
+/**
+ * How long a session must have been idle for an auto compaction to be the
+ * engine's idle compaction. The engine fires it at 0.9 of the cache TTL
+ * (54 min on a 1h cache), before the entry expires.
+ */
+const IDLE_COMPACT_MIN_SEC = 50 * 60
+
 const threadOf = (request: TranscriptRequest): string =>
   request.isSidechain
     ? `subagent:${request.agentId ?? 'unknown'}`
@@ -76,6 +95,32 @@ const ttlOf = (request: TranscriptRequest): Ttl | null => {
 
 const seconds = (ms: number): string =>
   `${Math.round(ms / 1000)}s`
+
+/** The last compaction of this thread between the previous request and this one. */
+const compactionSince = (
+  compactions: readonly TranscriptCompaction[],
+  previous: TranscriptRequest,
+  request: TranscriptRequest,
+): TranscriptCompaction | null => {
+  let found: TranscriptCompaction | null = null
+  for (const compaction of compactions) {
+    if (compaction.line <= previous.line || compaction.line >= request.line) continue
+    if (compaction.isSidechain !== request.isSidechain) continue
+    found = compaction
+  }
+
+  return found
+}
+
+/** How long the session sat idle before the boundary was written. */
+const idleBefore = (
+  compaction: TranscriptCompaction,
+  previous: TranscriptRequest,
+): number | null => {
+  if (compaction.timestamp === null || previous.timestamp === null) return null
+  const ms = Date.parse(compaction.timestamp) - Date.parse(previous.timestamp)
+  return Number.isFinite(ms) && ms >= 0 ? Math.round(ms / 1000) : null
+}
 
 const changed = (
   previous: PrefixSnapshot,
@@ -141,6 +186,14 @@ export const explainTranscript = (jsonl: string): ExplainResult => {
         previous !== undefined && changed(previous.prefix, prefix, 'pluginSetHash'),
     }
     const reasons: ExplainReason[] = []
+    const compaction =
+      previous === undefined
+        ? null
+        : compactionSince(parse.compactions, previous, request)
+    const compactionIdleSec =
+      compaction !== null && previous !== undefined
+        ? idleBefore(compaction, previous)
+        : null
 
     if (result === 'cold') {
       push(reasons, 'observed', 'no_prompt_tokens', 'the request carried no prompt tokens')
@@ -152,6 +205,38 @@ export const explainTranscript = (jsonl: string): ExplainResult => {
           'first_request_in_thread',
           'no earlier request in this thread is in the transcript to reuse a cache from',
         )
+      }
+      if (compaction !== null) {
+        const trigger = compaction.trigger ?? 'unknown'
+        const before =
+          compaction.preTokens === null
+            ? ''
+            : ` of ${compaction.preTokens} tokens`
+        push(
+          reasons,
+          'observed',
+          'compaction',
+          `the transcript records a ${trigger} compact_boundary${before} between the previous request and this one`,
+        )
+        if (compaction.isPrecomputed) {
+          push(
+            reasons,
+            'observed',
+            'idle_compact',
+            'the engine marked the compact_boundary as precomputed: its summary was written while the session was idle',
+          )
+        } else if (
+          trigger === 'auto' &&
+          compactionIdleSec !== null &&
+          compactionIdleSec >= IDLE_COMPACT_MIN_SEC
+        ) {
+          push(
+            reasons,
+            'inferred',
+            'idle_compact',
+            `${seconds(compactionIdleSec * 1000)} of idle before an auto compaction, inside the engine's idle-compaction window (0.9 of the cache TTL); a context-limit auto compaction after the same idle would look the same`,
+          )
+        }
       }
       if (request.cacheMissReason !== null) {
         const type = request.cacheMissReason
@@ -280,6 +365,15 @@ export const explainTranscript = (jsonl: string): ExplainResult => {
       readShare,
       ttl,
       gapSec,
+      compaction:
+        compaction === null
+          ? null
+          : {
+              trigger: compaction.trigger,
+              preTokens: compaction.preTokens,
+              idleSec: compactionIdleSec,
+              isPrecomputed: compaction.isPrecomputed,
+            },
       explicitMissReason: request.cacheMissReason,
       cacheMissedTokens: request.cacheMissedTokens,
       reasons,
@@ -300,6 +394,10 @@ export const explainTranscript = (jsonl: string): ExplainResult => {
     inferred: count('inferred'),
     unknown: count('unknown'),
     noMiss: rows.filter(row => row.result === 'hit' || row.result === 'cold').length,
+    compactions: rows.filter(row => row.compaction !== null).length,
+    idleCompacts: rows.filter(row =>
+      row.reasons.some(reason => reason.code === 'idle_compact'),
+    ).length,
     unknownPrefixFields: {
       systemPrompt: rows.filter(row => row.prefix.systemPromptHash === null).length,
       toolList: rows.filter(row => row.prefix.toolListHash === null).length,
@@ -361,6 +459,7 @@ export const renderExplain = (result: ExplainResult, tail?: number): string => {
     `reasons: observed ${s.observed} · inferred ${s.inferred} · unknown ${s.unknown}`,
     `prefix fields unavailable: system ${s.unknownPrefixFields.systemPrompt}/${s.requests} · tools ${s.unknownPrefixFields.toolList}/${s.requests} · plugin ${s.unknownPrefixFields.pluginSet}/${s.requests}`,
     'tools = deferred-tool set from deferred_tools_record/delta; sys = prompt_snapshot.systemPrompt; plugin = MCP-server set + skill listing (observed proxy, not an authoritative plugin list).',
+    'compaction = a compact_boundary row between two requests (observed). idle_compact = observed only when the boundary carries compactMetadata.precomputed; otherwise inferred from an auto boundary after at least 50 min of idle. Transcripts write trigger manual|auto only, so an idle compaction and a context-limit auto compaction after the same idle look alike.',
     'unknown means the transcript does not carry the field; no value is inferred for it.',
   ]
   return [head, ...lines, ...foot].join('\n')
