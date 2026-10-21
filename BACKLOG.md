@@ -63,7 +63,7 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 | FORK-01 | 读取量大的子任务放进 fork 子代理，读取结果留在 fork 里，主会话只收报告 | doing（真 haiku 实测：fork 第一次请求完整命中主会话前缀，只新写约 570 token。但 fork 固定继承主会话模型，每步都带全部上下文：比主会话自己做省约一半，比精简子代理（第一次请求 7–10K）和 DS 都贵。只适合需要上下文、不好写 brief 的排查，优先级降低。开关是 CLAUDE_CODE_FORK_SUBAGENT，本机 settings 设为 0） |
 | RED-01 | 大工具输出先交给 Haiku 压成带原文引用的回执（参照 SoL-Pi 的 Evidence-Preserving Reducer），引用逐字核对，不通过就保留原文 | dropped（2026-10-20：Top 30 会话里 232 个大输出只占 1.82M 字符，就算压缩免费，毛节省也只有总额度的 0.51%，净省 0.24–0.44%。注意：压缩率 7.5× 和核对通过率 90% 是 DS 环境里被映射成的 deepseek-v4.1-flash 跑出来的，不是 Haiku） |
 | REF-01 | 调研 SoL-Pi 的 Action Fusion、ObservationPack、Online Context Compact，以及 facebookresearch/context-language-models，判断能否移植 | done（ObservationPack：引擎在发请求前不能改写消息，订阅缓存写读比约 50，移植不了。Action Fusion：Edit→Bash 只占请求的 1.02%，不做。OCC：经济判断 ctx-mod 的 judgeSwitch 已经有了，可借鉴的是完成边界触发换窗，预期 0–3%，见 CTX-04。CLM：省钱靠服务端 KV 重定位，Claude 没有；它让模型自己写摘要也没赢过现成的摘要方案（47.3 对 47.8）。可借鉴的是入口截断加存盘（TRUNC-01）、预算提醒、交接加索引和勿重试清单） |
-| TRUNC-01 | session.append 入口截断大 Bash 输出：≥20KB 时留头 6KB 加尾 3KB，全文进 history，取回按 4KB 分页 | dropped（2026-10-20 影子评估，15 天 6655 条 Claude 侧 Bash 结果：CC 已把约 10–12KB 以上的输出落盘，上下文只留 2KB 预览，仍超过 20KB 留在上下文里的只有 4 条。毛省 0.435%，扣掉补读后净省 0.002–0.02%；若取代现有预览反而多花 0.084%。原先 3.5–5.5% 的估算没考虑落盘机制。报告在 D:\ptcab\scratch	runc01eport.md） |
+| TRUNC-01 | session.append 入口截断大 Bash 输出：≥20KB 时留头 6KB 加尾 3KB，全文进 history，取回按 4KB 分页 | dropped（2026-10-20 影子评估，15 天 6655 条 Claude 侧 Bash 结果：CC 已把约 10–12KB 以上的输出落盘，上下文只留 2KB 预览，仍超过 20KB 留在上下文里的只有 4 条。毛省 0.435%，扣掉补读后净省 0.002–0.02%；若取代现有预览反而多花 0.084%。原先 3.5–5.5% 的估算没考虑落盘机制。报告在 D:/ptcab/scratch/trunc01/report.md） |
 | CTX-04 | 换窗时机加上“账本任务完成”这个边界，参照 OCC：按边界间隔推算剩余请求数，缓存债务结转 | todo（预期 0–3%，主要改善切点质量） |
 | RD-02 | read-dedup 覆盖主会话 Bash 单条纯读取（cat / sed -n / head -n，可带 cd 前缀），与 Read 共用记录，只在范围完全相同且文件未改时替换，沿用 300 字符门槛 | done（2026-10-20：43/43；真实冒烟大文件第二次返回桩、小文件原样；转录统计这类重复约占 Claude 额度 0.35%） |
 | DLG-01 | delegate：resume 不传 mode/ptc 时沿用该代理上次的设置；启动前检查 cwd，不存在直接报错 | done（仅本地插件，不在本仓库；20/20） |
@@ -74,7 +74,7 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 
 | ID | 内容 | 状态 |
 |---|---|---|
-| LONG-04 | 更难的长程题：在 long3 基础上加 A7–A10 高难 bug（至少 2 个题面不提），目标是 haiku low 只拿 60–70 分，用来重新检验 low/medium | 进行中 |
+| LONG-04 | 更难的长程题：在 long3 基础上加 A7–A10 高难 bug（至少 2 个题面不提），目标是 haiku low 只拿 60–70 分，用来重新检验 low/medium | 完成：v3 上 medium 66.0 / low 60.8 / 自适应 63.5（各 5 次）；low −5.2 分、−14% units；自适应从未主动升档。待办：实验关掉 cache-keeper，effab2 迁出 %TEMP% |
 | GUARD-01b | 先修配置说明和代理 frontmatter 不一致的地方（reviewer 已统一按定义用 high），再审计工具清单指纹 | todo（排在 CTX-04 之前） |
 | EXP-DS-DIAG | 同一批含隐蔽 bug 的题：DS 直接执行，对比 DS 先诊断再执行（可选再加 Claude 审查） | todo（DS 不占 Claude 额度，排在 LONG-04 之后） |
 
@@ -89,5 +89,6 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 | caveman 式极限压缩子代理输出 | 子代理输出里可见文字只占约 9%（工具参数 70%、思考 21%），压到极限总体也省不到 1%，还可能影响质量和交接 |
 | 实时额度面板 | 用户认为没必要；需要时用一次性审计脚本 |
 | model.fork 旁路提问 | Claude Code 已有 /btw |
+| ephemeral-turn（按轮回滚大读取，MCP 探针） | 机制成立（真 haiku：前缀缓存完整，约 14K 读取被删掉），但 2026-10-21 长会话 A/B（haiku，n=1，32 轮后续，两组都 VERIFY PASS）插件组总 units 多 8.3%（191K 对 177K）：后续段平均每次请求只便宜 6%（1955 对 2088，理论值是省约 350），而工具风格变了（多用 Edit 和 Grep），多出 10 次请求，把节省吃掉了。收益小于行为噪声，不值得再花 Claude 额度；产物在 D:/ptcab/scratch/ephemeral-turn |
 | run_code 内读取去重 | 这类重复几乎都发生在 DS 会话，不占 Claude 额度 |
 | 工具参数无损压缩 | 工具收到的字符必须由模型逐字生成；大头是新文件和一次性脚本，只能靠复用脚本、少用 PowerShell 这类习惯改进 |
