@@ -120,8 +120,9 @@ node scripts/explain-cache.ts <session.jsonl> --tail 20  # 只看最后 20 个�
 
 逐个请求列出：工具清单 hash、系统提示 hash / 字符数、插件集 hash（MCP + skills，能拿到多少算多少）、`cache_read` / `cache_creation`、缓存是否命中、距上次请求的间隔、TTL，以及未命中的原因。原因分三级：
 
-- **observed**：transcript 里直接可见。`message.diagnostics.cache_miss_reason`、工具清单 hash 变化、系统提示 hash 变化、插件集 hash 变化、`previous_message_not_found`（服务端驱逐）。
-- **inferred**：只能推断。距上次请求超过 TTL、模型变化、客户端版本变化。
+- **observed**：transcript 里直接可见。`message.diagnostics.cache_miss_reason`、工具清单 hash 变化、系统提示 hash 变化、插件集 hash 变化、`previous_message_not_found`（服务端驱逐）、两次请求之间的 `compact_boundary`（`compaction`，带 `trigger`）。
+- **inferred**：只能推断。距上次请求超过 TTL、模型变化、客户端版本变化、空闲压缩（`idle_compact`）。
+- **空闲压缩（`idle_compact`）**：引擎在缓存过期前按 TTL 的 0.9（1h 缓存约 54 分钟）给空闲的大会话做压缩。transcript 的 `compactMetadata` 只写 `trigger`（`manual` / `auto`）和 token 数，引擎内部标记 `precomputed` 目前不落盘（2.1.299–2.1.306 的 469 条边界里一条都没有），所以：边界带 `precomputed: true` 时记 observed；否则只有 `trigger` 为 `auto` 且压缩前空闲 ≥ 50 分钟时记 inferred。同一段空闲后因上下文超限触发的 auto 压缩看起来一模一样，无法区分；`manual` 压缩即使空闲很久也仍是普通 `compaction`。
 - **unknown**：没有可见原因，或该会话的 transcript 根本没带前缀信息。拿不到的字段标 `unknown`，不猜。
 
 hash 的输入是 transcript 里的 `prompt_snapshot`、`deferred_tools_record` / `deferred_tools_delta`、`mcp_instructions_delta`、`skill_listing`。没有工具定义时工具 hash 按名字算（`toolHashBasis: names`），两者都没有就是 `none`；插件集同理（`mcp+skills` / `mcp` / `skills` / `none`）。系统提示只存 hash 和长度，不存正文。

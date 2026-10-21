@@ -26,13 +26,35 @@ export type TranscriptRequest = {
   cacheMissedTokens: number | null
   /** Order of the request's first assistant row in the transcript. */
   order: number
+  /** Position of the request's first row among the transcript's non-empty lines. */
+  line: number
   /** The prefix as it stood just before the request. */
   prefix: PrefixSnapshot
   rowCount: number
 }
 
+/** A `system`/`compact_boundary` row: the engine rewrote the conversation. */
+export type TranscriptCompaction = {
+  /** Position of the boundary row among the transcript's non-empty lines. */
+  line: number
+  timestamp: string | null
+  /** `compactMetadata.trigger` as written: manual, auto, or something newer. */
+  trigger: string | null
+  preTokens: number | null
+  postTokens: number | null
+  isSidechain: boolean
+  /**
+   * The engine's own mark for a summary written ahead of time (idle
+   * compaction). Current builds keep it out of the transcript, so this is
+   * false unless a build starts writing it.
+   */
+  isPrecomputed: boolean
+}
+
 export type ParseResult = {
   requests: TranscriptRequest[]
+  /** The engine's compaction boundaries, in transcript order. */
+  compactions: TranscriptCompaction[]
   assistantRows: number
   parseErrors: number
   /** Requests whose duplicate rows disagreed on usage. */
@@ -54,6 +76,7 @@ const text = (value: unknown): string | null =>
 
 type Candidate = {
   order: number
+  line: number
   row: Row
   message: Row
   usage: Usage
@@ -67,6 +90,7 @@ type Candidate = {
 const readCandidate = (
   row: Row,
   order: number,
+  line: number,
   prefix: PrefixSnapshot,
 ): Candidate | undefined => {
   const message = row.message
@@ -99,6 +123,7 @@ const readCandidate = (
 
   return {
     order,
+    line,
     row,
     message,
     usage,
@@ -122,6 +147,31 @@ const better = (a: Candidate, b: Candidate): Candidate => {
   }
 
   return a.order > b.order ? a : b
+}
+
+const numberOrNull = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null
+
+const isCompactBoundary = (row: Row): boolean =>
+  row.type === 'system' && row.subtype === 'compact_boundary'
+
+/**
+ * What a compaction boundary says about itself. The engine writes
+ * `trigger` (manual | auto) plus token counts; whether the summary was
+ * written while the session sat idle is not among them today.
+ */
+const readCompaction = (row: Row, line: number): TranscriptCompaction => {
+  const meta = isRecord(row.compactMetadata) ? row.compactMetadata : {}
+
+  return {
+    line,
+    timestamp: text(row.timestamp),
+    trigger: text(meta.trigger),
+    preTokens: numberOrNull(meta.preTokens),
+    postTokens: numberOrNull(meta.postTokens),
+    isSidechain: row.isSidechain === true,
+    isPrecomputed: meta.precomputed === true,
+  }
 }
 
 type MissInfo = { type: string | null; missedTokens: number | null }
@@ -163,20 +213,28 @@ export const parseTranscript = (jsonl: string): ParseResult => {
   let assistantRows = 0
   let parseErrors = 0
   let order = 0
+  let line = 0
   let prefix = initialPrefix()
-  for (const line of jsonl.split('\n')) {
-    if (line.trim() === '') continue
+  const compactions: TranscriptCompaction[] = []
+  for (const raw of jsonl.split('\n')) {
+    if (raw.trim() === '') continue
     let row: unknown
     try {
-      row = JSON.parse(line)
+      row = JSON.parse(raw)
     } catch {
       parseErrors += 1
       continue
     }
     if (!isRecord(row)) continue
+    const rowLine = line
+    line += 1
     prefix = applyPrefixRow(prefix, row)
+    if (isCompactBoundary(row)) {
+      compactions.push(readCompaction(row, rowLine))
+      continue
+    }
     if (row.type !== 'assistant') continue
-    const candidate = readCandidate(row, order, prefixSnapshot(prefix))
+    const candidate = readCandidate(row, order, rowLine, prefixSnapshot(prefix))
     order += 1
     if (candidate === undefined) continue
     assistantRows += 1
@@ -230,6 +288,7 @@ export const parseTranscript = (jsonl: string): ParseResult => {
       cacheMissReason: miss.type,
       cacheMissedTokens: miss.missedTokens,
       order: first.order,
+      line: first.line,
       prefix: first.prefix,
       rowCount: group.length,
     })
@@ -237,6 +296,7 @@ export const parseTranscript = (jsonl: string): ParseResult => {
 
   return {
     requests,
+    compactions,
     assistantRows,
     parseErrors,
     dedupeWarningCount,
