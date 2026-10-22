@@ -25,7 +25,7 @@ eport.md。代码侧样板下沉的总天花板约 12% 输出 token，典型会�
 | PTC-10 | 未过闸门（2026-10-19 两轮 A/B，task3，DS flash，每组 n=10）。第 1 轮：R（150 行，只给 more 字段）费用 +9%，调用 24.5→29.5；原因是模型只打印 lines，看不到 more，误以为已经读完，又多读了几次。第 2 轮改为在 lines 末尾加提示行：R2（150）费用 +14%，p=0.08，回传反而更多；R3（300）费用和对照持平（p=0.70），但有 1 次失控到 97 轮后超时。结论：截断 read 只会把重复读换成补读，省不下钱。runner 里的开关 PTC_RUN_DSH_READ_LIMIT 保留，默认关闭。提示存档在 D:\ptcab\scratch\ptc-only-system.R*.md，数据在 abtest/summary-run3.txt、summary-run4.txt |
 eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% 的 read 不带 limit；超过 200 行的读取占 read 字符的 74%；重叠 ≥80% 的重复读占 54%（与编辑无关的占 32%）；读大块后又 grep 同一文件的占 24%。候选方案：无 limit 时默认 150 行并提示剩余行数（预计省总回传 11–16%）、大文件先返回结构摘要、会话内已读区间去重、先 grep 后带 offset 读、行号前缀按需 | 下一步：先单独 A/B“默认 150 行”这一项 | todo |
 | PTC-05b | v6 的三个缺陷（PTC-10 发现）：tools.test 在 workdir 无效或启动失败时返回空的 unknown，没有错误信息和 tail（XB4 复现，用的是 /tmp/... 的 msys 路径）；提示示例 3 对带行号的 .text 用 ^ 锚定正则，结果失效；fullOutput 是文件路径，却被当成内容切片（XB7）。修好后再重做 A/B（B 组多出的 42 次调用里，这三处能解释 10–16 次；差异总体不显著，p=0.195） | 缺陷已修（error 兜底、msys 路径、outputPath），但三轮 A/B 都比对照贵：v6 +10%，v6b +28%，T2（只改 test、去掉 .text）+17%，p=0.009 显著。T2 的输出 token 从 17.3K 增到 20.3K，回传也增加。结论：不要把 tools.test 写进 DS 提示。SDK 里保留实现，不写进提示就没有成本 | dropped（提示层） |
-| PTC-07 | grep 结果 queryRef 分页 + 快照指纹，文件变了标 snapshot_stale | 大搜索翻页不重跑 rg | todo |
+| PTC-07 | grep 结果 queryRef 分页 + 快照指纹，文件变了标 snapshot_stale | 大搜索翻页不重跑 rg | dropped（2026-10-22 OPP-01：工作区未改时重跑 grep 只占 Claude 侧 U 0.07%、DS 请求 0.67%） |
 | PTC-03 | （暂缓，不删）`tools.fanout` 有界并发（只读优先，bash 默认串行除非 readOnly），单项超时、取消、部分成功 | 并发/取消/partial 测试通过；混合任务耗时下降 | todo |
 | PTC-08 | `flow` DAG（dependsOn） | 先看 PTC-03 后模型是否常写依赖逻辑 | todo |
 | CTX-01b | 按 WAF 结果选追加写或小 segment + manifest | WAF 实降，迁移前后 seq 和 SHA-256 一致 | done（segment 滚动加 manifest，默认 K=8、B=1MiB；470 条记录时 WAF 141.6→4.96，5000 条冷启动 213ms（旧实现 136ms）；477 个测试全过，含换窗阈值调整） |
@@ -81,9 +81,22 @@ eport.md）：read 占回传 54–65%，其中 97% 是整块打印；30–44% �
 | GUARD-01b | 先修配置说明和代理 frontmatter 不一致的地方（reviewer 已统一按定义用 high），再审计工具清单指纹 | todo（排在 CTX-04 之前） |
 | EXP-DS-DIAG | 同一批含隐蔽 bug 的题：DS 直接执行，对比 DS 先诊断再执行（可选再加 Claude 审查） | todo（DS 不占 Claude 额度，排在 LONG-04 之后） |
 
+## 2026-10-22 离线审计后（零 Claude 额度，DS 跑转录）
+| ID | 内容 | 状态 |
+|---|---|---|
+| MAIN-01 | 主会话额度拆解（30 个 Opus 主会话，236M U）：R 42% / O 33%（thinking 11%）/ W 24%；平均 prompt 263K，62% U 花在 >200K 的请求上；71% U 是主会话自己干活（Read/Grep/Bash/Edit/run_code），派发只占 5%。报告 D:/ptcab/scratch/main-audit/report.md | done |
+| DISPATCH-GATE | 主会话连续执行类请求达到阈值时，用 hook 提醒或要求派发（MAIN-01 估计连续 ≥4 轮的执行段派给 DS 可挽回 36–41%，属上界；扣掉验收读取和必须本机跑的探针，预期 15–25%） | todo（优先级最高） |
+| CTX-WIN-160 | 换窗阈值放在 160–200K（MAIN-01：前缀热时省 16.5–17.6%，冷窗时 160K 为 −0.7%；固定前缀 68K，80K 不可达）；避免 1M 窗口跑到 50 万上下文 | todo（与 CTX-04 合并考虑） |
+| BOOKKEEP-MERGE | update_plan/wrap_up/ledger 不单独占一轮，跟其他调用同条消息发出（MAIN-01：567 个纯簿记请求，约 5.5%） | todo（行为规则，先写进 CLAUDE.md） |
+| EFF-SIGNAL | 用已有 A/B 数据找 effort 路由信号：run 级早期信号不存在（组内 ρ≈0，强特征只是题目代理）；该用哪档由题目决定，oracle 只比全 low 多 1.9 分；唯一稳定规则“题面 ≥3000 字符 → medium”只比全 low 高 0.2 分。long3-batch 上 high 用 0.75M units，low 用 1.34M（low 反而更贵的实证，仅一题）。xhigh 无数据、high 只有一题；最小补测 75 run，并且 runner 要先保留 thinking。报告 D:/ptcab/scratch/eff-signal/report.md | blocked（等额度恢复再补测） |
+| RECALL-01 | 回想回放：23 个正例（占人类轮次约 1%），其中 39% 在转录里找不到出处；BM25 Top-1 精确命中 2/11，误报大量重叠，实体匹配和规则事件匹配一个都没命中 → 不做全历史检索注入。11/11 可回放的失败都发生在窗口边界，改为“换窗时钉住本会话已定的决策”（ctx-mod 交接已经带上账本，要补的是决定型陈述加行号），另外要查 memory 的合规问题（MEM-COMPLY 更正：P12 违规时“少派”规则尚未写入，当时上下文里的 memory 是模型自己写的“多派 Sonnet”；真因是索引行不写约束、写成口号、与 CLAUDE.md 冲突，见 D:/ptcab/scratch/mem-comply/report.md） | todo（CTX-PIN） |
+
 ## 已决定不做
 | ID | 原因 |
 |---|---|
+| OPP-01 离线机会审计（2026-10-22，GPT 复审 OMP/OmO 方案后） | 1358 个转录、38.5K 请求，按 Opus/Haiku/DS 分层，门槛 Claude 侧 U ≥1%。四类合计 0.74%：锚点编辑 0.38%（Haiku 层单看 1.08%，绝对量小；DS 侧请求 2.43%，只影响 DS 费用，暂不做）、错误熔断 0.13%、grep 重跑 0.07%、后台轮询 0.16%（Claude 侧全是 cat .output，tools.job 默认 wait 改不到）。报告 D:/ptcab/scratch/opp01/report.md，反事实估计、语料偏实验会话 |
+| PTC-READ-OUTLINE 结构化读取（OMP 式 outline） | 2026-10-22 离线影子评估（用转录当时返回内容生成 outline，按后续编辑/读取定位判够用/需展开/定位不到）：Claude 侧 601 个整文件读净 U 仅 +0.14%（不计额外请求的下界 0.59%），Haiku 层为负；定点读全为负；DS 侧净字符 +6.0M 但 678 次额外请求各重付约 47K 全价上下文，不划算。补读记 0，结论偏乐观。报告 D:/ptcab/scratch/outline-shadow/report.md |
+| Kibitzer 式旁路回想（OmO） | 只有 4 个真实提醒正例，样本不足；与 ctx-mod 账本/历史重叠，等正例积累再议 |
 | MEM-01 Project Memory | 与 Claude Code 自带 auto-memory 重复 |
 | Rust 执行器 | 没有证据显示 Node I/O 是瓶颈 |
 | 用完即删（轮末删除旧读取结果） | 受插件接口限制，轮末删除只省 2–4% |
