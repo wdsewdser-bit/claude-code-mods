@@ -107,6 +107,11 @@ export type HandoffInput = {
   window: number
   /** The home page the ledger rendered: requests and open tasks. Never cut. */
   home: string
+  /**
+   * What the person settled, already rendered: their own words from every window,
+   * which the recent requests and the open tasks do not carry. Never cut.
+   */
+  decisions?: string
   /** Why the window was switched, when the gate held a load back, already rendered; never cut. */
   loadReason?: string
   /**
@@ -169,9 +174,10 @@ export const renderActions = (actions: readonly HandoffAction[]): string =>
 /**
  * The one message a new window opens with. `handoffTokens` is a target, not a
  * ceiling: the recent actions go first, then the working set is cut from its end,
- * but the opening, the home page, the last reply, the subagents and the loaded
- * tools always stay, since they carry the request, the open tasks, the conclusion
- * and how to pick them up — so the total can run past it. What the open tasks add
+ * but the opening, the home page, the decisions, the last reply, the subagents and
+ * the loaded tools always stay, since they carry the request, the open tasks, the
+ * rules already settled, the conclusion and how to pick them up — so the total can
+ * run past it. What the open tasks add
  * is bounded by the home page (`MAX_FULL_ACTIVE` in ledger.ts), not by this cap.
  */
 export const assemble = (input: HandoffInput, config: Config): string => {
@@ -187,8 +193,9 @@ export const assemble = (input: HandoffInput, config: Config): string => {
   const tools = input.tools ?? ''
   const loadReason = input.loadReason ?? ''
   const coverage = input.coverage ?? ''
+  const decisions = input.decisions ?? ''
   const join = (workset: string, actions: string): string =>
-    [opening, input.home, reply, agents, loadReason, tools, coverage, workset, actions].filter(part => part !== '').join('\n\n')
+    [opening, input.home, decisions, reply, agents, loadReason, tools, coverage, workset, actions].filter(part => part !== '').join('\n\n')
   const actions = renderActions(input.actions)
   const whole = join(input.workset, actions)
   if (estimateTokens(whole) <= config.handoffTokens) return whole

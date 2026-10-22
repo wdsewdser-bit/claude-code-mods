@@ -43,6 +43,7 @@ import {
   shardName,
   sliceBounds,
   splitParts,
+  stripInjected,
   toolGroupOf,
 } from './history.ts'
 import type { LoadedTool, OverflowFailure, SearchHit, Shard } from './history.ts'
@@ -52,7 +53,12 @@ import { activityOf, filesOf, locate, pathKey, pathsToRead, relativePath, render
 import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
+import { extractDecisions, renderDecisions } from './decisions.ts'
+import type { DecisionRevoke } from './decisions.ts'
 import { describeFill, gateSwitch, isCold, judgeSwitch, levelOf } from './usage.ts'
+
+// Kept exported from here: the hooks and the tests have read it from this module all along.
+export { stripInjected } from './history.ts'
 
 export type Io = {
   read: (path: string) => Promise<string>
@@ -249,6 +255,9 @@ const SHARED_DIR = 'costly'
 /** The held-back user messages, kept in the session's directory until they are delivered. */
 const HELD_FILE = 'held.json'
 
+/** The decisions the person took back, kept beside the ledger so a new window still knows. */
+const DECISION_FILE = 'decisions.jsonl'
+
 type HeldItem = { id: number; text: string; at: number }
 
 /** Reads held.json; a missing or damaged file means nothing is held, never an error. */
@@ -277,28 +286,6 @@ const heldFrom = (text: string | null): HeldItem[] => {
  * back by it, and a rebuild that still happens is measured and recorded again.
  */
 const SHARED_MS = 30 * 24 * 3_600_000
-
-const REMINDER_OPEN = '<system-reminder>'
-const REMINDER_CLOSE = '</system-reminder>'
-
-/**
- * The text with the engine's injected notes stripped off its head. The engine
- * files a session-start hook's `<system-reminder>` block in the same door as a
- * person's words, so a request has to be read without it; a block that is never
- * closed is left alone, since the rest then cannot be trusted to be the person's.
- */
-export const stripInjected = (text: string): string => {
-  let rest = text
-  for (;;) {
-    const head = rest.trimStart()
-    if (!head.startsWith(REMINDER_OPEN)) break
-    const end = head.indexOf(REMINDER_CLOSE)
-    if (end < 0) return text
-    rest = head.slice(end + REMINDER_CLOSE.length)
-  }
-
-  return rest.trim()
-}
 
 /** How much of the previous window's last assistant reply the handoff carries. */
 const LAST_REPLY_CHARS = 6_000
@@ -406,6 +393,8 @@ export type Session = {
   flush: () => Promise<void>
   /** The files (names only, sorted) whose last write failed and has not succeeded since. */
   unsaved: () => string[]
+  /** Takes back one decision by the history seq it was said in, so new windows stop carrying it. */
+  decisionRevoke: (input: unknown) => Promise<ToolResult>
   /**
    * Keeps a user's message on disk before it is held back, so a reload cannot lose it. Resolves to
    * the item's id, or null when the write failed and the message must not be held.
@@ -936,6 +925,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     )
   }
   const archives = new Map<number, LedgerEntry[]>()
+  /** The decisions the person took back, by the history seq they were said in. */
+  const revokes = new Map<number, DecisionRevoke>()
   /**
    * The events file as this session knows it. Its own reads go straight to the
    * disk and miss a write still queued, so every switch appends to this text.
@@ -1143,6 +1134,10 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       ownCostly = loaded.own
     }
     held = heldFrom(await readText(pathIn(HELD_FILE)))
+    revokes.clear()
+    for (const record of parseJsonl<DecisionRevoke>((await readText(pathIn(DECISION_FILE))) ?? '')) {
+      if (Number.isInteger(record.seq) && record.seq > 0) revokes.set(record.seq, record)
+    }
   }
 
   let loading: Promise<void> | null = null
@@ -1203,6 +1198,15 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       if (requests.every(request => answered.has(request.seq) || request.window - 1 > window)) break
       await loadWindow(window)
     }
+  }
+
+  /**
+   * Pulls every window in, oldest last: a decision the person settled long ago is
+   * still binding, and the recent requests only reach back far enough for the home
+   * page. Each window is read once and then stays in memory.
+   */
+  const ensureAllWindows = async (): Promise<void> => {
+    for (let window = state.window - 1; window >= 1; window -= 1) await loadWindow(window)
   }
 
   /**
@@ -1810,6 +1814,53 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return hits.length === 0 ? `没有匹配「${query}」的账本条目。` : hits.map(renderEntry).join('\n')
   }
 
+  /**
+   * Takes back a decision the person has changed their mind about: that message's
+   * decisions stop being carried into new windows, while history keeps the words.
+   * `by` names the message that replaces it, so a reversal reads as one, not as a
+   * rule that silently vanished.
+   */
+  const decisionRevoke = async (input: unknown): Promise<ToolResult> => {
+    await ensureLoaded()
+    const raw =
+      typeof input === 'object' && input !== null && !Array.isArray(input)
+        ? (input as Record<string, unknown>)
+        : {}
+    const seq = typeof raw.seq === 'number' ? raw.seq : Number(raw.seq)
+    if (!Number.isInteger(seq) || seq < 1) {
+      return errorOf(`要撤销哪一条：seq 填交接里 [#123] 的数字，收到的是「${String(raw.seq)}」。`)
+    }
+    const by = raw.by === undefined || raw.by === null ? undefined : Number(raw.by)
+    if (by !== undefined && (!Number.isInteger(by) || by < 1)) {
+      return errorOf(`by 填取代它的那条的历史编号（形如 [#124] 里的数字），收到的是「${String(raw.by)}」。`)
+    }
+    const reason = typeof raw.reason === 'string' && raw.reason.trim() !== '' ? raw.reason.trim() : undefined
+    await ensureAllWindows()
+    // Whether the number named a decision at all, said back so a typo is caught at once.
+    const wasDecision = extractDecisions(allRows(), new Set(revokes.keys())).some(decision => decision.seq === seq)
+    revokes.set(seq, {
+      seq,
+      ts: io.now(),
+      window: state.window,
+      ...(by === undefined ? {} : { by }),
+      ...(reason === undefined ? {} : { reason }),
+    })
+    const isWritten = await queue.push(
+      pathIn(DECISION_FILE),
+      toJsonl([...revokes.values()].sort((left, right) => left.seq - right.seq)),
+    )
+    let result =
+      by === undefined
+        ? `已撤销 #${seq} 的决策，新窗口的交接里不再出现它（history 仍可查）。`
+        : `已撤销 #${seq} 的决策，由 #${by} 取代；新窗口的交接里不再出现 #${seq}（history 仍可查）。`
+    if (!wasDecision) result += `这条消息里没有抽取到决策，撤销记录仍然保存。`
+    if (!isWritten) {
+      result += '\n注意：撤销这次没能写进磁盘（内存里有，本会话内仍然有效）；下次撤销会重写整个文件。'
+    }
+
+    return { result }
+  }
+
   const ledgerRead = async (input: unknown): Promise<ToolResult> => {
     await ensureLoaded()
     const raw =
@@ -2241,8 +2292,16 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     await ensureRequests()
     await ensureReplies()
     await ensureAnswered()
+    await ensureAllWindows()
     const relay = await relayForHome()
     const rows = allRows()
+    // The last two windows are the ones the model was just working in: their
+    // decisions stay even when the section runs past its ceiling.
+    const decisions = renderDecisions(
+      extractDecisions(rows, new Set(revokes.keys())),
+      config.decisionChars,
+      state.window - 1,
+    )
     const requests = displayRequests(personRequests(rows, config.recentRequests))
     const answered = repliesAnswered(rows, requests)
     const window = state.window + 1
@@ -2306,6 +2365,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
         workset,
         actions,
         isMidTurn: opts.isMidTurn,
+        ...(decisions === '' ? {} : { decisions }),
         ...(loadReason === '' ? {} : { loadReason }),
         ...(coverage === '' ? {} : { coverage }),
         ...(agents === '' ? {} : { agents }),
@@ -2454,6 +2514,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     reminder,
     ledgerAppend,
     ledgerRead,
+    decisionRevoke,
     historyTool,
     historyWriteStats,
     status,

@@ -13,7 +13,7 @@ import { DEFAULTS, OWN_TOOL_PREFIX } from './lib/types.ts'
 
 /** The section of the system prompt, the same all session long. */
 const SYSTEM_TEXT =
-  '这个会话可能跨多个上下文窗口。你有一个任务账本（mcp__ctx-mod__ledger_append、mcp__ctx-mod__ledger_read）和完整历史（mcp__ctx-mod__history）。工具结果末尾形如 [#123] 的是历史编号。每完成一个阶段，就追加一条账本记录：用 task_id 标识任务，status 填 in_progress / done / superseded / blocked。标 done 时必须在 evidence 里附上证明它的工具结果的历史编号。用户提出新请求时，如果它取代了旧任务，就把旧任务标为 superseded。对还没做完的任务，写明 next_step，并用 anchors 记下接下来要改的位置：文件路径，加一小段能在文件里唯一定位的原文。收到收尾或交接通知时，先更新账本。上下文用量可以用 mcp__ctx-mod__context 查看；它提示可以换窗口时，先记账再调用它的 new。申请换窗口之前，先用 ledger_append 把进行中任务的进度写清楚，text 里写明后面要用到的关键事实（产物路径、已确认的结论、约定的参数），有子代理在跑时写明各自的 id、负责什么、产物放哪。改法已经确定的改动不要留给新窗口：和 new 放在同一条消息里并发做完；只有还需要判断的才写进 anchors。'
+  '这个会话可能跨多个上下文窗口。你有一个任务账本（mcp__ctx-mod__ledger_append、mcp__ctx-mod__ledger_read）和完整历史（mcp__ctx-mod__history）。工具结果末尾形如 [#123] 的是历史编号。每完成一个阶段，就追加一条账本记录：用 task_id 标识任务，status 填 in_progress / done / superseded / blocked。标 done 时必须在 evidence 里附上证明它的工具结果的历史编号。用户提出新请求时，如果它取代了旧任务，就把旧任务标为 superseded。用户改主意、或后面的话推翻了先前的决定时，用 decision_revoke 撤销旧条（用户说明了改成什么，就用 by 指向那条新消息）。对还没做完的任务，写明 next_step，并用 anchors 记下接下来要改的位置：文件路径，加一小段能在文件里唯一定位的原文。收到收尾或交接通知时，先更新账本。上下文用量可以用 mcp__ctx-mod__context 查看；它提示可以换窗口时，先记账再调用它的 new。申请换窗口之前，先用 ledger_append 把进行中任务的进度写清楚，text 里写明后面要用到的关键事实（产物路径、已确认的结论、约定的参数），有子代理在跑时写明各自的 id、负责什么、产物放哪。改法已经确定的改动不要留给新窗口：和 new 放在同一条消息里并发做完；只有还需要判断的才写进 anchors。'
 
 /** Submitted after a switch the model itself asked for, so the new window carries on. */
 const CONTINUE_TEXT = 'ctx-mod：已换到新的上下文窗口。先用一句话复述当前请求和进度，然后继续。'
@@ -556,6 +556,20 @@ const TOOLS = [
     },
   },
   {
+    name: 'decision_revoke',
+    description:
+      '撤销一条用户已定决策：seq 填交接「用户已定决策」里 [#123] 的数字。用户改主意、或后面的话推翻了先前那条时调用；被撤销的那条不再出现在新窗口的交接里，history 仍可查到原文。如果用户说明了改成什么，用 by 指向那条新消息的历史编号，交接里就记为被它取代。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        seq: { type: 'number', description: '要撤销的那条决策所在消息的历史编号。' },
+        by: { type: 'number', description: '取代它的那条消息的历史编号（可选）。' },
+        reason: { type: 'string', description: '为什么撤销（可选，一句话）。' },
+      },
+      required: ['seq'],
+    },
+  },
+  {
     name: 'ledger_read',
     description:
       '读取任务账本。view 可以是 home（默认，首页概览）、current（当前窗口的全部条目）或 archive:N（第 N 页归档）；给了 query 就在全部条目里搜索。',
@@ -1061,6 +1075,22 @@ export const register: Register = (on, options) => {
       return await session.ledgerRead(input)
     } catch (error) {
       logError($, 'tool.call ledger_read', error)
+
+      return next(e)
+    }
+  })
+
+  on('tool.call', { tool: 'mcp__ctx-mod__decision_revoke' as never }, async ($, e, next) => {
+    if (!enabled) return next(e)
+    if (isSubagentCall(e)) return AGENT_ONLY
+    const input = argsOf(e)
+    try {
+      const session = await sessionOf($)
+      if (session === undefined) return next(e)
+
+      return await session.decisionRevoke(input)
+    } catch (error) {
+      logError($, 'tool.call decision_revoke', error)
 
       return next(e)
     }

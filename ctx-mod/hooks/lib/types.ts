@@ -24,6 +24,11 @@ export type Config = {
    * last reply, subagents and tool notes are never cut, so a handoff can run past it.
    */
   handoffTokens: number
+  /**
+   * Longest the "用户已定决策" section may run, in characters. Past it the oldest
+   * decisions are dropped and one line says how many: the newest still stand.
+   */
+  decisionChars: number
   snippetTokens: number
   homeTokens: number
   pageTokens: number
@@ -70,6 +75,7 @@ export const DEFAULTS: Config = {
   cooldownRequests: 30,
   maxSwitchesPerHour: 4,
   handoffTokens: 15_000,
+  decisionChars: 3_000,
   snippetTokens: 6_000,
   homeTokens: 1_500,
   pageTokens: 4_000,
