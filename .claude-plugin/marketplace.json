@@ -13,6 +13,10 @@
       "source": "./ctx-mod"
     },
     {
+      "name": "dispatch-gate",
+      "source": "./dispatch-gate"
+    },
+    {
       "name": "ptc-run",
       "source": "./ptc-run"
     },

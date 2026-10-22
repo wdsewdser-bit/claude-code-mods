@@ -1,0 +1,40 @@
+{
+  "name": "dispatch-gate",
+  "version": "0.1.0",
+  "description": "A soft gate on the main session: reminds it, then refuses once per stretch, to hand work to a subagent; and refuses one Claude subagent per hour past three.",
+  "author": {
+    "name": "yadaz"
+  },
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Strength",
+      "description": "off: do nothing; remind: only the reminder after remindAt consecutive execution requests; soft: the reminder and the refusals (one per stretch, one per hour).",
+      "default": "soft"
+    },
+    "remindAt": {
+      "type": "number",
+      "title": "Remind after (consecutive execution requests)",
+      "description": "Consecutive requests the main session spends on its own work before the reminder is injected, once per stretch.",
+      "default": 4
+    },
+    "denyAt": {
+      "type": "number",
+      "title": "Refuse after (consecutive execution requests)",
+      "description": "Consecutive requests the main session spends on its own work before one execution call is refused. Once per stretch; the retry runs.",
+      "default": 8
+    },
+    "agentPerHour": {
+      "type": "number",
+      "title": "Claude subagents per hour",
+      "description": "Claude subagents the main session may dispatch in one rolling hour. The next dispatch is refused once; the retry runs and the hour refuses no more. Delegating to DeepSeek is never counted.",
+      "default": 3
+    },
+    "grace": {
+      "type": "number",
+      "title": "Acceptance requests after a dispatch",
+      "description": "Requests after a dispatch whose tools are only Read, Grep or Glob: reading the work back is free and does not count.",
+      "default": 3
+    }
+  }
+}
