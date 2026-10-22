@@ -431,15 +431,16 @@ test('with CTX_MOD unset a compaction reaches core and nothing is written', asyn
   expect(w.files.size).toBe(0)
 })
 
-test('armed, session.start registers four tools and the ctx-mod command', async ($, on) => {
+test('armed, session.start registers five tools and the ctx-mod command', async ($, on) => {
   const w = world(on, 's-armed', { CTX_MOD: '1' })
   await boot($)
-  expect(w.tools).toHaveLength(4)
+  expect(w.tools).toHaveLength(5)
   // The engine namespaces these to `mcp__ctx-mod__<name>`; the bottom sees the
   // declared name, which is what the mod's own `tool.call` matchers are built from.
   expect(w.tools).toContain('context')
   expect(w.tools).toContain('ledger_append')
   expect(w.tools).toContain('ledger_read')
+  expect(w.tools).toContain('decision_revoke')
   expect(w.tools).toContain('history')
   expect(w.commands).toContain('ctx-mod')
 })
@@ -450,6 +451,7 @@ test('armed, a subagent call of every tool is refused as main-thread only', asyn
   const calls = [
     ledger({ tool_use_id: 'agent-1', agentId: 'agent-7', task_id: 't1', title: '工作', status: 'in_progress', text: '开始', next_step: '接着做' }),
     { tool: 'mcp__ctx-mod__ledger_read', tool_use_id: 'agent-2', agentId: 'agent-7' },
+    { tool: 'mcp__ctx-mod__decision_revoke', tool_use_id: 'agent-5', agentId: 'agent-7', seq: 1 },
     history({ tool_use_id: 'agent-3', agentId: 'agent-7', action: 'search', query: 'x' }),
     { tool: 'mcp__ctx-mod__context', tool_use_id: 'agent-4', agentId: 'agent-7', action: 'status' },
   ]
