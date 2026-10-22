@@ -6,6 +6,28 @@
 import { OWN_TOOL_PREFIX, parseJsonl } from './types.ts'
 import type { HistoryRecord, Overflow, Role } from './types.ts'
 
+const REMINDER_OPEN = '<system-reminder>'
+const REMINDER_CLOSE = '</system-reminder>'
+
+/**
+ * The text with the engine's injected notes stripped off its head. The engine
+ * files a session-start hook's `<system-reminder>` block in the same door as a
+ * person's words, so a request has to be read without it; a block that is never
+ * closed is left alone, since the rest then cannot be trusted to be the person's.
+ */
+export const stripInjected = (text: string): string => {
+  let rest = text
+  for (;;) {
+    const head = rest.trimStart()
+    if (!head.startsWith(REMINDER_OPEN)) break
+    const end = head.indexOf(REMINDER_CLOSE)
+    if (end < 0) return text
+    rest = head.slice(end + REMINDER_CLOSE.length)
+  }
+
+  return rest.trim()
+}
+
 /** Shards rotate well before the engine's 4 MiB read ceiling, so a whole file still reads. */
 export const MAX_SHARD_BYTES = 2 * 1024 * 1024
 
