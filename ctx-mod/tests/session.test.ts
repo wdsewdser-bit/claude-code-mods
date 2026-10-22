@@ -1116,8 +1116,9 @@ describe('buildHandoff with the previous reply', () => {
 
     const text = await session.buildHandoff({ isMidTurn: false })
     expect(text).toContain('  - 回复的是助手 [#2]：改好了。要不要顺手把悬停色也换掉？')
-    // The first request of the session answered nothing.
-    expect(text.split('回复的是助手')).toHaveLength(2)
+    // The first request of the session answered nothing. Only the home page is
+    // counted: the decisions section repeats the reply beside the answer it settled.
+    expect(text.split('## 用户已定决策')[0].split('回复的是助手')).toHaveLength(2)
     expect((await session.ledgerRead({ view: 'home' })).result).toContain('回复的是助手 [#2]')
   })
 
@@ -1131,7 +1132,7 @@ describe('buildHandoff with the previous reply', () => {
     await session.record({ uuid: 'p3', role: 'user', isPerson: true, door: 'delivery', name: 'queued_command', text: '用深一点的蓝' })
 
     const text = await session.buildHandoff({ isMidTurn: false })
-    expect(text.split('回复的是助手 [#2]')).toHaveLength(2)
+    expect(text.split('## 用户已定决策')[0].split('回复的是助手 [#2]')).toHaveLength(2)
     expect(text).toContain('（回合进行中插入）用深一点的蓝')
   })
 
@@ -1173,6 +1174,103 @@ describe('buildHandoff with the previous reply', () => {
     // Only window 2 is loaded: the reply of window 1 has to be pulled back in.
     const reloaded = createSession(DIR, box.io, DEFAULTS)
     expect(await reloaded.buildHandoff({ isMidTurn: false })).toContain('改好了。')
+  })
+})
+
+describe('buildHandoff with the decisions the person settled', () => {
+  test('carries a decision from an earlier window after newer requests push it out of the recent list', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '以后一律用 pnpm，不要用 npm。' })
+    await session.commitSwitch({ trigger: 'manual', tokensBefore: 90_000, handoffText: '交接' })
+    for (let index = 0; index < DEFAULTS.recentRequests + 1; index += 1) {
+      await session.record({ uuid: `q${index}`, role: 'user', isPerson: true, text: `第 ${index} 个新请求` })
+    }
+
+    const text = await session.buildHandoff({ isMidTurn: false })
+    expect(text).toContain('## 用户已定决策')
+    expect(text).toContain('以后一律用 pnpm，不要用 npm。')
+    // The home page itself has moved on: the section is the only place it survives.
+    expect(text.split('## 最近的用户请求')[1]?.split('## 用户已定决策')[0]).not.toContain('pnpm')
+  })
+
+
+  test('a decision the person took back stops being carried, and history still has it', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '不要用 npm。' })
+    await session.record({ uuid: 'p2', role: 'user', isPerson: true, text: '以后一律用 pnpm。' })
+    expect(await session.buildHandoff({ isMidTurn: false })).toContain('不要用 npm。')
+
+    const receipt = await session.decisionRevoke({ seq: 1 })
+    expect(receipt.result).toContain('已撤销 #1 的决策')
+    // The home page still lists the request itself; only the decisions section drops it.
+    const section = (await session.buildHandoff({ isMidTurn: false })).split('## 用户已定决策')[1] ?? ''
+    expect(section).not.toContain('不要用 npm。')
+    expect(section).toContain('以后一律用 pnpm。')
+    // The words stay in history: only the handoff stops carrying them.
+    expect((await session.historyTool({ action: 'read', seq: 1 })).result).toContain('不要用 npm。')
+  })
+
+  test('a revoke names what replaced it, survives a reload, and says when there was nothing to revoke', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '不要用 npm。' })
+    await session.record({ uuid: 'p2', role: 'user', isPerson: true, text: '以后一律用 pnpm。' })
+    await session.record({ uuid: 't1', role: 'tool', tool: 'Read', text: 'ok' })
+    const replaced = await session.decisionRevoke({ seq: 1, by: 2, reason: '改用 pnpm' })
+    expect(replaced.result).toContain('由 #2 取代')
+    const nothing = await session.decisionRevoke({ seq: 3 })
+    expect(nothing.result).toContain('没有抽取到决策')
+    expect(nothing.isError).not.toBe(true)
+    await session.flush()
+
+    const reloaded = createSession(DIR, box.io, DEFAULTS)
+    const section = (await reloaded.buildHandoff({ isMidTurn: false })).split('## 用户已定决策')[1] ?? ''
+    expect(section).not.toContain('不要用 npm。')
+    expect(section).toContain('以后一律用 pnpm。')
+  })
+
+  test('a bad seq is refused without writing anything', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '不要用 npm。' })
+    const refused = await session.decisionRevoke({ seq: 'abc' })
+    expect(refused.isError).toBe(true)
+    expect(refused.result).toContain('seq')
+    expect(box.files.has(`${DIR}/decisions.jsonl`)).toBe(false)
+  })
+
+  test('a decision from the last two windows survives a tiny budget', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, { ...DEFAULTS, decisionChars: 245 })
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '不要用方案一，这一条是较长的说明文字。' })
+    await session.commitSwitch({ trigger: 'manual', tokensBefore: 90_000, handoffText: '交接' })
+    await session.record({ uuid: 'p2', role: 'user', isPerson: true, text: '不要用方案二，这一条是较长的说明文字。' })
+    await session.commitSwitch({ trigger: 'manual', tokensBefore: 90_000, handoffText: '交接二' })
+    await session.record({ uuid: 'p3', role: 'user', isPerson: true, text: '不要用方案三，这一条是较长的说明文字。' })
+
+    const section = (await session.buildHandoff({ isMidTurn: false })).split('## 用户已定决策')[1] ?? ''
+    expect(section).toContain('不要用方案三，这一条是较长的说明文字。')
+    expect(section).toContain('不要用方案二，这一条是较长的说明文字。')
+    expect(section).not.toContain('不要用方案一')
+    expect(section).toContain('已省略 1 条')
+  })
+
+  test('a reloaded session still finds the decision in the window it no longer holds in memory', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '不要动 vite.config。' })
+    await session.commitSwitch({ trigger: 'manual', tokensBefore: 90_000, handoffText: '交接' })
+    await session.record({ uuid: 'p2', role: 'user', isPerson: true, text: '继续' })
+    await session.flush()
+
+    const reloaded = createSession(DIR, box.io, DEFAULTS)
+    const text = await reloaded.buildHandoff({ isMidTurn: false })
+    // Only window 2 was read when the session loaded; the decision sits in window 1.
+    expect(reloaded.window()).toBe(2)
+    expect(text).toContain('## 用户已定决策')
+    expect(text).toContain('不要动 vite.config。')
   })
 })
 
