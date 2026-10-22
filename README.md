@@ -5,6 +5,7 @@
 | mod | 作用 |
 | --- | --- |
 | [cache-keeper](cache-keeper) | 观察 prompt cache 的命中情况，在会话闲置时保活主会话和子代理的缓存，额度快用完时让主会话收尾并在重置后继续，还能跑 5 分钟 / 1 小时 TTL 的对比实验 |
+| [dispatch-gate](dispatch-gate) | 主会话的软闸门：连续自己干太多就提醒一次、再拦一次；Claude 子代理一小时内派超过 3 个也拦一次。都是软拦截，重试即放行 |
 | [ctx-mod](ctx-mod) | 任务账本、可检索的完整历史、不靠模型摘要的换窗口、子代理冷续用提醒。依赖 cache-keeper |
 | [ptc-run](ptc-run) | 程序化工具调用：一段 JS 程序一次完成多步读写、搜索、批量文件操作和并发命令，只把结果放回上下文 |
 | [read-dedup](read-dedup) | 重复 Read 去重：文件没变只回一行提示，变了只回差异 |
