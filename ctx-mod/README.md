@@ -37,7 +37,7 @@ $env:CTX_MOD = '1'; claude
 | --- | --- |
 | `context` | `status` 报告上下文用量、距上次换窗的请求数、本小时换窗次数、进行中任务数；`new` 申请换窗口 |
 | `ledger_append` | 追加一条账本记录：`task_id`、`title`、`status`（`in_progress` / `done` / `superseded` / `blocked`）、`text`、`next_step`、`anchors`、`evidence`、`request_ref` |
-| `ledger_read` | 读账本：`view` 取 `home`（首页）、`current`（当前窗口的全部条目）或 `archive:N`（归档页）；给了 `query` 就按词搜索 |
+| `ledger_read` | 读账本：`view` 取 `home`（首页）、`current`（当前窗口的全部条目）或 `archive:N`（归档页）；给了 `query` 就按词搜索，命中超过 3 条只按新到旧列一行索引（`#L编号 · task_id · 状态 · 标题 · 正文前 60 字`），填精确 `task_id` 或 `#L337`/`L337` 看全文；`limit` 限制条数（默认 20，范围 1–100） |
 | `history` | `search` 按词、角色、工具名、文件、窗口、入口（`door`）查历史编号。默认跳过引擎的背景行（附件、钩子上下文、备注），指定 `door` 就能搜到它们；不指定窗口时先搜最近 3 个窗口，没命中再往前找，结果里写明搜了哪些窗口。`read` 按编号读原文，`field` 填 `input` 时读那次工具调用的完整参数 |
 
 mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配合使用。

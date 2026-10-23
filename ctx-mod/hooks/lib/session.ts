@@ -47,7 +47,20 @@ import {
   toolGroupOf,
 } from './history.ts'
 import type { LoadedTool, OverflowFailure, SearchHit, Shard } from './history.ts'
-import { archiveName, hasFreshEntry, pageOf, renderHome, stamp, tasksOf, turnPage, validate } from './ledger.ts'
+import {
+  archiveName,
+  hasFreshEntry,
+  pageOf,
+  QUERY_DEFAULT_LIMIT,
+  QUERY_MAX_LIMIT,
+  renderEntries,
+  renderHome,
+  renderQueryResult,
+  stamp,
+  tasksOf,
+  turnPage,
+  validate,
+} from './ledger.ts'
 import type { AnchorCheck, ArchivePage, TaskState } from './ledger.ts'
 import { activityOf, filesOf, locate, pathKey, pathsToRead, relativePath, renderWorkset, snippetsOf } from './workset.ts'
 import type { FileContent, OpenTask } from './workset.ts'
@@ -314,9 +327,6 @@ const DEFAULT_HANDOFF = 8_000
 /** The requests assumed to remain when the model does not say more work is coming. */
 const REMAINING_REQUESTS = 100
 const REMAINING_REQUESTS_LAST = 5
-
-/** How many ledger entries one query may return. */
-const MAX_QUERY_HITS = 30
 
 /** How many windows a default history search covers. */
 const SEARCH_WINDOWS = 3
@@ -1782,36 +1792,15 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return { result }
   }
 
-  const renderEntry = (entry: LedgerEntry): string => {
-    const parts = [entry.task_id, STATUS_LABEL[entry.status], entry.title, entry.text]
-    if (entry.next_step !== undefined && entry.next_step.trim() !== '') parts.push(`下一步：${entry.next_step}`)
-    if (Array.isArray(entry.evidence) && entry.evidence.length > 0) {
-      parts.push(`证据：${entry.evidence.map(seq => `#${seq}`).join('、')}`)
-    }
-    if (entry.superseded_by !== undefined && entry.superseded_by !== '') {
-      parts.push(`由 ${entry.superseded_by} 取代`)
-    }
-
-    return `#L${entry.seq} · ${parts.join(' · ')}`
-  }
-
-  const renderEntries = (entries: readonly LedgerEntry[]): string =>
-    entries.length === 0 ? '账本里还没有条目。' : entries.map(renderEntry).join('\n')
-
-  const queryLedger = async (query: string): Promise<string> => {
-    const needle = query.toLowerCase()
-    const matches = (entry: LedgerEntry): boolean => {
-      const fields: unknown[] = [entry.task_id, entry.title, entry.text, entry.next_step ?? '']
-      return fields.some(field => typeof field === 'string' && field.toLowerCase().includes(needle))
-    }
+  const queryLedger = async (query: string, limit: number): Promise<string> => {
+    // Every page, current first: a query is a lookup over the whole ledger.
     const all: LedgerEntry[] = [...state.page]
     for (let page = 1; page <= state.archive.length; page += 1) {
       const entries = await loadArchive(page)
       if (entries !== null) all.push(...entries)
     }
-    const hits = all.filter(matches).slice(0, MAX_QUERY_HITS)
 
-    return hits.length === 0 ? `没有匹配「${query}」的账本条目。` : hits.map(renderEntry).join('\n')
+    return renderQueryResult(all, query, limit)
   }
 
   /**
@@ -1869,7 +1858,18 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
         : {}
     const view = typeof raw.view === 'string' && raw.view.trim() !== '' ? raw.view.trim() : 'home'
     const query = typeof raw.query === 'string' && raw.query.trim() !== '' ? raw.query.trim() : null
-    if (query !== null) return { result: await queryLedger(query) }
+    const limitField = raw.limit
+    if (
+      limitField !== undefined &&
+      (typeof limitField !== 'number' ||
+        !Number.isInteger(limitField) ||
+        limitField < 1 ||
+        limitField > QUERY_MAX_LIMIT)
+    ) {
+      return errorOf(`limit 必须是 1-${QUERY_MAX_LIMIT} 之间的整数，收到的是「${String(limitField)}」。`)
+    }
+    const limit = typeof limitField === 'number' ? limitField : QUERY_DEFAULT_LIMIT
+    if (query !== null) return { result: await queryLedger(query, limit) }
 
     if (view === 'home') {
       await ensureRequests()

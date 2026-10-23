@@ -496,6 +496,44 @@ describe('ledgerRead and historyTool', () => {
     expect((await reloaded.historyTool({ action: 'read', seq: 99 })).isError).toBe(true)
     expect((await reloaded.historyTool({ action: 'read' })).isError).toBe(true)
   })
+
+  test('a query with many hits answers with an index, and limit, task_id and #L name one entry', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    for (let n = 1; n <= 5; n += 1) {
+      await session.ledgerAppend(
+        {
+          task_id: `dsh-${n}`,
+          title: `任务 ${n}`,
+          status: 'in_progress',
+          text: `第 ${n} 条正文`,
+          next_step: `做 ${n}`,
+        },
+        env(10_000),
+      )
+      box.advance(1_000)
+    }
+
+    const index = await session.ledgerRead({ query: 'dsh' })
+    const lines = index.result.split('\n')
+    expect(lines[0]).toBe('#L5 · dsh-5 · 进行中 · 任务 5 · 第 5 条正文')
+    expect(lines[4]).toBe('#L1 · dsh-1 · 进行中 · 任务 1 · 第 1 条正文')
+    expect(lines[6]).toBe('共 5 条命中；用 query 填 task_id 或 #L编号 看全文')
+
+    const capped = await session.ledgerRead({ query: 'dsh', limit: 2 })
+    expect(capped.result.split('\n')).toHaveLength(4)
+    expect(capped.result).toContain('省略 3 条')
+
+    const task = await session.ledgerRead({ query: 'dsh-3' })
+    expect(task.result).toBe('#L3 · dsh-3 · 进行中 · 任务 3 · 第 3 条正文 · 下一步：做 3')
+    expect((await session.ledgerRead({ query: '#L3' })).result).toBe(task.result)
+    expect((await session.ledgerRead({ query: 'L3' })).result).toBe(task.result)
+    expect((await session.ledgerRead({ query: '#L99' })).result).toBe('账本里没有 #L99 这条条目。')
+
+    for (const bad of [0, 101, 2.5, '5']) {
+      expect((await session.ledgerRead({ query: 'dsh', limit: bad })).isError, `limit ${String(bad)}`).toBe(true)
+    }
+  })
 })
 
 describe('requestSwitch', () => {
