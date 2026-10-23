@@ -4,3 +4,9 @@ node_modules/
 *.bak-*
 # Local tooling.
 /sync-from-local.ps1
+# Local notes and dev records (kept out of the repo).
+/BACKLOG.md
+/ctx-mod/SPEC-*.md
+/ctx-mod/NOTES-dev.md
+/ctx-mod/REVIEW-*.md
+/ctx-mod/phase0/

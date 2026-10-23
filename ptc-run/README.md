@@ -21,7 +21,7 @@
 
 - 工具不再延迟加载（`isDeferred: false`），会话首轮即可直接调用，不需要先等工具搜索。
 - 带 `expectedRevision` 的 edit/replace 会在系统临时目录 `cc-ptc-locks/` 下加跨进程写锁，保证“校验 revision、写入”在锁内完成；等锁超过约 2 秒报 `LOCKED`，什么都不写；超过 30 秒的锁视为崩溃遗留，可以接管。多文件 replace 按顺序加锁。注意：多文件写入不是事务，中途崩溃时已写的文件不会回滚。
-- DSH 方言（delegate 的 ptc-only）里另有 `tools.test`（测试摘要），以及 read 结果的不可枚举字段 `.text` / `.content`；设了 `PTC_RUN_DSH_READ_LIMIT` 时，不带 limit 的读取会截断，并追加一行 `kind:"notice"` 提示。这些都是实验功能，默认不写进提示，A/B 结果见 BACKLOG.md。
+- DSH 方言（delegate 的 ptc-only）里另有 `tools.test`（测试摘要），以及 read 结果的不可枚举字段 `.text` / `.content`；设了 `PTC_RUN_DSH_READ_LIMIT` 时，不带 limit 的读取会截断，并追加一行 `kind:"notice"` 提示。这些都是实验功能，默认不写进提示。
 - `run_code` 里的工具调用不经过 Claude Code 的权限确认，等同于给了模型直接读写文件和执行命令的能力。
 - 设置环境变量 `PTC_DENY_CREDENTIALS=1` 后，读取类操作会拒绝 `~/.ssh`、`.env`、`*.pem` 等凭据文件（`bash` 不受限）。默认关闭。
 - 只读模式（`PTC_RUN_READONLY=1`）下写入和命令类工具被拒绝，但 `tools.read`、`tools.revision`、`tools.glob`、`tools.grep` 等只读工具可用，且只能读取工作目录（及 `PTC_RUN_RO_ROOTS` 指定的额外目录）内的文件。
