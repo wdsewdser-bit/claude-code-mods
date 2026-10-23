@@ -572,12 +572,19 @@ const TOOLS = [
   {
     name: 'ledger_read',
     description:
-      '读取任务账本。view 可以是 home（默认，首页概览）、current（当前窗口的全部条目）或 archive:N（第 N 页归档）；给了 query 就在全部条目里搜索。',
+      '读取任务账本。view 可以是 home（默认，首页概览）、current（当前窗口的全部条目）或 archive:N（第 N 页归档）；给了 query 就在全部条目里搜索。命中超过 3 条时按新到旧每条只列一行索引（#L编号 · task_id · 状态 · 标题 · 正文前 60 字），不再逐条给全文；query 填精确的 task_id 返回该任务全部条目全文，填 #L337 或 L337 只返回那一条。limit 限制返回条数（默认 20，范围 1-100）。',
     inputSchema: {
       type: 'object',
       properties: {
         view: { type: 'string', description: 'home、current 或 archive:N，默认 home。' },
-        query: { type: 'string', description: '在 task_id、标题、正文和下一步里搜索的词。' },
+        query: {
+          type: 'string',
+          description: '在 task_id、标题、正文和下一步里搜索的词；也可以填精确的 task_id 或 #L编号 直接看全文。',
+        },
+        limit: {
+          type: 'number',
+          description: 'query 最多返回多少条（默认 20，范围 1-100）；view 视图不受影响。',
+        },
       },
     },
   },

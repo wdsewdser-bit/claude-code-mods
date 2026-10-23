@@ -25,6 +25,8 @@ type World = {
   messages: OldMessage[]
   /** The names the mod registered, in order. */
   tools: string[]
+  /** The definition each registered tool was given, by name. */
+  schemas: Map<string, Record<string, unknown>>
   commands: string[]
   /** Commands `$.command.run` was called with, in order. */
   runs: string[]
@@ -124,6 +126,7 @@ const world = (
     reads: [],
     messages: [],
     tools: [],
+    schemas: new Map(),
     commands: [],
     runs: [],
     coreCompactions: 0,
@@ -177,6 +180,7 @@ const world = (
   on('agent.spawn', () => w.spawnAnswer as never)
   on('tool.register', (_$, e) => {
     w.tools.push(e.name)
+    w.schemas.set(e.name, e as unknown as Record<string, unknown>)
 
     return { value: { tool: e.name } } as never
   })
@@ -443,6 +447,23 @@ test('armed, session.start registers five tools and the ctx-mod command', async 
   expect(w.tools).toContain('decision_revoke')
   expect(w.tools).toContain('history')
   expect(w.commands).toContain('ctx-mod')
+})
+
+test('armed, ledger_read tells the model when a query answers with an index and what limit does', async ($, on) => {
+  const w = world(on, 's-ledger-schema', { CTX_MOD: '1' })
+  await boot($)
+  const definition = w.schemas.get('ledger_read') as
+    | { description?: string; inputSchema?: { properties?: Record<string, unknown> } }
+    | undefined
+  expect(definition).toBeDefined()
+  const description = definition?.description ?? ''
+  expect(description).toContain('命中超过 3 条')
+  expect(description).toContain('索引')
+  expect(description).toContain('limit')
+  const properties = definition?.inputSchema?.properties ?? {}
+  expect(Object.keys(properties)).toContain('limit')
+  expect(Object.keys(properties)).toContain('query')
+  expect(Object.keys(properties)).toContain('view')
 })
 
 test('armed, a subagent call of every tool is refused as main-thread only', async ($, on) => {

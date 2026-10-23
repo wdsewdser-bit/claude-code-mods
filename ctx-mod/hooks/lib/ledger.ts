@@ -732,3 +732,113 @@ export const pageOf = (page: number, moved: readonly LedgerEntry[]): ArchivePage
 /** The archive file of one page: archive-001.jsonl, zero-padded to three. */
 export const archiveName = (page: number): string =>
   `archive-${String(page).padStart(3, '0')}.jsonl`
+
+/** A query with more hits than this answers with one line per hit instead of every entry's full text. */
+export const QUERY_INDEX_ABOVE = 3
+/** How many entries a query returns unless the caller says otherwise, and the most it may ask for. */
+export const QUERY_DEFAULT_LIMIT = 20
+export const QUERY_MAX_LIMIT = 100
+/** How much of an entry's text an index line keeps. */
+const INDEX_TEXT_CHARS = 60
+/** `#L337` and `L337` both name entry 337. */
+const SEQ_QUERY = /^#?l(\d+)$/i
+
+/** One entry as a reader sees it: the whole note, plus what is needed to act on it. */
+export const renderEntry = (entry: LedgerEntry): string => {
+  const parts = [entry.task_id, STATUS_LABEL[entry.status], entry.title, entry.text]
+  if (entry.next_step !== undefined && entry.next_step.trim() !== '') parts.push(`下一步：${entry.next_step}`)
+  if (Array.isArray(entry.evidence) && entry.evidence.length > 0) {
+    parts.push(`证据：${entry.evidence.map(seq => `#${seq}`).join('、')}`)
+  }
+  if (entry.superseded_by !== undefined && entry.superseded_by !== '') {
+    parts.push(`由 ${entry.superseded_by} 取代`)
+  }
+
+  return `#L${entry.seq} · ${parts.join(' · ')}`
+}
+
+export const renderEntries = (entries: readonly LedgerEntry[]): string =>
+  entries.length === 0 ? '账本里还没有条目。' : entries.map(renderEntry).join('\n')
+
+/** Newest first, so what a capped answer drops is what was written longest ago. */
+const newestFirstEntries = (entries: readonly LedgerEntry[]): LedgerEntry[] =>
+  [...entries].sort((left, right) => right.ts - left.ts || right.seq - left.seq)
+
+/** One line that says enough to pick the entry out, without carrying its text. */
+const indexLine = (entry: LedgerEntry): string => {
+  const text = entry.text.replace(/\s+/g, ' ').trim()
+  const head = text.length > INDEX_TEXT_CHARS ? `${text.slice(0, INDEX_TEXT_CHARS)}…` : text
+
+  return `#L${entry.seq} · ${entry.task_id} · ${STATUS_LABEL[entry.status]} · ${entry.title} · ${head}`
+}
+
+/**
+ * The answer to `ledger_read` with a query. `#L337` (or `L337`) names one entry and
+ * returns it whole. An exact task_id returns that task's entries whole, newest
+ * first, however many there are. Any other word is searched as before, except that
+ * more than three hits are listed as an index: one word must not pour every
+ * matching entry's full text into the window. `limit` caps the entries returned in
+ * every mode, and a closing note says how many were left out.
+ */
+export const renderQueryResult = (
+  entries: readonly LedgerEntry[],
+  query: string,
+  limit: number,
+): string => {
+  const text = query.trim()
+  const seq = SEQ_QUERY.exec(text)
+  if (seq !== null) {
+    const wanted = Number(seq[1])
+    const found = entries.find(entry => entry.seq === wanted)
+
+    return found === undefined ? `账本里没有 #L${wanted} 这条条目。` : renderEntry(found)
+  }
+
+  const needle = text.toLowerCase()
+  // A task_id typed exactly is a request for that task's history, not a word search.
+  const exact = entries.filter(entry => entry.task_id.toLowerCase() === needle)
+  if (exact.length > 0) {
+    const newest = newestFirstEntries(exact)
+    const shown = newest.slice(0, limit)
+    const lines = shown.map(renderEntry)
+    const omitted = newest.length - shown.length
+    if (omitted > 0) {
+      lines.push(
+        '',
+        `（这个任务共 ${newest.length} 条记录，只显示最新的 ${shown.length} 条，省略 ${omitted} 条；可用 limit 调整）`,
+      )
+    }
+
+    return lines.join('\n')
+  }
+
+  const hits = entries.filter(entry => {
+    const fields: unknown[] = [entry.task_id, entry.title, entry.text, entry.next_step ?? '']
+    return fields.some(field => typeof field === 'string' && field.toLowerCase().includes(needle))
+  })
+  if (hits.length === 0) return `没有匹配「${text}」的账本条目。`
+
+  if (hits.length <= QUERY_INDEX_ABOVE) {
+    const shown = hits.slice(0, limit)
+    const lines = shown.map(renderEntry)
+    const omitted = hits.length - shown.length
+    if (omitted > 0) {
+      lines.push('', `（共 ${hits.length} 条命中，只显示了 ${shown.length} 条，省略 ${omitted} 条；可用 limit 调整）`)
+    }
+
+    return lines.join('\n')
+  }
+
+  const newest = newestFirstEntries(hits)
+  const shown = newest.slice(0, limit)
+  const omitted = newest.length - shown.length
+  const lines = shown.map(indexLine)
+  lines.push(
+    '',
+    omitted > 0
+      ? `共 ${newest.length} 条命中，只显示最新的 ${shown.length} 条，省略 ${omitted} 条；用 query 填 task_id 或 #L编号 看全文`
+      : `共 ${newest.length} 条命中；用 query 填 task_id 或 #L编号 看全文`,
+  )
+
+  return lines.join('\n')
+}

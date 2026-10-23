@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { archiveName, hasFreshEntry, pageOf, renderHome, stamp, tasksOf, turnPage, validate } from '../hooks/lib/ledger.ts'
+import { archiveName, hasFreshEntry, pageOf, QUERY_DEFAULT_LIMIT, renderEntries, renderEntry, renderHome, renderQueryResult, stamp, tasksOf, turnPage, validate } from '../hooks/lib/ledger.ts'
 import type { ArchivePage, ValidateContext } from '../hooks/lib/ledger.ts'
 import { DEFAULTS, estimateTokens } from '../hooks/lib/types.ts'
 import type { Anchor, HistoryRecord, LedgerEntry, LedgerInput, TaskStatus } from '../hooks/lib/types.ts'
@@ -972,5 +972,89 @@ describe('what a ledger entry must carry', () => {
     expect(validate(input({ task_id: 't2', next_step: undefined }), context({ entries: earlier }))).toEqual([missing])
     // A blocked entry does not need one.
     expect(validate(input({ status: 'blocked', next_step: undefined }), context())).toEqual([])
+  })
+})
+
+describe('renderQueryResult', () => {
+  const hit = (n: number, extra: Partial<LedgerEntry> = {}): LedgerEntry =>
+    entry({ task_id: `dsh-${n}`, title: `任务 ${n}`, text: `第 ${n} 条正文`, next_step: '接着改表单', seq: n, ts: 1_000 + n, ...extra })
+
+  test('three hits or fewer keep the full text, as before', () => {
+    const entries = [hit(1), hit(2), hit(3)]
+    const text = renderQueryResult(entries, 'dsh', QUERY_DEFAULT_LIMIT)
+
+    expect(text).toBe(entries.map(renderEntry).join('\n'))
+    expect(text).toContain('下一步：接着改表单')
+    expect(text).not.toContain('条命中')
+  })
+
+  test('more than three hits become one index line each, newest first, and say how to read one', () => {
+    const entries = [hit(1), hit(2), hit(3), hit(4), hit(5)]
+    const lines = renderQueryResult(entries, 'dsh', QUERY_DEFAULT_LIMIT).split('\n')
+
+    expect(lines.slice(0, 5)).toEqual([
+      '#L5 · dsh-5 · 进行中 · 任务 5 · 第 5 条正文',
+      '#L4 · dsh-4 · 进行中 · 任务 4 · 第 4 条正文',
+      '#L3 · dsh-3 · 进行中 · 任务 3 · 第 3 条正文',
+      '#L2 · dsh-2 · 进行中 · 任务 2 · 第 2 条正文',
+      '#L1 · dsh-1 · 进行中 · 任务 1 · 第 1 条正文',
+    ])
+    expect(lines[5]).toBe('')
+    expect(lines[6]).toBe('共 5 条命中；用 query 填 task_id 或 #L编号 看全文')
+    // The body and the next step stay out of an index line.
+    expect(lines.slice(0, 5).join('\n')).not.toContain('下一步')
+  })
+
+  test('an index line keeps the first 60 characters of the text, flattened to one line', () => {
+    const long = hit(1, { text: `开头${'字'.repeat(80)}\n第二行` })
+    const entries = [long, hit(2), hit(3), hit(4)]
+    const first = renderQueryResult(entries, 'dsh', QUERY_DEFAULT_LIMIT).split('\n')[3] ?? ''
+
+    expect(first).toBe(`#L1 · dsh-1 · 进行中 · 任务 1 · ${long.text.replace(/\s+/g, ' ').slice(0, 60)}…`)
+    expect(first).not.toContain('第二行')
+  })
+
+  test('limit caps the hits in both modes and says how many were left out', () => {
+    const many = [hit(1), hit(2), hit(3), hit(4), hit(5)]
+    const index = renderQueryResult(many, 'dsh', 2).split('\n')
+    expect(index.slice(0, 2)).toEqual([
+      '#L5 · dsh-5 · 进行中 · 任务 5 · 第 5 条正文',
+      '#L4 · dsh-4 · 进行中 · 任务 4 · 第 4 条正文',
+    ])
+    expect(index[3]).toBe('共 5 条命中，只显示最新的 2 条，省略 3 条；用 query 填 task_id 或 #L编号 看全文')
+
+    const few = renderQueryResult([hit(1), hit(2), hit(3)], 'dsh', 2).split('\n')
+    expect(few).toEqual([
+      renderEntry(hit(1)),
+      renderEntry(hit(2)),
+      '',
+      '（共 3 条命中，只显示了 2 条，省略 1 条；可用 limit 调整）',
+    ])
+  })
+
+  test('an exact task_id returns that task whole, however many entries it has', () => {
+    const entries = [1, 2, 3, 4].map(n => hit(n, { task_id: 'dsh' }))
+    const text = renderQueryResult(entries, 'dsh', QUERY_DEFAULT_LIMIT)
+
+    expect(text.split('\n')).toHaveLength(4)
+    expect(text.split('\n')[0]).toBe(renderEntry(entries[3] as LedgerEntry))
+    expect(text).not.toContain('条命中')
+
+    const capped = renderQueryResult(entries, 'dsh', 2)
+    expect(capped.split('\n')[2]).toBe('')
+    expect(capped.split('\n')[3]).toBe('（这个任务共 4 条记录，只显示最新的 2 条，省略 2 条；可用 limit 调整）')
+  })
+
+  test('#L337 and L337 name one entry and return it whole', () => {
+    const entries = [hit(1), hit(2), hit(3), hit(4)]
+
+    expect(renderQueryResult(entries, '#L3', QUERY_DEFAULT_LIMIT)).toBe(renderEntry(entries[2] as LedgerEntry))
+    expect(renderQueryResult(entries, 'L3', QUERY_DEFAULT_LIMIT)).toBe(renderEntry(entries[2] as LedgerEntry))
+    expect(renderQueryResult(entries, '#L99', QUERY_DEFAULT_LIMIT)).toBe('账本里没有 #L99 这条条目。')
+  })
+
+  test('no hit keeps the old answer, and renderEntries still renders an empty page', () => {
+    expect(renderQueryResult([hit(1)], '不存在的词', QUERY_DEFAULT_LIMIT)).toBe('没有匹配「不存在的词」的账本条目。')
+    expect(renderEntries([])).toBe('账本里还没有条目。')
   })
 })
