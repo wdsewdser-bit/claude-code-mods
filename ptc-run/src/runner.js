@@ -356,6 +356,12 @@ const childEnv = (extra) => {
 };
 // Background jobs: one detached node wrapper per command, state in files, 2h lifetime cap.
 const BG_MAX_MS = 2 * 60 * 60 * 1000;
+// One write path (write/edit/replace) may not produce more than 32 MiB for a single file. Checked before anything is
+// written, so an over-limit call changes no file at all.
+const MAX_WRITE_BYTES = 32 * 1024 * 1024;
+const capWrite = (bytes, what) => {
+  if (bytes > MAX_WRITE_BYTES) throw E("OUTPUT_LIMIT", what + " would be " + bytes + " bytes, over the " + (MAX_WRITE_BYTES / 1048576) + " MiB write limit (" + MAX_WRITE_BYTES + " bytes); nothing was written", "Split it: write the first part, then append or edit the rest (tools.edit / tools.bash), or narrow the replacement.");
+};
 const BG_WRAP2 = 'const fs=require("fs"),cp=require("child_process");const [id,d,cmd,cwd,bash]=process.argv.slice(1);' +
   'const stf=d+"/"+id+".st";const done=(code,sig,timedOut)=>{try{fs.writeFileSync(stf,JSON.stringify({code:code,sig:sig,timedOut:!!timedOut,t:Date.now()}))}catch{};process.exit(0)};' +
   'let c;try{c=cp.spawn(bash,["-c",cmd],{cwd:cwd,stdio:["ignore","pipe","pipe"],windowsHide:true})}catch(e){try{fs.appendFileSync(d+"/"+id+".err",String(e))}catch{};done(null,"error")}' +
@@ -385,6 +391,7 @@ tools.revision = (a) => {
 tools.write = (a) => {
   A(a, "write"); reqStr(a.path, "path");
   if (typeof a.content !== "string") throw E("INVALID_ARGUMENT", "content must be a string", "Pass content as a string.");
+  capWrite(Buffer.byteLength(a.content), "write of " + a.path);
   const f = abs(a.path);
   fs.mkdirSync(path.dirname(f), { recursive: true });
   atomicWrite(f, a.content);
@@ -411,34 +418,63 @@ tools.edit = (a) => {
     countCheck(a.expect, n, "expect", p);
     if (n > 1 && !all) throw E("NOT_UNIQUE", "old string matches " + n + " places in " + p, "Add surrounding context to make it unique, or pass all:true (with expect:<count>).");
     const lines = all ? lineNosOf(t, old) : lineNosOf(t, old).slice(0, 1);
-    atomicWrite(f, all ? t.split(old).join(nw) : t.replace(old, () => nw));
+    const after = all ? t.split(old).join(nw) : t.replace(old, () => nw);
+    capWrite(Buffer.byteLength(after), "edit of " + p);
+    atomicWrite(f, after);
     readState[f] = fs.statSync(f).mtimeMs;
     noteWrite("edit", rel(f), lines.length, lines);
     return { replaced: lines.length, lines };
   });
 };
-tools.bash = (a) => {
-  A(a, "bash"); reqStr(a.command, "command");
-  const { command, cwd: c, timeoutMs = 120000, env, background = false } = a;
-  const cd = c ? abs(c) : cwd;
-  if (background === true) {
-    const bgEnv = childEnv(env);
-    let st; try { st = fs.statSync(cd); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "cwd not found: " + (c || cd), "Check the cwd."); throw e; }
-    if (!st.isDirectory()) throw E("INVALID_ARGUMENT", "cwd is not a directory: " + (c || cd), "Pass a directory.");
-    fs.mkdirSync(bgDir, { recursive: true });
-    const id = newId("b");
-    const meta = { id, kind: "bash", label: String(command).slice(0, 200), startedAt: Date.now(), deadlineAt: Date.now() + BG_MAX_MS };
-    fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify(meta));
-    fs.writeFileSync(path.join(bgDir, id + ".out"), "");
-    fs.writeFileSync(path.join(bgDir, id + ".err"), "");
-    let ch;
-    try { ch = cp.spawn(process.execPath, ["-e", BG_WRAP2, id, bgDir, command, cd, BASH], { detached: true, stdio: "ignore", windowsHide: true, env: bgEnv }); }
-    catch (e) { try { fs.writeFileSync(path.join(bgDir, id + ".st"), JSON.stringify({ code: null, sig: "error", t: Date.now() })); } catch {} throw sysErr(e); }
-    try { meta.pid = ch.pid; fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify(meta)); } catch {}
-    ch.unref();
-    return { id };
+// Foreground bash runs through the same detached wrapper as background:true, so reaching timeoutMs can PROMOTE the
+// command to a job instead of killing it: the job keeps the same 2h cap and state files, and tools.job({id}) reads it
+// like any other job. waitJob polls the state file with Atomics.wait (sleeping, no busy loop).
+const BG_SYNC_MAX = 256 << 20; // the old spawnSync maxBuffer, kept as the foreground output cap
+const startBgJob = (command, cd, env) => {
+  const id = newId("b");
+  const meta = { id, kind: "bash", label: String(command).slice(0, 200), startedAt: Date.now(), deadlineAt: Date.now() + BG_MAX_MS };
+  fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify(meta));
+  fs.writeFileSync(path.join(bgDir, id + ".out"), "");
+  fs.writeFileSync(path.join(bgDir, id + ".err"), "");
+  let ch;
+  try { ch = cp.spawn(process.execPath, ["-e", BG_WRAP2, id, bgDir, command, cd, BASH], { detached: true, stdio: "ignore", windowsHide: true, env: childEnv(env) }); }
+  catch (e) { try { fs.writeFileSync(path.join(bgDir, id + ".st"), JSON.stringify({ code: null, sig: "error", t: Date.now() })); } catch {} throw sysErr(e); }
+  try { meta.pid = ch.pid; fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify(meta)); } catch {}
+  ch.unref();
+  return id;
+};
+const bgFile = (id, ext) => path.join(bgDir, id + ext);
+const bgText = (id, ext) => { try { return fs.readFileSync(bgFile(id, ext), "utf8"); } catch { return ""; } };
+const bgStat = (id) => { try { return JSON.parse(fs.readFileSync(bgFile(id, ".st"), "utf8")); } catch { return null; } };
+// "done" | "timeout" | "overflow"; sleeps between polls, so waiting costs no CPU.
+const waitJob = (id, timeoutMs, capBytes) => {
+  const t0 = Date.now(), end = t0 + (timeoutMs > 0 ? timeoutMs : 0);
+  for (;;) {
+    if (fs.existsSync(bgFile(id, ".st"))) return "done";
+    if (capBytes) {
+      let n = 0;
+      for (const ext of [".out", ".err"]) { try { n += fs.statSync(bgFile(id, ext)).size; } catch {} }
+      if (n > capBytes) return "overflow";
+    }
+    const now = Date.now();
+    if (now >= end) return "timeout";
+    sleepMs(Math.min(40, Math.max(2, Math.round((now - t0) / 16))));
   }
-  const o = { cwd: cd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 256 << 20, env: childEnv(env) };
+};
+const dropJob = (id) => { // a foreground command that finished normally leaves nothing behind (its id was never returned)
+  for (const ext of [".json", ".out", ".err", ".st", ".mix"]) { try { fs.unlinkSync(bgFile(id, ext)); } catch {} }
+};
+const killJobTree = (id) => { // by the recorded wrapper pid only, never by a command-line search
+  try {
+    const m = JSON.parse(fs.readFileSync(bgFile(id, ".json"), "utf8"));
+    if (!m.pid) return;
+    if (WIN) cp.spawnSync("taskkill", ["/pid", String(m.pid), "/T", "/F"], { windowsHide: true });
+    else { try { process.kill(-m.pid, "SIGKILL"); } catch { try { process.kill(m.pid, "SIGKILL"); } catch {} } }
+  } catch {}
+};
+// The pre-promotion behaviour (promote:false, and the fallback when the wrapper cannot start bash at all).
+const syncBash = (command, cd, timeoutMs, env) => {
+  const o = { cwd: cd, encoding: "utf8", timeout: timeoutMs, maxBuffer: BG_SYNC_MAX, env: childEnv(env) };
   let r = cp.spawnSync(BASH, ["-c", command], o);
   if (r.error && r.error.code === "ENOENT") r = cp.spawnSync(command, Object.assign({ shell: true }, o));
   if (r.error && r.error.code === "ENOBUFS") throw E("OUTPUT_LIMIT", "command output exceeded 256MB", "Redirect output to a file or filter it in the command.");
@@ -446,6 +482,31 @@ tools.bash = (a) => {
   const res = { code: r.status, stdout: r.stdout, stderr: r.stderr };
   if (r.error) res.error = String(r.error.message || r.error);
   return res;
+};
+tools.bash = (a) => {
+  A(a, "bash"); reqStr(a.command, "command");
+  const { command, cwd: c, timeoutMs = 120000, env, background = false } = a;
+  if (a.promote !== undefined && typeof a.promote !== "boolean") throw E("INVALID_ARGUMENT", "promote must be a boolean", "Pass promote:false to kill the command on timeout (the old behaviour); the default promotes it to a background job.");
+  const promote = a.promote !== false;
+  const cd = c ? abs(c) : cwd;
+  if (background === true) {
+    let st; try { st = fs.statSync(cd); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "cwd not found: " + (c || cd), "Check the cwd."); throw e; }
+    if (!st.isDirectory()) throw E("INVALID_ARGUMENT", "cwd is not a directory: " + (c || cd), "Pass a directory.");
+    return { id: startBgJob(command, cd, env) };
+  }
+  if (!promote) return syncBash(command, cd, timeoutMs, env);
+  const id = startBgJob(command, cd, env);
+  const how = waitJob(id, timeoutMs, BG_SYNC_MAX);
+  if (how === "overflow") { killJobTree(id); throw E("OUTPUT_LIMIT", "command output exceeded 256MB", "Redirect output to a file or filter it in the command."); }
+  const stdout = bgText(id, ".out"), stderr = bgText(id, ".err");
+  if (how === "timeout") return { code: null, stdout, stderr, timedOut: true, promoted: true, jobId: id };
+  const st = bgStat(id);
+  // sig "error" with no code means the wrapper could not spawn bash: the command never started, so the old
+  // spawnSync path (which retries through a shell) reproduces the previous result exactly.
+  if (!st || (st.sig === "error" && st.code === null)) return syncBash(command, cd, timeoutMs, env);
+  if (st.timedOut) return { code: null, stdout, stderr, timedOut: true, promoted: true, jobId: id }; // the job's own 2h cap
+  dropJob(id);
+  return { code: st.code, stdout, stderr };
 };
 
 // tools.job: query a background bash started by tools.bash({background:true}); jobs live in the scope dir and
@@ -455,7 +516,7 @@ tools.job = (a) => {
   const waitMs = optInt(a.wait, "wait", 0, 0, 600000);
   const tailChars = optInt(a.tailChars, "tailChars", 4000, 1, 1 << 20);
   const mf = path.join(bgDir, id + ".json");
-  if (!fs.existsSync(mf)) throw E("NOT_FOUND", "job not found: " + id, "Use the id returned by tools.bash({background:true}).");
+  if (!fs.existsSync(mf)) throw E("NOT_FOUND", "job not found: " + id, "Use the id returned by tools.bash({background:true}) or the jobId of a promoted foreground command.");
   const stf = path.join(bgDir, id + ".st");
   const end = Date.now() + waitMs;
   while (!fs.existsSync(stf) && Date.now() < end) sleepMs(100);
@@ -765,6 +826,7 @@ tools.replace = guard((a) => {
     matches += n;
     if (matches > maxRep) throw E("OUTPUT_LIMIT", "more than maxReplacements (" + maxRep + ") matches; nothing was written", "Narrow the pattern/path/glob or raise maxReplacements.");
     const nt = text.replace(re, replacement), diff = nt !== text;
+    if (diff) capWrite(Buffer.byteLength(nt), "replace of " + rel(f));
     if (diff) changed++;
     found.push({ f, n, lines: lineNosAt(text, offs), mtime: fs.statSync(f).mtimeMs, nt: diff ? nt : null, buf: diff ? buf : null });
   }
@@ -777,7 +839,7 @@ tools.replace = guard((a) => {
       for (const x of todo) {
         let m; try { m = fs.statSync(x.f).mtimeMs; } catch { m = -1; }
         if (m !== x.mtime) throw E("STALE", "file changed during replace: " + rel(x.f) + " (nothing was written)", "Re-run tools.replace.", { rolledBack: false, written: [] });
-        const want = expRev && expRev.get(revKey(x.f));
+        const want = expRev ? expRev.get(revKey(x.f)) : undefined;
         if (want !== undefined && revOf(x.f) !== want) throw E("STALE", "revision mismatch for " + rel(x.f) + ": expected " + want + ", current " + revOf(x.f) + " (nothing was written)", "Re-read the file with tools.read and get the current revision with tools.revision.", { rolledBack: false, written: [] });
       }
       const written = []; let cur = null;
@@ -1246,6 +1308,7 @@ dsh.read = dshWrap("read", (a) => {
 dsh.write = dshWrap("write", (a) => {
   const p = dshStr(a.file_path, "file_path");
   if (typeof a.content !== "string") throw E("INVALID_ARGUMENT", "content must be a string", "Pass content as a string.");
+  capWrite(Buffer.byteLength(a.content), "write of " + p);
   credGuard(p);
   const f = abs(p); let before = null;
   try { before = fs.readFileSync(f, "utf8"); } catch (e) { if (e.code !== "ENOENT") throw e; }
@@ -1266,6 +1329,7 @@ dsh.edit = dshWrap("edit", (a) => {
   if (n > 1 && a.replace_all !== true) throw E("NOT_UNIQUE", "old_string matches " + n + " places in " + p, "Add context to make it unique, or set replace_all to true (with expected_count).");
   const lines = a.replace_all === true ? lineNosOf(before, a.old_string) : lineNosOf(before, a.old_string).slice(0, 1);
   const after = a.replace_all === true ? before.split(a.old_string).join(a.new_string) : before.replace(a.old_string, () => a.new_string);
+  capWrite(Buffer.byteLength(after), "edit of " + p);
   atomicWrite(f, after);
   try { readState[f] = fs.statSync(f).mtimeMs; } catch {}
   noteWrite("edit", rel(f), lines.length, lines);
@@ -1317,21 +1381,44 @@ const spillTail = (s) => {
   fs.writeFileSync(f, s);
   return { text: s.slice(-DSH_OUT_TAIL), truncated: true, spillPath: f };
 };
+// Foreground wrapper for the dsh dialect: .out/.err stay separate (the foreground result needs both) and .mix holds
+// stdout+stderr interleaved, which is what job_output reads for a promoted job (the same merged view as BG_WRAP).
+const BG_WRAP_D = 'const fs=require("fs"),cp=require("child_process");const [id,d,cmd,cwd,bash]=process.argv.slice(1);' +
+  'const stf=d+"/"+id+".st";const done=(code,sig,timedOut)=>{try{if(!fs.existsSync(stf))fs.writeFileSync(stf,JSON.stringify({code:code,sig:sig,timedOut:!!timedOut,t:Date.now()}))}catch{};process.exit(0)};' +
+  'const c=cp.spawn(bash,["-c",cmd],{cwd:cwd,stdio:["ignore","pipe","pipe"],windowsHide:true});const w=(e,b)=>{try{fs.appendFileSync(d+"/"+id+e,b)}catch{}};' +
+  'c.stdout.on("data",b=>{w(".out",b);w(".mix",b)});c.stderr.on("data",b=>{w(".err",b);w(".mix",b)});' +
+  'c.on("close",(code,sig)=>done(code,sig,false));c.on("error",e=>{w(".err",String(e));w(".mix",String(e));done(null,"error")});' +
+  'const t=setTimeout(()=>{try{if(process.platform==="win32")cp.spawnSync("taskkill",["/pid",String(c.pid),"/T","/F"],{windowsHide:true});else c.kill("SIGKILL")}catch{};done(null,"timeout",true)},' + BG_MAX_MS + ');if(t.unref)t.unref();';
+const startDshJob = (a, c, wrap, split) => {
+  fs.mkdirSync(bgDir, { recursive: true });
+  const id = newId("d");
+  const meta = { id, kind: "bash", label: a.description, startedAt: Date.now(), deadlineAt: Date.now() + BG_MAX_MS, read: 0 };
+  if (split) meta.mixed = true;
+  fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify(meta));
+  fs.writeFileSync(path.join(bgDir, id + ".out"), "");
+  if (split) { fs.writeFileSync(path.join(bgDir, id + ".err"), ""); fs.writeFileSync(path.join(bgDir, id + ".mix"), ""); }
+  const ch = cp.spawn(process.execPath, ["-e", wrap, id, bgDir, a.command, c, BASH], { detached: true, stdio: "ignore", windowsHide: true, env: childEnv(a.env) });
+  ch.unref();
+  return id;
+};
 dsh.bash = dshWrap("bash", (a) => {
   dshStr(a.command, "command"); dshStr(a.description, "description");
+  if (a.promote !== undefined && typeof a.promote !== "boolean") throw E("INVALID_ARGUMENT", "promote must be a boolean", "Pass promote:false to kill the command on timeout; the default promotes it to a background task.");
   const c = a.workdir === undefined ? cwd : abs(dshStr(a.workdir, "workdir"));
-  if (a.run_in_background === true) {
-    fs.mkdirSync(bgDir, { recursive: true });
-    const id = newId("d");
-    fs.writeFileSync(path.join(bgDir, id + ".json"), JSON.stringify({ id, kind: "bash", label: a.description, startedAt: Date.now(), deadlineAt: Date.now() + BG_MAX_MS, read: 0 }));
-    fs.writeFileSync(path.join(bgDir, id + ".out"), "");
-    const ch = cp.spawn(process.execPath, ["-e", BG_WRAP, id, bgDir, a.command, c, BASH], { detached: true, stdio: "ignore", windowsHide: true, env: childEnv(a.env) });
-    ch.unref();
-    return { kind: "background", taskId: id };
-  }
+  if (a.run_in_background === true) return { kind: "background", taskId: startDshJob(a, c, BG_WRAP, false) };
   const timeoutMs = dshOptInt(a.timeoutMs, "timeoutMs", 1) || 120000;
-  const r = legacyBash({ command: a.command, cwd: c, timeoutMs, env: a.env });
-  return { kind: "foreground", exitCode: r.code === undefined ? null : r.code, signal: null, timedOut: !!r.timedOut, aborted: false, timeoutMs, stdout: spillTail(String(r.stdout || "")), stderr: spillTail(String(r.stderr || "")) };
+  if (a.promote === false) {
+    const r = legacyBash({ command: a.command, cwd: c, timeoutMs, env: a.env, promote: false });
+    return { kind: "foreground", exitCode: r.code === undefined ? null : r.code, signal: null, timedOut: !!r.timedOut, aborted: false, timeoutMs, stdout: spillTail(String(r.stdout || "")), stderr: spillTail(String(r.stderr || "")) };
+  }
+  const id = startDshJob(a, c, BG_WRAP_D, true);
+  const how = waitJob(id, timeoutMs, BG_SYNC_MAX);
+  if (how === "overflow") { killJobTree(id); throw E("OUTPUT_LIMIT", "command output exceeded 256MB", "Redirect output to a file or filter it in the command."); }
+  const st = how === "done" ? bgStat(id) : null;
+  const res = { kind: "foreground", exitCode: st ? st.code : null, signal: null, timedOut: !st || !!st.timedOut, aborted: false, timeoutMs, stdout: spillTail(bgText(id, ".out")), stderr: spillTail(bgText(id, ".err")) };
+  if (!st || st.timedOut) { res.promoted = true; res.taskId = id; } // still running (or hit the 2h cap): read it with job_output
+  else dropJob(id);
+  return res;
 });
 // tools.test: run a test command through the bash path and return a compact summary instead of the raw stream.
 // Parsing is conservative: status comes from the exit code first, counts only from explicit summary lines, and an
@@ -1456,7 +1543,7 @@ dsh.test = dshWrap("test", (a) => {
   } catch (e) {
     return startError(String((e && e.message) || e));
   }
-  const r = legacyBash({ command, cwd: c, timeoutMs });
+  const r = legacyBash({ command, cwd: c, timeoutMs, promote: false });
   const out = String(r.stdout || "") + (r.stderr ? NL + String(r.stderr) : "");
   try { fs.writeFileSync(outputPath, out); } catch {}
   const p = parsePytest(out) || parseNodeTest(out) || parseJsTest(out) || { counts: undefined, failures: [] };
@@ -1487,7 +1574,7 @@ dsh.job_output = dshWrap("job_output", (a) => {
   const t = dshOptInt(a.timeout_ms, "timeout_ms", 0);
   const waitMs = Math.min(t === undefined ? 30000 : t, 100000);
   if (a.wait === true) { const end = Date.now() + waitMs; while (!fs.existsSync(stf) && Date.now() < end) sleepMs(100); }
-  const buf = fs.readFileSync(path.join(bgDir, id + ".out"));
+  const buf = fs.readFileSync(path.join(bgDir, id + (meta.mixed ? ".mix" : ".out")));
   const text = buf.subarray(meta.read).toString("utf8");
   meta.read = buf.length; fs.writeFileSync(mf, JSON.stringify(meta));
   const job = { id, kind: meta.kind, label: meta.label, status: "running", startedAt: meta.startedAt };
