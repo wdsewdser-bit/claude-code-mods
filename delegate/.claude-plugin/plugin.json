@@ -1,0 +1,7 @@
+{
+  "name": "delegate",
+  "version": "0.1.0",
+  "description": "Hand a task to a cheaper model (any OpenAI chat-protocol provider) through a local Anthropic-to-OpenAI proxy; /delegate manages providers, keys and models.",
+  "author": { "name": "yadaz" },
+  "types": "./types/index.d.ts"
+}
