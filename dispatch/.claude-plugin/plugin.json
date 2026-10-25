@@ -1,0 +1,7 @@
+{
+  "name": "dispatch",
+  "version": "0.1.0",
+  "description": "根代理派活规则：分包、模型与档位、执行包写法、验收与终态报告（配合 delegate 和 dispatch-gate）",
+  "author": { "name": "yadaz" },
+  "license": "MIT"
+}

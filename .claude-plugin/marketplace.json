@@ -13,6 +13,14 @@
       "source": "./ctx-mod"
     },
     {
+      "name": "delegate",
+      "source": "./delegate"
+    },
+    {
+      "name": "dispatch",
+      "source": "./dispatch"
+    },
+    {
       "name": "dispatch-gate",
       "source": "./dispatch-gate"
     },
