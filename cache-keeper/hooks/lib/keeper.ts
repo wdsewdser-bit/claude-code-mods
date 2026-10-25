@@ -233,22 +233,33 @@ const clock = (ms: number): string => {
 const thousands = (tokens: number): string => `${Math.round(tokens / 1000)}k`
 
 /** The status line entry for a keeper outside an experiment. */
+/** 等待原因的中文说明；没列出的原样显示。 */
+const WAIT_TEXT: Record<string, string> = {
+  disabled: '只观察',
+  experiment: '实验中',
+  busy: '对话进行中',
+  'ttl-unknown': 'TTL 未知',
+  'no-baseline': '还没有基线',
+  'prefix-too-small': '前缀太小',
+  expired: '已过期',
+  'break-even': '保活不划算',
+}
+
 export const describeKeeper = (
   state: KeeperState,
   decision: Decision,
 ): string => {
-  const ttl = state.ttl ?? 'ttl?'
+  const ttl = state.ttl ?? 'TTL?'
   const prefix = thousands(state.cachedPrefixTokens)
-  if (decision.action === 'stop') return `cache-keeper stopped`
-  if (decision.action === 'fire') return `cache ${ttl} ${prefix} · keeping`
-  if (decision.reason === 'disabled') return `cache ${ttl} ${prefix} · observing`
+  if (decision.action === 'stop') return '保活已停止'
+  if (decision.action === 'fire') return `缓存 ${ttl} · ${prefix} · 保活中`
   if (decision.reason === 'not-due' && decision.dueInMs !== undefined) {
-    return `cache ${ttl} ${prefix} · keep in ${clock(decision.dueInMs)}`
+    return `缓存 ${ttl} · ${prefix} · ${clock(decision.dueInMs)} 后保活`
   }
   const why =
     decision.reason === 'paused'
-      ? `paused (${state.pausedReason})`
-      : decision.reason
+      ? `暂停（${state.pausedReason}）`
+      : WAIT_TEXT[decision.reason] ?? decision.reason
 
-  return `cache ${ttl} ${prefix} · ${why}`
+  return `缓存 ${ttl} · ${prefix} · ${why}`
 }

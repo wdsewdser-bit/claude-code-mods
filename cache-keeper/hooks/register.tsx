@@ -230,7 +230,7 @@ const readConfig = (options: PluginOptions): Config => ({
   probePrompt: stringOf(options.probePrompt, 'Reply with OK only.'),
   writeCsv: booleanOf(options.writeCsv, true),
   writeJson: booleanOf(options.writeJson, true),
-  showStatus: booleanOf(options.showStatus, true),
+  showStatus: booleanOf(options.showStatus, false), // 按钮栏已实时显示保活信息，状态行默认不再重复
   shadowMode: booleanOf(options.shadowMode, false),
 })
 
@@ -1204,7 +1204,9 @@ const showStatus = ($: EngineInterface, s: Session, now: number): void => {
       decision.action === 'wait' && decision.dueInMs !== undefined
         ? { ...decision, dueInMs: Math.ceil(decision.dueInMs / 15_000) * 15_000 }
         : decision
-    text = describeKeeper(s.keeper, coarse)
+    // 状态行前加一个点：● 正在按计划保活，○ 暂停、只观察或已停止。按钮栏自己有点，所以只加在这里。
+    const live = coarse.action === 'fire' || (coarse.action === 'wait' && coarse.reason === 'not-due')
+    text = `${live ? '●' : '○'} ${describeKeeper(s.keeper, coarse)}`
   }
   if (text === s.lastStatus) return
   s.lastStatus = text
@@ -1789,17 +1791,25 @@ export const register: Register = (on, options) => {
     const below = await next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
 
+    // barText 形如「缓存保活：开 · 锚点 · …」：开关和锚点从这里读，后半段原样显示。
+    const isOn = text.startsWith('缓存保活：开')
+    const isAnchor = /^缓存保活：[开关] · 锚点/.test(text)
+    const detail = text.replace(/^缓存保活：[开关]( · 锚点)?( · )?/, '')
+
     return (
-      <Box flexDirection="column">
-        <Box>
-          <Text dimColor>{text} </Text>
-          <Button key="keeper-on" label="开启保活" onPress={() => setEnabled($, true)} />
-          <Text> </Text>
-          <Button key="keeper-off" label="关闭保活" onPress={() => setEnabled($, false)} />
-          <Text> </Text>
-          <Button key="anchor-on" label="设为锚点" onPress={() => setAnchor($, true)} />
-          <Text> </Text>
-          <Button key="anchor-off" label="取消锚点" onPress={() => setAnchor($, false)} />
+      <Box flexWrap="wrap" columnGap={4} alignItems="center">
+        <Box gap={2} alignItems="center">
+          <Text>
+            <Text color={isOn ? 'success' : 'inactive'}>● </Text>
+            <Text>保活</Text>
+            <Text dimColor>{detail === '' ? (isOn ? ' · 开' : ' · 关') : ` · ${detail}`}</Text>
+          </Text>
+          <Button key="keeper-toggle" plain dimColor onPress={() => setEnabled($, !isOn)}>
+            {isOn ? '关闭' : '开启'}
+          </Button>
+          <Button key="anchor-toggle" plain dimColor={!isAnchor} onPress={() => setAnchor($, !isAnchor)}>
+            <Text color={isAnchor ? 'warning' : undefined}>{isAnchor ? '★ 锚点' : '☆ 锚点'}</Text>
+          </Button>
         </Box>
         {below}
       </Box>

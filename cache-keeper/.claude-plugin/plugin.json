@@ -81,8 +81,8 @@
     "showStatus": {
       "type": "boolean",
       "title": "Status line entry",
-      "description": "Show the keeper's state in the status line.",
-      "default": true
+      "description": "Show the keeper's state in the status line (off by default: the bar above the prompt already shows it).",
+      "default": false
     },
     "shadowMode": {
       "type": "boolean",
