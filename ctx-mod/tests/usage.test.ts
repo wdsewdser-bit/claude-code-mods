@@ -86,10 +86,10 @@ describe('usage arithmetic', () => {
   })
 
   test('describeFill names the window even without a token count', () => {
-    expect(describeFill(228_400, LIMIT, 3)).toBe('ctx 62% · 228k/367k · w3')
-    expect(describeFill(undefined, LIMIT, 3)).toBe('ctx ? · w3')
+    expect(describeFill(228_400, LIMIT, 3)).toBe('上下文 ▰▰▰▰▰▰▱▱▱▱ 62% · 228k/367k · 窗口 3')
+    expect(describeFill(undefined, LIMIT, 3)).toBe('上下文 ? · 窗口 3')
     // k is rounded, not floored.
-    expect(describeFill(228_600, LIMIT, 1)).toBe('ctx 62% · 229k/367k · w1')
+    expect(describeFill(228_600, LIMIT, 1)).toBe('上下文 ▰▰▰▰▰▰▱▱▱▱ 62% · 229k/367k · 窗口 1')
   })
 })
 

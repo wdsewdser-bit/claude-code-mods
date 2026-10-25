@@ -183,10 +183,44 @@ const countCheck = (expect, n, what, p) => {
   if (!Number.isInteger(expect) || expect < 0) throw E("INVALID_ARGUMENT", what + " must be a non-negative integer", "Pass the number of places you intend to change.");
   if (n !== expect) throw E("COUNT_MISMATCH", "expected " + expect + " match(es) but found " + n + " in " + p + "; nothing was written", "Re-read the matches (tools.grep) and fix the pattern/old text or the expected count.");
 };
+// Windows files usually have CRLF line endings, while an old string typed in a program has LF. Exact match first; only
+// when that finds nothing, the file contains CRLF and old is LF-only, retry once with CRLF in both old and new. The
+// retried pair is then used for counting, NOT_UNIQUE, expect and the write, so the file keeps its CRLF endings.
+const crlfMatch = (text, old, nw) => {
+  if (text.split(old).length - 1 > 0) return { old, nw };
+  if (!text.includes("\r\n") || !old.includes(NL) || old.includes("\r")) return { old, nw };
+  const crlf = (s) => s.replace(/\r?\n/g, "\r\n");
+  return { old: crlf(old), nw: crlf(nw) };
+};
 const opsText = () => {
   if (!writeOps.size) return "本程序已生效的写操作：无";
   const rows = [...writeOps.values()].map((e) => "- " + e.op + " " + e.path + (e.count > 1 ? " ×" + e.count : "") + placesText(e));
   return "本程序已生效的写操作：\n" + rows.slice(0, 50).join("\n") + (rows.length > 50 ? "\n- …等 " + rows.length + " 项" : "");
+};
+// The call in flight, so an uncaught throw can name it (tools.* calls run synchronously, so this is the failing one).
+let curCall = null;
+const markCall = (k, a) => { curCall = { k, path: a && typeof a === "object" ? (a.path || a.file_path) : undefined }; };
+// code/message of the throw, and the call name + path when known (falls back to the code and message alone)
+const failInfo = (err) => {
+  const r = { code: "", msg: String((err && err.message) || err) };
+  if (err && typeof err.code === "string") r.code = err.code;
+  else { const m = /^\[([A-Z_]+)\]/.exec(r.msg); if (m) r.code = m[1]; }
+  r.msg = r.msg.replace(/^\[[A-Z_]+\]\s*/, "").split(NL)[0];
+  if (err && err.name === "ToolCallError") r.call = err.toolName;
+  else if (err && err.name === "PtcError" && curCall) r.call = curCall.k;
+  if (curCall && typeof curCall.path === "string" && r.call === curCall.k) r.path = curCall.path;
+  if (!r.path) { const m = /\b(?:in|:)\s+([^\s:]+\.[A-Za-z0-9_]+)/.exec(r.msg); if (m) r.path = m[1]; }
+  return r;
+};
+// Error path only, and only when writes already happened: applied / failed / not-run, so the model neither resends
+// applied writes nor forgets the ones after the throw. Kept to 3 short blocks.
+const errText = (err) => {
+  if (!writeOps.size) return "";
+  const rows = [...writeOps.values()].map((e) => e.op + " " + e.path + (e.lines && e.lines.length ? " 行 " + e.lines.slice(0, 15).join(",") : ""));
+  const fi = failInfo(err);
+  const failed = "failed：" + (fi.call ? fi.call + " " : "") + (fi.path ? fi.path + " " : "") + (fi.code ? "[" + fi.code + "] " : "") + fi.msg;
+  return "applied（已生效，不要重发）：\n" + rows.slice(0, 10).join("\n") + (rows.length > 10 ? "\n…另 " + (rows.length - 10) + " 条" : "") +
+    NL + failed.slice(0, 200) + NL + "not-run：抛错点之后的代码没有执行；后面若还有写入，需要重新发";
 };
 const closeLog = () => {
   try { if (logFd !== null) fs.closeSync(logFd); } catch {}
@@ -389,7 +423,7 @@ tools.revision = (a) => {
   try { return revOf(f); } catch (e) { if (e.code === "ENOENT") throw E("NOT_FOUND", "file not found: " + p, "Check the path with tools.glob."); throw e; }
 };
 tools.write = (a) => {
-  A(a, "write"); reqStr(a.path, "path");
+  markCall("write", a); A(a, "write"); reqStr(a.path, "path");
   if (typeof a.content !== "string") throw E("INVALID_ARGUMENT", "content must be a string", "Pass content as a string.");
   capWrite(Buffer.byteLength(a.content), "write of " + a.path);
   const f = abs(a.path);
@@ -400,7 +434,7 @@ tools.write = (a) => {
   return { bytes: Buffer.byteLength(a.content) };
 };
 tools.edit = (a) => {
-  A(a, "edit"); reqStr(a.path, "path");
+  markCall("edit", a); A(a, "edit"); reqStr(a.path, "path");
   const { path: p, old, new: nw, all = false } = a;
   if (typeof old !== "string" || old === "") throw E("INVALID_ARGUMENT", "old must be a non-empty string", "Pass the exact text to replace.");
   if (typeof nw !== "string") throw E("INVALID_ARGUMENT", "new must be a string", "Pass the replacement text.");
@@ -413,12 +447,13 @@ tools.edit = (a) => {
     if (readState[f] !== undefined && st.mtimeMs !== readState[f]) throw E("STALE", "file changed since it was read: " + p, "Re-read the file with tools.read and redo the edit.");
     checkRevision(a.expectedRevision, f, p);
     const t = fs.readFileSync(f, "utf8");
-    const n = t.split(old).length - 1;
+    const m = crlfMatch(t, old, nw), o = m.old, nn = m.nw;
+    const n = t.split(o).length - 1;
     if (n === 0) throw E("NOT_FOUND", "old string not found in " + p, "Re-read the file and copy the exact text (whitespace and line endings matter).");
     countCheck(a.expect, n, "expect", p);
     if (n > 1 && !all) throw E("NOT_UNIQUE", "old string matches " + n + " places in " + p, "Add surrounding context to make it unique, or pass all:true (with expect:<count>).");
-    const lines = all ? lineNosOf(t, old) : lineNosOf(t, old).slice(0, 1);
-    const after = all ? t.split(old).join(nw) : t.replace(old, () => nw);
+    const lines = all ? lineNosOf(t, o) : lineNosOf(t, o).slice(0, 1);
+    const after = all ? t.split(o).join(nn) : t.replace(o, () => nn);
     capWrite(Buffer.byteLength(after), "edit of " + p);
     atomicWrite(f, after);
     readState[f] = fs.statSync(f).mtimeMs;
@@ -780,6 +815,7 @@ const looseForFinder = (pattern) => {
   return { pat, needsPcre, needsScan };
 };
 tools.replace = guard((a) => {
+  markCall("replace", a);
   A(a, "replace");
   const { pattern, replacement, path: root, glob, flags = "", dryRun = false } = a;
   let expRev = null;
@@ -1211,6 +1247,7 @@ const preflightJob = (job, roots, idxs) => { // returns true if all ok; marks fa
 };
 
 tools.batch = guard((a) => {
+  markCall("batch", a);
   A(a, "batch");
   const { action, operations, protect = [], root, toRoot, id } = a;
   if (action === "list") {
@@ -1306,7 +1343,7 @@ dsh.read = dshWrap("read", (a) => {
   return r;
 });
 dsh.write = dshWrap("write", (a) => {
-  const p = dshStr(a.file_path, "file_path");
+  markCall("write", a); const p = dshStr(a.file_path, "file_path");
   if (typeof a.content !== "string") throw E("INVALID_ARGUMENT", "content must be a string", "Pass content as a string.");
   capWrite(Buffer.byteLength(a.content), "write of " + p);
   credGuard(p);
@@ -1319,16 +1356,17 @@ dsh.write = dshWrap("write", (a) => {
   return { path: rel(f), operation: before === null ? "create" : "update", before, after: a.content };
 });
 dsh.edit = dshWrap("edit", (a) => {
-  const p = dshStr(a.file_path, "file_path"); credGuard(p);
+  markCall("edit", a); const p = dshStr(a.file_path, "file_path"); credGuard(p);
   if (typeof a.old_string !== "string" || a.old_string === "") throw E("INVALID_ARGUMENT", "old_string must be a non-empty string", "Pass the exact text to replace.");
   if (typeof a.new_string !== "string") throw E("INVALID_ARGUMENT", "new_string must be a string", "Pass the replacement text (empty string deletes).");
   const f = abs(p), before = fs.readFileSync(f, "utf8");
-  const n = before.split(a.old_string).length - 1;
+  const m = crlfMatch(before, a.old_string, a.new_string), o = m.old, nn = m.nw;
+  const n = before.split(o).length - 1;
   if (n === 0) throw E("NOT_FOUND", "old_string not found in " + p, "Re-read the file and copy the exact text.");
   countCheck(a.expected_count, n, "expected_count", p);
   if (n > 1 && a.replace_all !== true) throw E("NOT_UNIQUE", "old_string matches " + n + " places in " + p, "Add context to make it unique, or set replace_all to true (with expected_count).");
-  const lines = a.replace_all === true ? lineNosOf(before, a.old_string) : lineNosOf(before, a.old_string).slice(0, 1);
-  const after = a.replace_all === true ? before.split(a.old_string).join(a.new_string) : before.replace(a.old_string, () => a.new_string);
+  const lines = a.replace_all === true ? lineNosOf(before, o) : lineNosOf(before, o).slice(0, 1);
+  const after = a.replace_all === true ? before.split(o).join(nn) : before.replace(o, () => nn);
   capWrite(Buffer.byteLength(after), "edit of " + p);
   atomicWrite(f, after);
   try { readState[f] = fs.statSync(f).mtimeMs; } catch {}
@@ -1585,6 +1623,63 @@ dsh.job_output = dshWrap("job_output", (a) => {
   }
   return { text, job };
 });
+// tools.fetch: async (the only async legacy tool) web fetch for batch reading of pages and raw source files.
+// Works in read-only mode too: the Node permission model restricts the filesystem, not the network.
+// {url} -> one result object; {urls:[...]} -> results in order, fetched concurrently. Network errors never throw:
+// they come back as {ok:false, error}. HTML is reduced to text unless raw:true; github.com blob links are rewritten
+// to raw.githubusercontent.com. Text over maxChars is cut and the full text is saved in ref (field ref).
+const FETCH_MAX_BYTES = 20 << 20;
+const htmlText = (h) => h
+  .replace(/<(script|style|noscript|svg|head)\b[\s\S]*?<\/\1>/gi, "")
+  .replace(/<!--[\s\S]*?-->/g, "")
+  .replace(/<(br|\/p|\/div|\/li|\/tr|\/h[1-6]|\/pre|\/section|\/article)\b[^>]*>/gi, NL)
+  .replace(/<li\b[^>]*>/gi, "- ")
+  .replace(/<[^>]+>/g, "")
+  .replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+  .replace(/&#(\d+);/g, (m, d) => String.fromCodePoint(+d)).replace(/&#x([0-9a-f]+);/gi, (m, x) => String.fromCodePoint(parseInt(x, 16)))
+  .replace(/&amp;/g, "&")
+  .replace(/[ \t]+\n/g, NL).replace(/\n{3,}/g, NL + NL).trim();
+const rawGithub = (u) => {
+  const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/(.+)$/.exec(u);
+  return m ? "https://raw.githubusercontent.com/" + m[1] + "/" + m[2] + "/" + m[3] : u;
+};
+tools.fetch = async (a) => {
+  A(a, "fetch");
+  const many = a.urls !== undefined;
+  if (many && a.url !== undefined) throw E("INVALID_ARGUMENT", "pass url or urls, not both", "Use urls:[...] for a batch.");
+  const list = many ? a.urls : [a.url];
+  if (!Array.isArray(list) || list.length === 0 || list.length > 50) throw E("INVALID_ARGUMENT", "urls must be a non-empty array of at most 50 URLs", "Split larger batches.");
+  for (const u of list) if (typeof u !== "string" || !/^https?:\/\//i.test(u)) throw E("INVALID_ARGUMENT", "not an http(s) URL: " + String(u), "Pass absolute http:// or https:// URLs.");
+  const maxChars = optInt(a.maxChars, "maxChars", 20000, 100, 200000);
+  const timeoutMs = optInt(a.timeoutMs, "timeoutMs", 30000, 1000, 120000);
+  const conc = optInt(a.concurrency, "concurrency", 6, 1, 16);
+  const raw = a.raw === true;
+  const one = async (u0) => {
+    const u = rawGithub(u0);
+    const ac = new AbortController(), t = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const r = await fetch(u, { signal: ac.signal, redirect: "follow", headers: { "user-agent": "ptc-run-fetch/1", accept: "text/*,application/json,*/*;q=0.5" } });
+      const type = r.headers.get("content-type") || "";
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length > FETCH_MAX_BYTES) return { url: u0, ok: false, status: r.status, error: "body over 20MB" };
+      if (/^(image|audio|video)\/|application\/(octet-stream|zip|pdf|gzip)/i.test(type)) return { url: u0, ok: false, status: r.status, contentType: type, error: "binary content (" + type + ")" };
+      let text = buf.toString("utf8");
+      if (!raw && /html/i.test(type)) text = htmlText(text);
+      const res = { url: u0, ok: r.ok, status: r.status, contentType: type, chars: text.length };
+      if (u !== u0) res.fetched = u;
+      if (r.url && r.url !== u) res.finalUrl = r.url;
+      if (text.length > maxChars) { res.ref = ref.put(text); res.truncated = true; text = text.slice(0, maxChars); }
+      res.text = text;
+      return res;
+    } catch (e) {
+      return { url: u0, ok: false, error: e && e.name === "AbortError" ? "timeout after " + timeoutMs + "ms" : String((e && e.cause && e.cause.message) || (e && e.message) || e) };
+    } finally { clearTimeout(t); }
+  };
+  const out = new Array(list.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(conc, list.length) }, async () => { while (next < list.length) { const i = next++; out[i] = await one(list[i]); } }));
+  return many ? out : out[0];
+};
 const legacyBash = tools.bash;
 tools.dsh = dsh;
 tools.test = dsh.test; // normal mode gets the same summary shape (same fields, same parsing)
@@ -1619,7 +1714,8 @@ const AF = Object.getPrototypeOf(async function () {}).constructor;
       if (err && typeof err.code === "string") m += NL + "[code: " + err.code + "]";
     }
     if (/\.(catch|then) is not a function/.test(String(err && err.message))) m += NL + "hint: tools.* 是同步的，用 try/catch，不要链 .then/.catch";
-    text = opsText() + NL + NL + m + (body ? NL + NL + body : "");
+    const et = errText(err);
+    text = et ? et + NL + NL + m + (body ? NL + NL + body : "") : opsText() + NL + NL + m + (body ? NL + NL + body : "");
   }
   if (text.length > MAX) {
     const id = ref.put(text);

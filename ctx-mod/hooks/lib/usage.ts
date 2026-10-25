@@ -48,10 +48,14 @@ export const describeFill = (
   limit: number,
   window: number,
 ): string => {
-  if (tokens === undefined) return `ctx ? · w${window}`
+  if (tokens === undefined) return `上下文 ? · 窗口 ${window}`
   const k = (n: number): number => Math.round(n / 1000)
 
-  return `ctx ${percentOf(tokens, limit)}% · ${k(tokens)}k/${k(limit)}k · w${window}`
+  const pct = percentOf(tokens, limit)
+  // 10 格进度条，每格 10%，满了也不超过 10 格。
+  const filled = Math.min(10, Math.max(0, Math.round(pct / 10)))
+
+  return `上下文 ${'▰'.repeat(filled)}${'▱'.repeat(10 - filled)} ${pct}% · ${k(tokens)}k/${k(limit)}k · 窗口 ${window}`
 }
 
 export type Judgement = {

@@ -126,7 +126,7 @@ describe('keeper', () => {
     await command($, 'start')
     await w.clock.advance(600_000)
     expect(w.forks).toHaveLength(0)
-    expect(await command($, 'status')).toContain('expired')
+    expect(await command($, 'status')).toContain('已过期')
   })
 
   test('leaves a small prefix alone', LONG, async ($, on) => {
@@ -198,7 +198,7 @@ describe('keeper', () => {
       await command($, 'start')
       await w.clock.advance(600_000)
       expect(w.forks).toHaveLength(2)
-      expect(await command($, 'status')).toContain('break-even')
+      expect(await command($, 'status')).toContain('保活不划算')
       await w.clock.advance(900_000)
       expect(w.forks).toHaveLength(2)
     },
@@ -211,7 +211,7 @@ describe('keeper', () => {
     await command($, 'start')
     await w.clock.advance(290_000)
     expect(w.forks).toHaveLength(0)
-    expect(await command($, 'status')).toContain('ttl-unknown')
+    expect(await command($, 'status')).toContain('TTL 未知')
 
     w.files.set(
       '/t/session.jsonl',
@@ -263,7 +263,7 @@ describe('keeper', () => {
     await command($, 'start')
     const step = $.turn.step({ turnId: 't2', index: 0, model: 'claude-sonnet-5-5', effort: 'medium', messageCount: 3 })
     for await (const chunk of step) void chunk
-    expect(await command($, 'status')).toContain('paused (model or effort changed)')
+    expect(await command($, 'status')).toContain('暂停（model or effort changed）')
     await w.clock.advance(290_000)
     expect(w.forks).toHaveLength(0)
   })
@@ -335,7 +335,7 @@ describe('anchor session', () => {
     const status = await command($, 'status')
     expect(status).toContain('anchor on')
     expect(status).toContain('of unbounded')
-    expect(status).not.toContain('break-even')
+    expect(status).not.toContain('保活不划算')
   })
 
   test('anchor off restores the cap and leaves the keeper on', CAPPED, async ($, on) => {
