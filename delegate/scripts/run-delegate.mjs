@@ -10,6 +10,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { readRootsEnv, readRootsOf, readRootsPromptArg } from './read-roots.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const home = os.homedir()
@@ -360,6 +361,13 @@ const main = async () => {
       env.PTC_RUN_SDK_IN_PROMPT = '1' // ptc-run: short run_code description + DSH-shaped tools.*
       if (roOnly) env.PTC_RUN_READONLY = '1' // ptc-run: read-only sandbox (broker + restricted runner)
     }
+    // read + ptc:'only' with readPaths: extra directories ptc-run's read-only broker may read and search, besides the
+    // cwd (PTC_RUN_READ_ROOTS, PATH-style separated). Read only: writes and child processes stay blocked, and ptc-run
+    // drops any entry that is missing or not absolute, so a stale directory never fails the run.
+    const readRoots = readRootsOf(job, roOnly)
+    const readRootsValue = readRootsEnv(readRoots, path.delimiter)
+    if (readRootsValue !== '') env.PTC_RUN_READ_ROOTS = readRootsValue
+    else delete env.PTC_RUN_READ_ROOTS
     // ptc: 'only' leaves run_code as the sole tool (like DSH's PTC-only presentation), so no
     // built-in tool descriptions are sent at all. --tools "" would also drop plugin tools, so name it.
     const only = job.ptc === 'only'
@@ -393,6 +401,8 @@ const main = async () => {
       '--tools',
       tools,
       ...(only ? ['--system-prompt-file', roOnly ? PTC_RO_PROMPT : PTC_ONLY_PROMPT, '--settings', PTC_ONLY_SETTINGS, '--exclude-dynamic-system-prompt-sections'] : []),
+      // The read-only prompt is shared, so the extra readable directories go in as an appended line (one arg, no shell).
+      ...readRootsPromptArg(readRoots),
       // clean: 原生 CC 对照用，保留内置工具，关掉全部插件、输出风格和 CLAUDE.md（A/B 测试专用）。
       ...(job.clean === true && !only ? ['--settings', CLEAN_SETTINGS] : []),
       '--strict-mcp-config',

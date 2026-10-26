@@ -207,7 +207,7 @@ export const toolDescription = (config: Config): string => {
     'background=true 立即返回，任务做完后会自动通知你（结果在通知里）：你手头有别的事可做、任务较久、或要同时派几个互不依赖的包时用；你下一步就依赖它的结果时用默认的前台，别用后台再干等。',
     '轮数和时长基本不设限（只有 2 小时的防卡死兜底），不用为了怕超时把任务拆碎；预计超过几分钟的任务用 background=true。万一超时，返回里会带 agent ID 和它做到哪：先核对文件，没做完就 resume 续做，不要原样重试。汇报要求它精简：结论、改了哪些文件、测试结果。',
     'mode=read（默认）只读；mode=work 可改文件和跑命令（它只用一个 run_code 工具，在程序里批量调用 read/edit/bash 等），仅在任务明确需要改动时用。',
-    "read 模式默认也只用一个只读的 run_code（只能读 cwd 内的文件，不能写文件、跑命令），在程序里批量读取、检索后汇总，另外带一个 WebFetch 可以读网页；要读 cwd 以外的文件时传 ptc:'off'，改用原生 Read/Grep/Glob/WebFetch。",
+    "read 模式默认也只用一个只读的 run_code（默认只能读 cwd 内的文件，不能写文件、跑命令），在程序里批量读取、检索后汇总，另外带一个 WebFetch 可以读网页；要读 cwd 以外的目录时，把它们列进 readPaths（绝对目录，只放宽读），不必改用 ptc:'off'；只有 readPaths 也覆盖不了（比如需要别的工具）才传 ptc:'off' 改用原生 Read/Grep/Glob/WebFetch。",
     ready.length === 2 ? '' : `当前已配置的档位：${ready.join('、') || '无（先用 /delegate 设置）'}`,
   ]
     .filter(Boolean)
