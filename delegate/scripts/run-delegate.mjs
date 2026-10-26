@@ -11,6 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRootsEnv, readRootsOf, readRootsPromptArg } from './read-roots.mjs'
+import { createOutputTracker } from './stream-usage.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const home = os.homedir()
@@ -124,6 +125,9 @@ const createControl = (jobId, job) => {
     turns: 0,
     lastTool: null,
     lastText: '',
+    // 运行中数出来的输出 token 总数：每条 assistant 行的 usage.output_tokens 是 0，
+    // 只有 stream_event 的 message_delta 和最后的 result 行带着真数（见 stream-usage.mjs）。
+    outputTokens: 0,
   }
   let lastWrite = 0
   const write = force => {
@@ -143,7 +147,18 @@ const createControl = (jobId, job) => {
       bytes += Buffer.byteLength(line) + 1
     } catch {}
   }
+  // 运行中的输出：stream_event 只用来数 token，不进 events.jsonl（逐 token 的增量会把有用事件挤掉）。
+  const output = createOutputTracker()
   const onEvent = (line, o) => {
+    if (o.type === 'stream_event') {
+      const total = output.onEvent(o.event)
+      if (total !== state.outputTokens) {
+        state.outputTokens = total
+        write(false) // 和 assistant/user 行同一个节流频率
+      }
+
+      return
+    }
     // 每个思考 token 一行的进度事件对面板没用，只会把文件撑大、提前轮转。
     if (!(o.type === 'system' && o.subtype === 'thinking_tokens')) append(line)
     if (typeof o.session_id === 'string' && o.session_id !== '') state.sessionId = o.session_id
@@ -161,6 +176,9 @@ const createControl = (jobId, job) => {
       write(false)
     } else if (o.type === 'result') {
       state.phase = 'finishing'
+      // result.usage.output_tokens 是整次运行的真实总数，覆盖运行中数出来的值。
+      const total = output.final(o.usage)
+      if (total > state.outputTokens) state.outputTokens = total
       write(true)
     }
   }
@@ -195,6 +213,8 @@ const createControl = (jobId, job) => {
     if (typeof value.sessionId === 'string' && value.sessionId !== '') state.sessionId = value.sessionId
     if (typeof value.turns === 'number') state.turns = value.turns
     if (typeof value.text === 'string' && value.text !== '') state.lastText = value.text.slice(0, 600)
+    const used = Number(value.usage?.output_tokens)
+    if (Number.isFinite(used) && used > state.outputTokens) state.outputTokens = used
     write(true)
   }
   const heartbeat = setInterval(() => write(true), HEARTBEAT_MS)
@@ -396,6 +416,8 @@ const main = async () => {
       '--output-format',
       'stream-json',
       '--verbose',
+      // 半成品事件（stream_event）里才有运行中的用量：assistant 行的 usage.output_tokens 恒为 0。
+      '--include-partial-messages',
       '--allowedTools',
       only ? tools : ptc ? `${tools},${PTC_TOOL}` : tools,
       '--tools',

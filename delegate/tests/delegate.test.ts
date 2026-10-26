@@ -989,6 +989,29 @@ describe('live pane helpers', () => {
   test('usageOf counts each message once and takes the latest context', () => {
     expect(usageOf(lines)).toEqual({ context: 2000, output: 90 })
   })
+  test('usageOf takes the real total from the result line (assistant lines carry 0)', () => {
+    // 网关只给半成品事件 usage：assistant 行的 output_tokens 全是 0，总数只在 result 里。
+    const zero = (id: string) => asst(id, [{ type: 'text', text: 'hi' }], { input_tokens: 700, output_tokens: 0 })
+    const run = [zero('m1'), zero('m2'), JSON.stringify({ type: 'result', usage: { input_tokens: 700, output_tokens: 186_521 } })]
+    expect(usageOf(run)).toEqual({ context: 700, output: 186_521 })
+    // 没有 result 时仍是各条消息之和
+    expect(usageOf([zero('m1'), zero('m2')])).toEqual({ context: 700, output: 0 })
+    // 同一目录里更早一次运行留下的 result 不算，取最后一条
+    const rerun = [
+      JSON.stringify({ type: 'result', usage: { output_tokens: 44_816 } }),
+      asst('m3', [{ type: 'text', text: 'again' }], { input_tokens: 900, output_tokens: 0 }),
+      JSON.stringify({ type: 'result', usage: { output_tokens: 3_273 } }),
+    ]
+    expect(usageOf(rerun)).toEqual({ context: 900, output: 3_273 })
+    // result 行没有 usage 或不是数字时退回各条消息之和
+    const partial = [asst('m4', [], { input_tokens: 10, output_tokens: 40 }), JSON.stringify({ type: 'result' })]
+    expect(usageOf(partial)).toEqual({ context: 10, output: 40 })
+  })
+  test('status.json carries the running output count, and garbage is dropped', () => {
+    expect(normalizeStatus({ outputTokens: 12_345 })?.outputTokens).toBe(12_345)
+    expect(normalizeStatus({ outputTokens: 'x' })).not.toHaveProperty('outputTokens')
+    expect(normalizeStatus({ outputTokens: -1 })).not.toHaveProperty('outputTokens')
+  })
   test('tokensOf', () => {
     expect([tokensOf(undefined), tokensOf(950), tokensOf(56789), tokensOf(1234567)]).toEqual(['–', '950', '57K', '1.2M'])
   })

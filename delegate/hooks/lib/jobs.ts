@@ -47,6 +47,8 @@ export type JobStatusFile = {
   turns?: number
   lastTool?: string | null
   lastText?: string
+  /** 运行中数出来的输出 token 总数：assistant 行的 usage 是 0，runner 从 stream_event 里累加，result 时覆盖。 */
+  outputTokens?: number
   startedAt?: number
   updatedAt?: number
   endedAt?: number
@@ -225,6 +227,7 @@ export const normalizeStatus = (raw: unknown): JobStatusFile | undefined => {
     turns: num(raw.turns),
     lastTool: str(raw.lastTool) === '' ? null : str(raw.lastTool),
     lastText: str(raw.lastText),
+    ...(num(raw.outputTokens) === undefined || num(raw.outputTokens)! < 0 ? {} : { outputTokens: num(raw.outputTokens) }),
     startedAt: num(raw.startedAt),
     updatedAt: num(raw.updatedAt),
     endedAt: num(raw.endedAt),
@@ -452,19 +455,29 @@ export const tokensOf = (n: number | undefined): string => {
   return String(n)
 }
 
-/** 从事件流算用量：上下文 = 最近一次请求的输入（含缓存），输出 = 各条消息输出之和（同一消息只算一次）。 */
+/** 从事件流算用量：上下文 = 最近一次请求的输入（含缓存），输出 = 各条消息输出之和（同一消息只算一次）。
+ *  上游网关只在半成品事件里给 usage，每条 assistant 行的 output_tokens 是 0，所以输出还要看 result 行：
+ *  它带着整次运行的真实总数（同一作业目录里更早一次运行留下的 result 不算，取最后一条）。 */
 export const usageOf = (lines: readonly string[]): { context: number; output: number } => {
   const seen = new Map<string, number>()
   let context = 0
+  let resultOutput = 0
   for (const raw of lines) {
-    if (!raw.includes('"type":"assistant"')) continue
+    if (!raw.includes('"type":"assistant"') && !raw.includes('"type":"result"')) continue
     let o: unknown
     try {
       o = JSON.parse(raw)
     } catch {
       continue
     }
-    if (!isRecord(o) || o.type !== 'assistant' || !isRecord(o.message) || !isRecord(o.message.usage)) continue
+    if (!isRecord(o)) continue
+    if (o.type === 'result') {
+      const u = isRecord(o.usage) ? o.usage : undefined
+      const v = typeof u?.output_tokens === 'number' && Number.isFinite(u.output_tokens) ? u.output_tokens : 0
+      if (v > 0) resultOutput = v
+      continue
+    }
+    if (o.type !== 'assistant' || !isRecord(o.message) || !isRecord(o.message.usage)) continue
     const u = o.message.usage
     const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
     const input = num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens)
@@ -475,5 +488,5 @@ export const usageOf = (lines: readonly string[]): { context: number; output: nu
   let output = 0
   for (const v of seen.values()) output += v
 
-  return { context, output }
+  return { context, output: Math.max(output, resultOutput) }
 }
