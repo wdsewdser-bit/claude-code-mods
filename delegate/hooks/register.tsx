@@ -586,24 +586,79 @@ const homeOf = async ($: EngineInterface): Promise<string | undefined> => {
 
 const rootOf = async ($: EngineInterface): Promise<string | undefined> => jobsRootOf(await homeOf($))
 
-// 第一条消息之前 $.session.id() 可能迟迟不返回；按钮栏的绘制等它就会整条不出来，所以限时 300ms，拿到后缓存。
-let sessionIdCache: string | undefined
+// 第一条消息之前 $.session.id() 可能迟迟不返回；按钮栏的绘制等它就会整条不出来，所以限时 300ms。
+// 每次都重新问：模块级的 id 缓存会在桌面端多会话共用进程时一直返回上一个会话的 id（owner 全串）。
+// 宿主没有 setTimeout（hooks 模块只有 $.clock），限时用 $.clock.after 做。
+const SESSION_ID_WAIT_MS = 300
+// 宿主不许把 $（或 $.session）当值传、也不许读，所以做不到「按 $ 实例」的 WeakMap。
+// 折中：模块级只记「上一次成功拿到的 id」，且只在本次 300ms 超时时兜底；拿到新 id 立刻覆盖。
+// 代价：桌面端多会话共用一个进程时，超时窗口内可能返回另一个会话的 id（最多 300ms，且下一次调用就纠正）。
+const SESSION_FALLBACK_MS = 5_000
+let lastSessionId: { id: string; at: number } | undefined
 const sessionOf = async ($: EngineInterface): Promise<string | undefined> => {
-  if (sessionIdCache !== undefined) return sessionIdCache
-  try {
-    const id = await Promise.race([
-      $.session.id(),
-      new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 300)),
-    ])
-    if (id) sessionIdCache = id
-    return id || undefined
-  } catch {
-    return undefined
+  const id = await new Promise<string | undefined>(resolve => {
+    let settled = false
+    let timer: { cancel: () => void } | undefined
+    const settle = (value: string | undefined): void => {
+      if (settled) return
+      settled = true
+      try {
+        timer?.cancel()
+      } catch {}
+      resolve(value)
+    }
+    try {
+      timer = $.clock.after(SESSION_ID_WAIT_MS, () => settle(undefined))
+    } catch {
+      settle(undefined)
+    }
+    void Promise.resolve()
+      .then(() => $.session.id())
+      .then(
+        value => settle(typeof value === 'string' && value !== '' ? value : undefined),
+        () => settle(undefined),
+      )
+  })
+  if (id !== undefined) {
+    lastSessionId = { id, at: Date.now() }
+
+    return id
   }
+
+  // 超时兜底：只用刚刚拿到的值，太旧就当拿不到（宁可当作「无会话」，也不把别的会话的 id 当成自己的）。
+  const last = lastSessionId
+
+  return last !== undefined && Date.now() - last.at < SESSION_FALLBACK_MS ? last.id : undefined
 }
 
 /** 属于本会话的作业：旧记录没有 owner，只在「全部会话」里出现。 */
 const mine = (r: JobRecord, me: string | undefined): boolean => me !== undefined && r.owner === me
+
+// 面板的「看全部会话」开关按会话存。StateAddress 只有 plugin/key/id，liveAll 不是 StateFamily，
+// 类型上不许填 id，所以会话维度放在 store 的键里：liveAll:<sessionId>。
+// 共用 atom 只当重绘信号：别的会话在里面写的值不会被当成自己的。
+const liveAllKey = (sessionId: string): string => `liveAll:${sessionId}`
+const readLiveAll = async ($: EngineInterface): Promise<boolean> => {
+  await read($, liveAllAtom) // 只为订阅重绘，值不用
+  const me = await sessionOf($)
+  // 拿不到会话 id 就按「只看本会话」：不读共用槽，免得显示别的会话的选择。
+  if (me === undefined) return false
+  try {
+    return (await $.store.get(liveAllKey(me))) === true
+  } catch {
+    return false
+  }
+}
+const writeLiveAll = async ($: EngineInterface, isAll: boolean): Promise<void> => {
+  const me = await sessionOf($)
+  if (me !== undefined) {
+    try {
+      await $.store.set(liveAllKey(me), isAll)
+    } catch {}
+  }
+  // 只当重绘信号：每次都翻转，保证值一定变化（别的会话写过同样的值也会触发重绘）。
+  await update($, liveAllAtom, v => !v)
+}
 
 const jobDir = (root: string, id: string): string => `${root}/${id}`
 
@@ -1460,12 +1515,12 @@ export const register: Register = on => {
     await read($, liveTickAtom)
     const now = Date.now()
     const me = await sessionOf($)
-    const showAll = await read($, liveAllAtom)
+    const showAll = await readLiveAll($)
     const everyJob = await listJobs($)
     const jobs = (showAll ? everyJob : everyJob.filter(r => mine(r, me))).slice(0, 30)
     const nOther = everyJob.filter(r => !mine(r, me)).length
     const scopeToggle = (
-      <Button key="live-scope" plain dimColor onPress={() => update($, liveAllAtom, v => !v)}>
+      <Button key="live-scope" plain dimColor onPress={() => writeLiveAll($, !showAll)}>
         {showAll ? '全部会话 · 只看本会话' : `本会话${nOther > 0 ? ` · 看全部（另有 ${nOther}）` : ''}`}
       </Button>
     )
@@ -1788,14 +1843,18 @@ export const register: Register = on => {
     }
   })
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // 绘制里出任何错都会让整条栏消失（还可能连累链下面的 hook），所以整体兜住，出错就退回别的 mod 和引擎的画。
+    let drawn: Awaited<ReturnType<typeof next>> | undefined
+    try {
     if (e.props.hasSurvey) return next(e)
     const below = await next(e)
+    drawn = below
     const { Box, Button, Text } = $.ui.resolve(e)
     await read($, liveTickAtom)
     await read($, versionAtom)
     const me = await sessionOf($)
     const nRunning = (await listJobs($)).filter(r => r.status === 'running' && mine(r, me)).length
-    void refreshQuota($).catch(() => undefined)
+    // 额度只在已有的计时器（ensureLiveTimer 每 2 秒）里刷新：绘制路径里不许 update，绘制中 state.set 会被拒。
     const five = quota?.ok === true ? quota.windows.find(w => w.label === '5 小时') : undefined
     // Button 只收字符串和 Text：条件部分先拼好，不留 false。
     const parts = [
@@ -1831,6 +1890,12 @@ export const register: Register = on => {
         {below}
       </Box>
     )
+    } catch (error) {
+      $.ui.log(`delegate bar: ${messageOf(error)}`, { to: 'debug' })
+
+      // next 已经调用过就用它的结果；没调用过就让下面的 hook 和引擎照常画。
+      return drawn ?? (await next(e))
+    }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
