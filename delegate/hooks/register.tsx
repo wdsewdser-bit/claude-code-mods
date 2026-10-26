@@ -1758,7 +1758,9 @@ export const register: Register = on => {
               {stat('轮数', String(turnsOf(sel)))}
               {stat('用时', spanOf(elapsed(sel)))}
               {stat('上下文', tokensOf(usage.context))}
-              {stat('输出', tokensOf(usage.output))}
+              {/* 事件流里 assistant 行的 output_tokens 是 0，运行中只有 status.json 的 outputTokens 有数（runner 从
+                  stream_event 里数出来）；跑完之后 result 行给的是总数，两边取大的那个。 */}
+              {stat('输出', tokensOf(Math.max(usage.output, s?.outputTokens ?? 0)))}
             </Box>
             {usage.context === 0 && turnsOf(sel) > 0 && sel.tier !== 'gpt' && (
               <Box paddingX={2}>
