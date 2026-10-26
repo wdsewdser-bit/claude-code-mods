@@ -26,6 +26,7 @@ import {
   formatStatus,
   jobsRootOf,
   jobKey,
+  normalizeReadPaths,
   normalizeRecord,
   normalizeStatus,
   pidMatches,
@@ -359,6 +360,40 @@ describe('delegate tool', () => {
     expect(
       (jobs.store.get('jobs') as Record<string, { mode?: string; ptc?: string }>).legacy,
     ).toMatchObject({ mode: 'read', ptc: 'only' })
+  })
+
+  test('readPaths reach the runner only for read + ptc:only, and resume inherits them', { timeoutMs: 10_000 }, async ($: never, on: never) => {
+    const jobs = setup(on as never, 'k-1', { ok: true, text: 'done', sessionId: 'sid-rp', turns: 1, ms: 1 })
+    await start($ as never)
+    // 新任务：传了就进 job，也记进作业记录
+    await call($ as never, { task: 'a', cwd: '/proj', readPaths: ['/ext/one', '/ext/two/'] })
+    expect(jobs[0]).toMatchObject({ mode: 'read', ptc: 'only', readPaths: ['/ext/one', '/ext/two'] })
+    const rec = jobOf(jobs.store, String(jobs[0]?.jobId))
+    expect(rec.readPaths).toEqual(['/ext/one', '/ext/two'])
+    // 旧表镜像里也带着，外部脚本能读到
+    expect((jobs.store.get('jobs') as Record<string, { readPaths?: string[] }>)['sid-rp']?.readPaths).toEqual(['/ext/one', '/ext/two'])
+    // resume 没传：沿用上次的
+    await call($ as never, { task: 'b', resume: 'sid-rp' })
+    expect(jobs[1]).toMatchObject({ resume: 'sid-rp', readPaths: ['/ext/one', '/ext/two'] })
+    // resume 传了：以传入为准（空数组 = 明确不要）
+    await call($ as never, { task: 'c', resume: 'sid-rp', readPaths: ['/ext/three'] })
+    expect(jobs[2]).toMatchObject({ readPaths: ['/ext/three'] })
+    await call($ as never, { task: 'd', resume: 'sid-rp', readPaths: [] })
+    expect(jobs[3]).not.toHaveProperty('readPaths')
+    // work 模式、ptc:'off' 都不带（只读沙箱之外没有意义）
+    await call($ as never, { task: 'e', mode: 'work', readPaths: ['/ext/one'] })
+    expect(jobs[4]).not.toHaveProperty('readPaths')
+    await call($ as never, { task: 'f', ptc: 'off', readPaths: ['/ext/one'] })
+    expect(jobs[5]).not.toHaveProperty('readPaths')
+  })
+
+  test('readPaths survive garbage: only absolute-looking strings are kept, duplicates dropped', { timeoutMs: 10_000 }, async ($: never, on: never) => {
+    const jobs = setup(on as never, 'k-1', { ok: true, text: 'done', sessionId: 'sid-rp2', turns: 1, ms: 1 })
+    await start($ as never)
+    await call($ as never, { task: 'a', readPaths: [' C:/Ext/One/ ', 'c:/ext/one', '', 'C:/ext/two', 42] })
+    expect(jobs[0]).toMatchObject({ readPaths: ['C:/Ext/One', 'C:/ext/two'] })
+    await call($ as never, { task: 'b', readPaths: 'not-an-array' })
+    expect(jobs[1]).not.toHaveProperty('readPaths')
   })
 
   test('a bad cwd fails before the runner starts, foreground and background', { timeoutMs: 10_000 }, async ($: never, on: never) => {
@@ -863,6 +898,20 @@ describe('job records', () => {
     expect(jobsRootOf('C:\\Users\\t')).toBe('C:/Users/t/.claude/delegate/jobs')
     expect(jobsRootOf('C:/Users/t/')).toBe('C:/Users/t/.claude/delegate/jobs')
     expect(jobsRootOf(undefined)).toBeUndefined()
+  })
+
+  test('readPaths are cleaned, de-duplicated and kept on the record', () => {
+    expect(normalizeReadPaths([' C:/a/ ', 'c:/A', '', 'D:\\b\\', 7, null])).toEqual(['C:/a', 'D:\\b'])
+    expect(normalizeReadPaths('C:/a')).toEqual([])
+    expect(normalizeReadPaths(undefined)).toEqual([])
+    expect(normalizeReadPaths(['C:/'])).toEqual(['C:'])
+    const rec = normalizeRecord({ tier: 'pro', at: 5, readPaths: ['C:/ext/'] }, 'fg-2')
+    expect(rec?.readPaths).toEqual(['C:/ext'])
+    expect(normalizeRecord({ tier: 'pro', at: 5, readPaths: [] }, 'fg-3')).not.toHaveProperty('readPaths')
+    expect(normalizeRecord({ tier: 'pro', at: 5 }, 'fg-4')).not.toHaveProperty('readPaths')
+    // 进度里能看见额外目录
+    const shown = formatStatus(rec, undefined, [], undefined, 5)
+    expect(shown).toContain('额外可读目录：C:/ext')
   })
 
   test('a record survives garbage and fills what is missing', () => {

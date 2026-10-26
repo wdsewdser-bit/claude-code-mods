@@ -29,6 +29,7 @@ import {
   jobsRootOf,
   MAX_JOBS,
   newJobId,
+  normalizeReadPaths,
   normalizeRecord,
   normalizeStatus,
   pidMatches,
@@ -129,7 +130,12 @@ const describeOne = async ($: EngineInterface, config: Config, tier: Tier): Prom
           ptc: {
             type: 'string',
             enum: ['only', 'off'],
-            description: "仅 read 模式：默认 'only'，子代理只用一个只读的 run_code，在程序里批量 read/glob/grep 再汇总（只能读 cwd，不能写文件、跑命令，另带 WebFetch 读网页）；'off' 改用原生 Read/Grep/Glob/WebFetch（要读 cwd 以外的文件时用）",
+            description: "仅 read 模式：默认 'only'，子代理只用一个只读的 run_code，在程序里批量 read/glob/grep 再汇总（默认只能读 cwd，不能写文件、跑命令，另带 WebFetch 读网页）；要读 cwd 以外的目录时优先把它们列进 readPaths，不必因此改用 'off'；'off' 改用原生 Read/Grep/Glob/WebFetch（readPaths 不适用，兜底用）",
+          },
+          readPaths: {
+            type: 'array',
+            items: { type: 'string' },
+            description: "可选：额外可读的绝对目录（cwd 以外的），仅 read 模式且 ptc 为 only 时生效；列在这里就能在只读 run_code 里 read/grep/glob，不必改用 ptc:'off'。只放宽读，写权限不变；不存在的目录自动忽略。resume 不传则沿用该 agent 上次的。",
           },
           cwd: { type: 'string', description: '工作目录；不填用当前会话的' },
           maxTurns: { type: 'number', description: '最多轮数，默认不限（1000）' },
@@ -144,7 +150,7 @@ const describeOne = async ($: EngineInterface, config: Config, tier: Tier): Prom
           },
           resume: {
             type: 'string',
-            description: '上次返回的 agent ID：接着那个代理的上下文继续，不新建（沿用它的档位、mode、ptc 和目录；显式传 mode/ptc 则覆盖）',
+            description: '上次返回的 agent ID：接着那个代理的上下文继续，不新建（沿用它的档位、mode、ptc、readPaths 和目录；显式传 mode/ptc/readPaths 则覆盖）',
           },
         },
         required: ['task'],
@@ -178,7 +184,12 @@ const describeGpt = async ($: EngineInterface): Promise<void> => {
           ptc: {
             type: 'string',
             enum: ['only', 'off'],
-            description: "仅 read 模式：默认 'only'，子代理只用一个只读的 run_code，在程序里批量 read/glob/grep 再汇总（只能读 cwd，不能写文件、跑命令，另带 WebFetch 读网页）；'off' 改用原生 Read/Grep/Glob/WebFetch（要读 cwd 以外的文件时用）",
+            description: "仅 read 模式：默认 'only'，子代理只用一个只读的 run_code，在程序里批量 read/glob/grep 再汇总（默认只能读 cwd，不能写文件、跑命令，另带 WebFetch 读网页）；要读 cwd 以外的目录时优先把它们列进 readPaths，不必因此改用 'off'；'off' 改用原生 Read/Grep/Glob/WebFetch（readPaths 不适用，兜底用）",
+          },
+          readPaths: {
+            type: 'array',
+            items: { type: 'string' },
+            description: "可选：额外可读的绝对目录（cwd 以外的），仅 read 模式且 ptc 为 only 时生效；列在这里就能在只读 run_code 里 read/grep/glob，不必改用 ptc:'off'。只放宽读，写权限不变；不存在的目录自动忽略。resume 不传则沿用该 agent 上次的。",
           },
           cwd: { type: 'string', description: '工作目录；不填用当前会话的' },
           maxTurns: { type: 'number', description: '最多轮数，默认不限（1000）' },
@@ -193,7 +204,7 @@ const describeGpt = async ($: EngineInterface): Promise<void> => {
           },
           resume: {
             type: 'string',
-            description: '上次返回的 agent ID：接着那个代理的上下文继续，不新建（沿用它的 mode、ptc 和目录；显式传 mode/ptc 则覆盖）',
+            description: '上次返回的 agent ID：接着那个代理的上下文继续，不新建（沿用它的 mode、ptc、readPaths 和目录；显式传 mode/ptc/readPaths 则覆盖）',
           },
         },
         required: ['task'],
@@ -470,6 +481,7 @@ const mirrorLegacy = async ($: EngineInterface, rec: JobRecord): Promise<void> =
       cwd: rec.cwd,
       mode: rec.mode,
       ptc: rec.ptc,
+      ...(rec.readPaths === undefined ? {} : { readPaths: rec.readPaths }),
       at: rec.at,
       status: rec.status,
       model: rec.model,
@@ -794,6 +806,10 @@ const callTool = async (
     input.mode === 'read' || input.mode === 'work' ? input.mode : (old?.mode ?? 'read')
   const ptc: Ptc =
     input.ptc === 'only' || input.ptc === 'off' ? input.ptc : (old?.ptc ?? 'only')
+  // 额外可读目录：没传就沿用该 agent 上次的；传了（哪怕是空数组）就以传入为准。只在 read + ptc:'only' 时有意义。
+  const givenReadPaths = Array.isArray(input.readPaths) ? normalizeReadPaths(input.readPaths) : undefined
+  const readPaths = givenReadPaths ?? old?.readPaths ?? []
+  const readPathsActive = mode === 'read' && ptc === 'only' && readPaths.length > 0
   const background = input.background === true
   const label =
     target === 'gpt'
@@ -817,6 +833,7 @@ const callTool = async (
     task,
     mode,
     ...(mode === 'read' ? { ptc: ptc === 'off' ? false : 'only' } : {}),
+    ...(readPathsActive ? { readPaths } : {}),
     cwd: cwd ?? (recordedCwd === '' ? undefined : recordedCwd),
     maxTurns: typeof input.maxTurns === 'number' ? input.maxTurns : undefined,
     resume: resume === '' ? undefined : resume,
@@ -841,6 +858,7 @@ const callTool = async (
     cwd: recordedCwd,
     mode,
     ptc,
+    ...(readPaths.length === 0 ? {} : { readPaths }),
     background,
     status: 'running',
     at,
@@ -1645,10 +1663,13 @@ export const register: Register = on => {
     const tagOf = (r: JobRecord) => {
       const t = AGENT_TAG[r.tier]
 
+      // 不让标题把标签挤成两行；标签固定宽度、居右。
       return (
-        <Text color={t.color} backgroundColor={t.bg} size="footnote">
-          {` ${t.text} `}
-        </Text>
+        <Box flexShrink={0}>
+          <Text color={t.color} backgroundColor={t.bg} size="footnote" weight="semibold" wrap="truncate">
+            {` ${t.text} `}
+          </Text>
+        </Box>
       )
     }
 

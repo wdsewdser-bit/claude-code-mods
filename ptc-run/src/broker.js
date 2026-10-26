@@ -1,18 +1,33 @@
 "use strict";
 // ptc-run read-only broker. Started by the hook instead of the runner when PTC_RUN_READONLY=1.
-// It launches the runner under the Node permission model (reads only in the session cwd, the scope dir and its own
-// response dir; writes only in the session scope dir;
-// no child processes / workers / addons) and runs ripgrep on its behalf. The restricted runner asks for an rg run by
-// writing <reqDir>/<id>.req; the broker validates the argv against a strict whitelist, runs the bundled rg and writes
-// <resDir>/<id>.out + <id>.res. reqDir lives in the writable scope dir (user code can forge requests there, so the
-// whitelist is the hard boundary); resDir is outside it, so the restricted process can only read the answers.
-// Input (line 1 of stdin, via the bootstrap): {cwd, code, rg, scope, dsh, maxChars, timeoutMs, root, roRoots, logName, boot, runner}.
+// It launches the runner under the Node permission model (reads only in the session cwd, the extra read roots named by
+// the hook (input.readRoots, from PTC_RUN_READ_ROOTS), the scope dir and its own response dir; writes only in the
+// session scope dir; no child processes / workers / addons) and runs ripgrep on its behalf. The restricted runner asks
+// for an rg run by writing <reqDir>/<id>.req; the broker validates the argv against a strict whitelist, runs the
+// bundled rg and writes <resDir>/<id>.out + <id>.res. reqDir lives in the writable scope dir (user code can forge
+// requests there, so the whitelist is the hard boundary); resDir is outside it, so the restricted process can only
+// read the answers.
+// Input (line 1 of stdin, via the bootstrap): {cwd, code, rg, scope, dsh, maxChars, timeoutMs, root, roRoots, readRoots, logName, boot, runner}.
 const fs = require("fs"), path = require("path"), os = require("os"), cp = require("child_process"), crypto = require("crypto");
 const input = JSON.parse(typeof globalThis.__PTC_IN === "string" ? globalThis.__PTC_IN : fs.readFileSync(0, "utf8"));
 const runnerSrc = input.runner, boot = input.boot;
 delete input.runner; delete input.boot;
 let cwd = input.cwd || process.cwd();
 const NL = "\n";
+// Extra directories the hook may name for reading (delegate's readPaths, via PTC_RUN_READ_ROOTS). They only ever widen
+// reads, never writes, and they come from the environment, never from the program. A path that is missing, is not an
+// absolute path or is not a directory is ignored: a stale entry must not fail the whole run.
+const realOf = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const splitRoots = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : typeof v === "string" ? v.split(/[;:](?![\\/])/) : []);
+const extraReadRoots = [];
+for (const raw of splitRoots(input.readRoots)) {
+  const s = String(raw).trim();
+  if (s === "" || !path.isAbsolute(s)) continue;
+  const abs = path.resolve(s);
+  let st; try { st = fs.statSync(abs); } catch { continue; }
+  if (!st.isDirectory()) continue;
+  if (!extraReadRoots.includes(abs)) extraReadRoots.push(abs);
+}
 const started = Date.now();
 const timeoutMs = Number.isFinite(input.timeoutMs) ? Math.min(Math.max(input.timeoutMs, 1000), 1800000) : 300000;
 const deadline = started + Math.max(500, timeoutMs - 1500); // a little earlier than the hook's own timeout
@@ -32,9 +47,10 @@ if (input.root !== undefined) {
   const within = (p, base) => { const r = path.relative(base.toLowerCase(), p.toLowerCase()); return r === "" || (!r.startsWith("..") && !path.isAbsolute(r)); };
   const real = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
   const want = path.resolve(input.root);
-  // Besides the session cwd, the hook may name extra trusted roots (PTC_RUN_RO_ROOTS); never from user code.
-  const bases = [cwd, ...(Array.isArray(input.roRoots) ? input.roRoots.filter((b) => typeof b === "string" && path.isAbsolute(b)) : [])];
-  if (!bases.some((b) => within(want, path.resolve(b)) && within(real(want), real(b)))) { fail("[POLICY_DENIED] read-only root must be inside the session cwd: " + input.root); return; }
+  // Besides the session cwd, the hook may name extra trusted roots (PTC_RUN_RO_ROOTS) and extra read roots
+  // (PTC_RUN_READ_ROOTS); never from user code.
+  const bases = [cwd, ...(Array.isArray(input.roRoots) ? input.roRoots.filter((b) => typeof b === "string" && path.isAbsolute(b)) : []), ...extraReadRoots];
+  if (!bases.some((b) => within(want, path.resolve(b)) && within(real(want), real(b)))) { fail("[POLICY_DENIED] read-only root must be inside the session cwd or one of the extra read directories: " + input.root); return; }
   cwd = want;
 }
 // rg comes from the broker's own input, never from a request
@@ -87,10 +103,13 @@ const WINP = process.platform === "win32";
 const key = (p) => { const r = path.resolve(p); return WINP ? r.toLowerCase() : r; };
 const insideOf = (p, root) => { const a = key(p), r = key(root); return a === r || a.startsWith(r.endsWith(path.sep) ? r : r + path.sep); };
 let cwdReal = cwd; try { cwdReal = fs.realpathSync.native(cwd); } catch {}
+// Every directory rg may search: the session cwd (as given and resolved) plus the extra read roots from the hook.
+const searchRoots = [];
+for (const p of [cwd, cwdReal, ...extraReadRoots.flatMap((r) => [r, realOf(r)])]) if (!searchRoots.includes(p)) searchRoots.push(p);
 const inCwd = (p) => {
-  if (!insideOf(p, cwd) && !insideOf(p, cwdReal)) return false;
+  if (!searchRoots.some((r) => insideOf(p, r))) return false;
   let real = null; try { real = fs.realpathSync.native(p); } catch { return true; } // missing path: rg finds nothing
-  return insideOf(real, cwdReal) || insideOf(real, cwd);
+  return searchRoots.some((r) => insideOf(real, r));
 };
 const validate = (argv) => {
   if (!Array.isArray(argv) || argv.length === 0 || argv.length > 4096) return "argv must be a non-empty array (<= 4096 items)";
@@ -109,7 +128,7 @@ const validate = (argv) => {
     }
     if (a.startsWith("-")) return "option not allowed: " + a;
     if (!isAbsPath(a)) return "positional argument must be an absolute path: " + a;
-    if (!inCwd(a)) return "search path is outside the session cwd (read-only mode reads only the working directory): " + a;
+    if (!inCwd(a)) return "search path is outside the session cwd and the extra read directories (read-only mode reads only the working directory plus PTC_RUN_READ_ROOTS): " + a;
     positional++;
   }
   if (!positional) return "a search path is required";
@@ -164,10 +183,13 @@ const scan = () => {
 // ---------- restricted runner ----------
 const childInput = Object.assign({}, input, { readonly: true, reqDir, resDir, stateDir, brokerPid: process.pid });
 // Reads: the session cwd (as given, its real path and both drive-letter cases, since the permission model compares
-// paths case-sensitively), the scope dir (refs) and this broker's response dir. Writes: the scope dir only.
+// paths case-sensitively), every extra read root from the hook (same treatment), the scope dir (refs) and this
+// broker's response dir. Writes: the scope dir only.
 const readRoots = [];
 const addRead = (p) => { if (p && !readRoots.includes(p)) readRoots.push(p); };
-for (const p of [cwd, cwdReal]) { addRead(p); if (WINP && /^[A-Za-z]:/.test(p)) { addRead(p[0].toUpperCase() + p.slice(1)); addRead(p[0].toLowerCase() + p.slice(1)); } }
+const addReadTree = (p) => { addRead(p); if (WINP && /^[A-Za-z]:/.test(p)) { addRead(p[0].toUpperCase() + p.slice(1)); addRead(p[0].toLowerCase() + p.slice(1)); } };
+for (const p of [cwd, cwdReal]) addReadTree(p);
+for (const r of extraReadRoots) { addReadTree(r); addReadTree(realOf(r)); }
 addRead(stateDir); addRead(resDir);
 const args = ["--permission", ...readRoots.map((p) => "--allow-fs-read=" + p), "--allow-fs-write=" + stateDir, "-e", boot];
 let child;

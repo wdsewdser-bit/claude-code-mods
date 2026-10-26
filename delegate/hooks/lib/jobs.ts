@@ -19,6 +19,8 @@ export type JobRecord = {
   cwd: string
   mode: Mode
   ptc: Ptc
+  /** read + ptc:'only' 时额外可读的绝对目录（cwd 以外）。resume 没传就沿用它。旧记录没有。 */
+  readPaths?: string[]
   background: boolean
   status: JobStatus
   /** 开始时间（毫秒）。淘汰按它排序，不是完成时间。 */
@@ -143,6 +145,27 @@ const num = (v: unknown): number | undefined =>
 
 const agentOf = (v: unknown): Agent => (v === 'pro' || v === 'gpt' ? v : 'flash')
 
+/** 额外可读目录：只留非空字符串，去掉末尾分隔符并去重（Windows 上不区分大小写）。空数组就是“没有”。 */
+export const normalizeReadPaths = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (trimmed === '') continue
+    // 盘符根（C:/、D:\）保留分隔符，其余去掉末尾的
+    const cleaned = /^[A-Za-z]:[\\/]?$/.test(trimmed) ? trimmed.slice(0, 2) : trimmed.replace(/[\\/]+$/, '')
+    if (cleaned === '') continue
+    const key = cleaned.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(cleaned)
+  }
+
+  return out
+}
+
 /** 读回来的记录（store 里可能是旧版本或垃圾）。 */
 export const normalizeRecord = (raw: unknown, jobId: string): JobRecord | undefined => {
   if (!isRecord(raw)) return undefined
@@ -156,6 +179,7 @@ export const normalizeRecord = (raw: unknown, jobId: string): JobRecord | undefi
     cwd: str(raw.cwd),
     mode: raw.mode === 'work' ? 'work' : 'read',
     ptc: raw.ptc === 'off' ? 'off' : 'only',
+    ...(normalizeReadPaths(raw.readPaths).length === 0 ? {} : { readPaths: normalizeReadPaths(raw.readPaths) }),
     background: raw.background === true,
     status: isStatus(raw.status) ? raw.status : 'done',
     at: at ?? 0,
@@ -341,6 +365,10 @@ export const formatStatus = (
   const agent = status?.sessionId ?? rec?.sessionId
   if (agent) lines.push(`agent：${agent}（resume 用这个）`)
   if (rec?.cwd) lines.push(`cwd：${rec.cwd}`)
+  // 只在真正生效时显示（read + ptc:'only'）：work 模式或 ptc:'off' 时这些目录不起作用，记下来只为 resume 沿用。
+  if (rec?.readPaths !== undefined && rec.readPaths.length > 0 && rec.mode === 'read' && rec.ptc === 'only') {
+    lines.push(`额外可读目录：${rec.readPaths.join('、')}`)
+  }
   if (started !== undefined) lines.push(`开始：${timeOf(started, now)}（${agoOf(started, now)}）`)
   if (rec?.endedAt !== undefined) lines.push(`结束：${timeOf(rec.endedAt, now)} · 用时 ${spanOf(rec.endedAt - rec.at)}`)
   if (status?.pid !== undefined) lines.push(`进程：runner pid ${status.pid}${status.childPid ? ` · claude pid ${status.childPid}` : ''}`)

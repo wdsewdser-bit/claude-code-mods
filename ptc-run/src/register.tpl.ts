@@ -39,21 +39,42 @@ const DESC = DESC_PARTS.join(' ')
 // Short description for delegate's ptc-only mode: there the SDK declarations are already in the system prompt.
 const DESC_SHORT = 'Run a JavaScript async-function body in a sandbox; the SDK bindings (tools.*) are declared in the system prompt. Only console.log output and the return value come back. timeoutMs defaults to 300000 (max 1800000); root:"D:/abs/dir" changes the base directory for relative paths, glob/grep and bash.'
 
+// Extra read-only directories come from the environment only (delegate's readPaths -> PTC_RUN_READ_ROOTS, separated
+// the way PATH is: ';' on Windows, ':' elsewhere). They widen reads, never writes. Both separators are accepted, and a
+// drive colon ("C:\dir" / "C:/dir") is not a separator, so the same string works on either platform.
+const splitReadRoots = (raw: string): string[] => {
+  const parts: string[] = []
+  let cur = ''
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    const driveColon = ch === ':' && /^[A-Za-z]$/.test(raw[i - 1] ?? '') && /[\\/]/.test(raw[i + 1] ?? '')
+    if (ch === ';' || (ch === ':' && !driveColon)) { parts.push(cur); cur = ''; continue }
+    cur += ch
+  }
+  parts.push(cur)
+  return parts.map(s => s.trim()).filter(Boolean)
+}
+const rootsLine = (roots: string[]): string =>
+  roots.length === 0 ? '' : ' Extra readable directories besides the working directory: ' + roots.join(', ') + '.'
+
 // Read-only mode descriptions: only the read-side bindings are advertised.
-const DESC_RO = [
-  'Run a JavaScript async-function body in a READ-ONLY sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch reading, grep+aggregate and summaries. timeoutMs defaults to 300000 (max 1800000); root:"D:/abs/dir" changes the base directory for relative paths and glob/grep.',
-  'Read-only mode: tools.write/edit/replace/batch/bash/parallel/job throw POLICY_DENIED, the program itself cannot write files or start processes (fs writes and child_process are blocked), and only files under the working directory can be read or searched.',
-  DESC_PARTS[1], DESC_PARTS[2].split('. tools.write')[0] + '.', DESC_PARTS[3], DESC_PARTS[7],
-].join(' ')
-const DESC_SHORT_RO = 'Run a JavaScript async-function body in a read-only sandbox (no file writes, no commands, reads only under the working directory); the SDK bindings (tools.*) are declared in the system prompt. Only console.log output and the return value come back.'
+const descRo = (roots: string[]): string =>
+  [
+    'Run a JavaScript async-function body in a READ-ONLY sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch reading, grep+aggregate and summaries. timeoutMs defaults to 300000 (max 1800000); root:"D:/abs/dir" changes the base directory for relative paths and glob/grep.',
+    'Read-only mode: tools.write/edit/replace/batch/bash/parallel/job throw POLICY_DENIED, the program itself cannot write files or start processes (fs writes and child_process are blocked), and only files under the working directory and the extra readable directories (if any) can be read or searched; anything else fails with an access error.' + rootsLine(roots),
+    DESC_PARTS[1], DESC_PARTS[2].split('. tools.write')[0] + '.', DESC_PARTS[3], DESC_PARTS[7],
+  ].join(' ')
+const descShortRo = (roots: string[]): string =>
+  'Run a JavaScript async-function body in a read-only sandbox (no file writes, no commands, reads only under the working directory and the extra readable directories, if any); the SDK bindings (tools.*) are declared in the system prompt. Only console.log output and the return value come back.' + rootsLine(roots)
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const sdkInPrompt = (await $.env.get('PTC_RUN_SDK_IN_PROMPT')) === '1'
     const ro = (await $.env.get('PTC_RUN_READONLY')) === '1'
+    const roRoots = ro ? splitReadRoots((await $.env.get('PTC_RUN_READ_ROOTS')) || '') : []
     await $.tool.register({
       name: 'run_code',
-      description: ro ? (sdkInPrompt ? DESC_SHORT_RO : DESC_RO) : sdkInPrompt ? DESC_SHORT : DESC,
+      description: ro ? (sdkInPrompt ? descShortRo(roRoots) : descRo(roRoots)) : sdkInPrompt ? DESC_SHORT : DESC,
       isDeferred: false,
       inputSchema: {
         type: 'object',
@@ -94,6 +115,9 @@ export const register: Register = on => {
     }
     // Extra directories a read-only root may point into (besides the session cwd), from the environment only.
     const roRoots = ro ? ((await $.env.get('PTC_RUN_RO_ROOTS')) || '').split(';').map(s => s.trim()).filter(Boolean) : []
+    // Extra directories the read-only sandbox may read and search (delegate's readPaths), from the environment only.
+    // The broker drops the ones that are missing or not absolute, so a stale entry never fails the run.
+    const readRoots = ro ? splitReadRoots((await $.env.get('PTC_RUN_READ_ROOTS')) || '') : []
     let scope = 'default'
     try {
       const sid = await $.session.id()
@@ -125,7 +149,7 @@ export const register: Register = on => {
         (ro ? '\n（只读模式：不会修改项目文件）' : '') + '\n' + ops + '\n' + (parsed.out || '（无输出）')
     }
     try {
-      const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, logName, dshReadLimit, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
+      const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
       const r = await $.process.run(['node', '-e', BOOT], {
         cwd,
         stdin: ro
