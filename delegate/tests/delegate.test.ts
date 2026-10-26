@@ -1041,6 +1041,69 @@ describe('CPA settings and transactional migration', () => {
   })
 })
 
+
+// ---- 多会话共用进程：作业归属和面板开关不能串 --------------------------------
+
+describe('session scoping', () => {
+  // 同一个进程服务多个会话：$.session.id() 会换成另一个会话的 id。
+  const twoSessions = (on: never, reply: Record<string, unknown>) => {
+    const t = jobSetup(on, reply)
+    let sessionId = 'sess-A'
+    const o = on as (name: string, fn: (_$: unknown, e: never) => unknown) => void
+    o('session.id', () => ({ value: sessionId }))
+    o('clock.after', () => ({ value: { cancel: () => undefined } }))
+    o('clock.every', () => ({ value: { cancel: () => undefined } }))
+    const mountLive = () =>
+      ($: never) =>
+        ($ as { ui: { mount: (i: never) => Promise<{ findAll: (q: never) => Promise<unknown[]>; press: (i: never) => Promise<unknown>; unmount: () => Promise<void> }> } }).ui.mount({
+          plugin: 'delegate',
+          surface: 'terminal',
+          component: 'Pane',
+          requestId: 'delegate-live',
+          props: { title: '委派任务', isFocused: false },
+        } as never)
+    return { ...t, mountLive, switchTo: (id: string) => { sessionId = id } }
+  }
+
+  test('a job belongs to the session that started it, whichever session asks next', { timeoutMs: 30_000 }, async ($, on) => {
+    const t = twoSessions(on as never, { ok: true, text: 'x', sessionId: 'sid-a', turns: 1, ms: 5 })
+    await startSession($ as never)
+    await jobCall($ as never, 'mcp__delegate__delegate_flash', { task: 'only for A' })
+    const id = String(t.runs[0]?.jobId)
+    expect(jobOf(t.store, id).owner).toBe('sess-A')
+    // 另一个会话（同一进程）打开实时面板：A 的作业不算自己的
+    t.switchTo('sess-B')
+    const uiB = await t.mountLive()($ as never)
+    expect((await uiB.findAll({ type: 'Text', text: /本会话还没有委派任务/ })).length).toBeGreaterThan(0)
+    expect(await uiB.findAll({ type: 'Text', text: /only for A/ })).toHaveLength(0)
+    await uiB.unmount()
+    // 回到 A：作业又看得见了
+    t.switchTo('sess-A')
+    const uiA = await t.mountLive()($ as never)
+    expect((await uiA.findAll({ type: 'Text', text: /only for A/ })).length).toBeGreaterThan(0)
+    await uiA.unmount()
+  })
+
+  test('the 看全部 toggle is kept per session and defaults to this session only', { timeoutMs: 30_000 }, async ($, on) => {
+    const t = twoSessions(on as never, { ok: true, text: 'x', sessionId: 'sid-b', turns: 1, ms: 5 })
+    await startSession($ as never)
+    const uiA = await t.mountLive()($ as never)
+    // 新会话默认只看本会话
+    expect(await uiA.findAll({ type: 'Button', text: /本会话/ })).toHaveLength(1)
+    expect(await uiA.findAll({ type: 'Button', text: /全部会话/ })).toHaveLength(0)
+    await uiA.press({ key: 'live-scope' })
+    expect(t.store.get('liveAll:sess-A')).toBe(true)
+    expect(await uiA.findAll({ type: 'Button', text: /全部会话/ })).toHaveLength(1)
+    await uiA.unmount()
+    // B 会话里打开面板：A 的选择不能漏过来
+    t.switchTo('sess-B')
+    const uiB = await t.mountLive()($ as never)
+    expect(await uiB.findAll({ type: 'Button', text: /全部会话/ })).toHaveLength(0)
+    expect(t.store.get('liveAll:sess-B')).toBeUndefined()
+    await uiB.unmount()
+  })
+})
+
 // ---- runner 结果：任务终态与实际模型 -----------------------------------------
 
 describe('runner result', () => {

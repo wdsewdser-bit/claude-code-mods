@@ -1351,6 +1351,27 @@ const barText = (s: Session, now: number): string => {
   return `缓存保活：开${anchor} · ${describeKeeper(s.keeper, coarse)}${bridge}`
 }
 
+// barAtom 还是空的时候（新会话、或槽被另一个会话的 $ 写过），由 $.clock.after(0, …) 在绘制之外补写一次。
+// 绘制里不能写 state（绘制中 state.set 会被拒），所以不能在 AbovePrompt 里直接写。
+let barSoonPending = false
+const refreshBarFor = async ($: EngineInterface): Promise<void> => {
+  await refreshBar($, await ensure($))
+}
+const scheduleRefreshBar = ($: EngineInterface): void => {
+  if (barSoonPending) return
+  barSoonPending = true
+  try {
+    // 回调闭包捕获这个 $：计时器跟着这个会话走，不会把栏文字写进别的会话的槽。
+    $.clock.after(0, () => {
+      barSoonPending = false
+      void refreshBarFor($).catch(error => debug($, error))
+    })
+  } catch (error) {
+    barSoonPending = false
+    debug($, error)
+  }
+}
+
 const refreshBar = async ($: EngineInterface, s: Session): Promise<void> => {
   const text = barText(s, await $.clock.now())
   if ((await read($, barAtom)) !== text) await update($, barAtom, () => text)
@@ -1784,9 +1805,17 @@ export const register: Register = (on, options) => {
   isTicking = false
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // 绘制里抛错 = 整条栏消失（还会连累链下面的 hook），所以整体兜住，出错就退回别的 mod 和引擎的画。
+    try {
     if (e.props.hasSurvey) return next(e)
     const text = await read($, barAtom)
-    if (text === '') return next(e)
+    if (text === '') {
+      // 槽还没写过（新会话、或写它的是另一个会话的 $）：别在绘制里写 state（绘制中 state.set 会被拒），
+      // 让一个非绘制时机的定时器去补一次。
+      scheduleRefreshBar($)
+
+      return next(e)
+    }
     // Other mods' rows above the prompt stay: our bar goes on top of them.
     const below = await next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
@@ -1814,6 +1843,11 @@ export const register: Register = (on, options) => {
         {below}
       </Box>
     )
+    } catch (error) {
+      debug($, error)
+
+      return next(e)
+    }
   })
 
   on('session.start', async ($, e, next) => {
@@ -1823,6 +1857,7 @@ export const register: Register = (on, options) => {
         description: 'Prompt-cache keeper: start, stop, status, anchor, probe, agents, experiment, report',
         argumentHint: 'start|stop|status|anchor [on|off]|probe|agents [ping]|experiment <name>|report',
       })
+      // 计时器必须用当前会话的 $：模块级单例若闭包住上一个会话的 $，写进去的栏文字会落到旧会话的槽里。
       const s = await ensure($)
       timer?.cancel()
       timer = $.clock.every(TICK_MS, () => void tick($))
@@ -1882,6 +1917,8 @@ export const register: Register = (on, options) => {
           await save($, s)
         }
       }
+      // 发消息也是状态变化：新会话的第一条消息之后栏文字必须已经在槽里。
+      await refreshBarFor($)
     } catch (error) {
       debug($, error)
     }
@@ -1924,6 +1961,7 @@ export const register: Register = (on, options) => {
           s.pending = null
         }
       }
+      await refreshBarFor($)
     } catch (error) {
       debug($, error)
     }
@@ -2076,6 +2114,7 @@ export const register: Register = (on, options) => {
       }
       await rotateChunkIfNeeded($, s)
       await save($, s)
+      await refreshBarFor($)
     } catch (error) {
       debug($, error)
     }

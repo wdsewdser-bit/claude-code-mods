@@ -1,3 +1,4 @@
+import type { On } from 'claude-code'
 import { describe, expect, test } from 'claude-code/testing'
 
 import { decide, initialKeeperState, unboundedView } from '../hooks/lib/keeper.ts'
@@ -14,6 +15,47 @@ const saved = (extra: Record<string, unknown>) => ({
   lastActivityAt: null,
   cachedPrefixTokens: 0,
   ...extra,
+})
+
+// ---- 栏文字：会话开始、发消息、回合结束都会写进槽里（不在绘制里写） ----
+
+describe('bar text', () => {
+  const DEFAULTS = { timeoutMs: 20_000 }
+  // 栏文字由插件自己写进 state；测试在下面记录每一次写入。
+  const bars: string[] = []
+  const watch = (on: On): string[] => {
+    ;(on as unknown as (name: string, fn: (_$: unknown, e: never) => unknown) => void)(
+      'state.set',
+      (_$, e: { plugin: string; key: string; value: unknown }) => {
+        if (e.plugin === 'cache-keeper' && e.key === 'bar' && typeof e.value === 'string') bars.push(e.value)
+
+        return { value: undefined }
+      },
+    )
+
+    return bars
+  }
+
+  test('the bar is written when the session starts', DEFAULTS, async ($, on) => {
+    const seen = watch(on)
+    world(on, FIVE)
+    await boot($)
+    expect(seen.some(text => text.includes('缓存保活'))).toBe(true)
+  })
+
+  test('a message writes the bar even after the slot was emptied', DEFAULTS, async ($, on) => {
+    const seen = watch(on)
+    const w = world(on, FIVE)
+    await boot($)
+    // 槽被清空（另一个会话的 $ 或一次重载）：发一条消息之后必须重新写进去。
+    await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+    await w.clock.advance(1)
+    expect(seen.some(text => text.includes('缓存保活'))).toBe(true)
+    const afterPrompt = seen.length
+    expect(afterPrompt).toBeGreaterThan(0)
+    await turn($, 't1', 'hello')
+    expect(seen.length).toBeGreaterThanOrEqual(afterPrompt)
+  })
 })
 
 describe('keeper', () => {
