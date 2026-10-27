@@ -371,6 +371,8 @@ const main = async () => {
         ENABLE_TOOL_SEARCH: 'false',
         CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: '1',
       })
+      // Claude Code caps output at 32000 by default; DS max-effort thinking alone can use all of it.
+      env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = gpt ? '128000' : '358000'
     }
     // read + ptc: 'only' (the default; ptc: false gives the built-in Read/Grep/Glob/WebFetch): run_code is the only
     // tool, like work's ptc-only, but ptc-run runs it read-only (Node permission model: no writes, no child processes).
