@@ -184,6 +184,7 @@ describe('gpt', () => {
     expect(gptModelOf(' gpt-6-astra ')).toBe('gpt-6-astra')
     expect(GPT_DEFAULT_MODEL).toBe('gpt-6.1-sol')
     expect(GPT_MODELS).toContain('gpt-6-astra')
+    expect(GPT_MODELS).toContain('gpt-6.1-terra')
     const bad = gptModelOf('gpt-9')
     expect(typeof bad === 'object' && 'error' in bad && bad.error.includes('未知的 GPT 模型')).toBe(true)
   })

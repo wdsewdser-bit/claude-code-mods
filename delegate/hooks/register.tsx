@@ -174,7 +174,7 @@ const describeGpt = async ($: EngineInterface): Promise<void> => {
           model: {
             type: 'string',
             enum: [...GPT_MODELS],
-            description: "默认 gpt-6.1-sol，日常都用它；只有真正高难的问题才传 'gpt-6-astra'（更慢，别当默认）",
+            description: "默认 gpt-6.1-sol，日常都用它；只有真正高难的问题才传 'gpt-6-astra'（更慢，别当默认）；gpt-6.1-terra 只在 DS 不可用时当下位替代，effort 最少 xhigh，要和 DS 相当得用 max",
           },
           mode: {
             type: 'string',
