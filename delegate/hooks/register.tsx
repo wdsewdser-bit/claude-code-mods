@@ -174,7 +174,7 @@ const describeGpt = async ($: EngineInterface): Promise<void> => {
           model: {
             type: 'string',
             enum: [...GPT_MODELS],
-            description: "默认 gpt-6.1-sol，日常都用它；只有真正高难的问题才传 'gpt-6-astra'（更慢，别当默认）；gpt-6.1-terra 只在 DS 不可用时当下位替代，effort 最少 xhigh，要和 DS 相当得用 max",
+            description: "默认 gpt-6.1-sol，日常都用它；只有真正高难的问题才传 'gpt-6-astra'（更慢，别当默认）；gpt-6.1-terra 只在 DS 不可用时当下位替代，固定按 max 跑（传别的 effort 也按 max）",
           },
           mode: {
             type: 'string',
@@ -817,7 +817,9 @@ const callTool = async (
       : callLabel(config, target, { background, work: mode === 'work' })
   const effort =
     target === 'gpt'
-      ? // GPT 最低 medium：不填或传 low 都按 medium 跑
+      ? gptModel === 'gpt-6.1-terra'
+        ? 'max' // terra 低于 max 几乎不思考（bug hunt：xhigh 11.3 分，max 40.7 分），一律按 max 跑
+        : // GPT 最低 medium：不填或传 low 都按 medium 跑
         input.effort === 'high' || input.effort === 'xhigh' || input.effort === 'max'
         ? input.effort
         : input.effort === undefined && (old?.effort === 'high' || old?.effort === 'xhigh' || old?.effort === 'max')
