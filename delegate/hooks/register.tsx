@@ -1663,11 +1663,11 @@ export const register: Register = on => {
     const tagOf = (r: JobRecord) => {
       const t = AGENT_TAG[r.tier]
 
-      // 不让标题把标签挤成两行；标签固定宽度、居右。
+      // 放在第二行右侧，不挡标题；圆角边框做成胶囊样式。
       return (
-        <Box flexShrink={0}>
-          <Text color={t.color} backgroundColor={t.bg} size="footnote" weight="semibold" wrap="truncate">
-            {` ${t.text} `}
+        <Box flexShrink={0} borderStyle="round" borderColor={t.color} backgroundColor={t.bg} paddingX={1}>
+          <Text color={t.color} size="footnote" weight="semibold" wrap="truncate">
+            {t.text}
           </Text>
         </Box>
       )
@@ -1701,18 +1701,18 @@ export const register: Register = on => {
               backgroundColor={picked ? ROW_PICKED : undefined}
               hover={picked ? undefined : { backgroundColor: ROW_HOVER }}
             >
-              <Box justifyContent="space-between" gap={1}>
-                <Button key={`live-pick-${r.jobId}`} plain onPress={pick}>
-                  <Text color={dot.color}>● </Text>
-                  <Text weight={picked ? 'semibold' : 'regular'} dimColor={legacy(r)}>
-                    {clip(titleOf(r), 28)}
-                  </Text>
+              <Button key={`live-pick-${r.jobId}`} plain onPress={pick}>
+                <Text color={dot.color}>● </Text>
+                <Text weight={picked ? 'semibold' : 'regular'} dimColor={legacy(r)}>
+                  {clip(titleOf(r), 28)}
+                </Text>
+              </Button>
+              <Box justifyContent="space-between" alignItems="center" gap={1}>
+                <Button key={`live-meta-${r.jobId}`} plain dimColor onPress={pick}>
+                  {`   ${metaOf(r)}`}
                 </Button>
                 {tagOf(r)}
               </Box>
-              <Button key={`live-meta-${r.jobId}`} plain dimColor onPress={pick}>
-                {`   ${metaOf(r)}`}
-              </Button>
             </Box>
           )
         })}
