@@ -54,13 +54,14 @@ async function replace(protocol, transform) {
 export async function execute(command, input={}, arg='') {
  if(input.key) secrets.push(input.key)
  if(command==='providers') return {ok:true,providers:(await groups()).map(view)}
+ // chat 协议的新模型默认 is-compat：不开时 CPA 会丢掉客户端回传的空签名 thinking，模型看不到自己的历史推理。
  if(command==='save') return locked(async()=>{
    const {id,name=id,protocol,baseUrl}=input
    if(!/^[a-zA-Z0-9_-]+$/.test(id||'') || !String(name).trim() || !families[protocol]) throw new Error('无效的 id / 名称 / 协议')
    const u=new URL(baseUrl); if(!['http:','https:'].includes(u.protocol)||u.username||u.password||u.search||u.hash) throw new Error('无效的 base-url')
    if(!Array.isArray(input.models)||input.models.some(m=>typeof m!=='string'||!m.trim())) throw new Error('models 必须是模型 ID 数组')
    const all=await groups(); const old=all.find(x=>x.group.name===id || x.group.prefix===id)
-   const g={...(old?.group||{}),name:id,prefix:id,'base-url':baseUrl.replace(/\/$/,''),keys:input.key===undefined?old?.group.keys||[]:[{'api-key':input.key}],models:[...new Set(input.models)].map(m=>({...old?.group.models?.find(x=>x.name===m),name:m,alias:m,thinking:{levels:['low','medium','high','xhigh','max']},...(input.isCompat===undefined?{}:{'is-compat':!!input.isCompat})}))}
+   const g={...(old?.group||{}),name:id,prefix:id,'base-url':baseUrl.replace(/\/$/,''),keys:input.key===undefined?old?.group.keys||[]:[{'api-key':input.key}],models:[...new Set(input.models)].map(m=>{const prev=old?.group.models?.find(x=>x.name===m);return {...prev,name:m,alias:m,thinking:{levels:['low','medium','high','xhigh','max']},...(input.isCompat!==undefined?{'is-compat':!!input.isCompat}:protocol==='chat'&&prev?.['is-compat']===undefined?{'is-compat':true}:{})}})}
    if(!g.keys.some(k=>k['api-key'])) throw new Error('新增供应商需要 key')
    await replace(protocol, arr=>[...arr.filter(x=>x.name!==id && x.prefix!==id),g])
    if(old && old.protocol!==protocol) { try { await replace(old.protocol,arr=>arr.filter(x=>x.name!==id && x.prefix!==id)) } catch { throw new Error('新协议已保存，旧协议删除失败；请刷新并重试') } }
