@@ -1759,7 +1759,8 @@ export const register: Register = on => {
             <Box gap={3} paddingX={2} paddingY={1} borderStyle="single" borderDimColor>
               {stat('轮数', String(turnsOf(sel)))}
               {stat('用时', spanOf(elapsed(sel)))}
-              {stat('上下文', tokensOf(usage.context))}
+              {/* 优先用 runner 从 message_delta 取的真数；旧作业或没有该字段时退回事件流里的预估值。 */}
+              {stat('上下文', tokensOf(s?.contextTokens ?? usage.context))}
               {/* 事件流里 assistant 行的 output_tokens 是 0，运行中只有 status.json 的 outputTokens 有数（runner 从
                   stream_event 里数出来）；跑完之后 result 行给的是总数，两边取大的那个。 */}
               {stat('输出', tokensOf(Math.max(usage.output, s?.outputTokens ?? 0)))}

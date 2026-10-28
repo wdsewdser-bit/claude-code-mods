@@ -49,6 +49,8 @@ export type JobStatusFile = {
   lastText?: string
   /** 运行中数出来的输出 token 总数：assistant 行的 usage 是 0，runner 从 stream_event 里累加，result 时覆盖。 */
   outputTokens?: number
+  /** 最近一次请求的真实输入（runner 从 message_delta 取；事件流里的是 CPA 预估，偏大）。 */
+  contextTokens?: number
   startedAt?: number
   updatedAt?: number
   endedAt?: number
@@ -228,6 +230,7 @@ export const normalizeStatus = (raw: unknown): JobStatusFile | undefined => {
     lastTool: str(raw.lastTool) === '' ? null : str(raw.lastTool),
     lastText: str(raw.lastText),
     ...(num(raw.outputTokens) === undefined || num(raw.outputTokens)! < 0 ? {} : { outputTokens: num(raw.outputTokens) }),
+    ...(num(raw.contextTokens) === undefined || num(raw.contextTokens)! <= 0 ? {} : { contextTokens: num(raw.contextTokens) }),
     startedAt: num(raw.startedAt),
     updatedAt: num(raw.updatedAt),
     endedAt: num(raw.endedAt),
