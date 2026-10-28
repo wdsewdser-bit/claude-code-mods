@@ -128,6 +128,8 @@ const createControl = (jobId, job) => {
     // 运行中数出来的输出 token 总数：每条 assistant 行的 usage.output_tokens 是 0，
     // 只有 stream_event 的 message_delta 和最后的 result 行带着真数（见 stream-usage.mjs）。
     outputTokens: 0,
+    // 最近一次请求的真实输入（来自 message_delta；assistant 行里的是 CPA 的预估，偏大）。
+    contextTokens: 0,
   }
   let lastWrite = 0
   const write = force => {
@@ -149,13 +151,17 @@ const createControl = (jobId, job) => {
   }
   // 运行中的输出：stream_event 只用来数 token，不进 events.jsonl（逐 token 的增量会把有用事件挤掉）。
   const output = createOutputTracker()
+  const track = event => {
+    const total = output.onEvent(event)
+    if (total !== state.outputTokens || output.context !== state.contextTokens) {
+      state.outputTokens = total
+      state.contextTokens = output.context
+      write(false) // 和 assistant/user 行同一个节流频率
+    }
+  }
   const onEvent = (line, o) => {
     if (o.type === 'stream_event') {
-      const total = output.onEvent(o.event)
-      if (total !== state.outputTokens) {
-        state.outputTokens = total
-        write(false) // 和 assistant/user 行同一个节流频率
-      }
+      track(o.event)
 
       return
     }
