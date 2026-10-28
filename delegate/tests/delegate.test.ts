@@ -208,6 +208,8 @@ describe('gpt', () => {
 })
 
 describe('delegate tool', () => {
+  const QUOTA = { ok: true, source: 'live', at: 0, plan: 'plus', limitReached: false, windows: [{ label: '5 小时', used: 85, resetAt: Date.now() + 7_200_000 }, { label: '本周', used: 25 }] }
+
   const setup = (on: never, key: string, reply: Record<string, unknown>) => {
     const store = new Map<string, unknown>([
       ['cfg', normalize(undefined)],
@@ -248,12 +250,14 @@ describe('delegate tool', () => {
       submitted.push(e.text)
       return { text: e.text }
     })
-    o('process.run', (_$, e: { init?: { stdin?: string } }) => {
-      jobs.push(JSON.parse(e.init?.stdin ?? '{}'))
+    o('process.run', (_$, e: { argv?: string[]; init?: { stdin?: string } }) => {
+      // GPT 作业结束时会查一次额度，那不是派活。
+      const quota = e.argv?.some(a => a.endsWith('gpt-quota.mjs')) === true
+      if (!quota) jobs.push(JSON.parse(e.init?.stdin ?? '{}'))
       return {
         value: {
           exitCode: 0,
-          stdout: `${JSON.stringify(reply)}\n`,
+          stdout: quota ? `${JSON.stringify(QUOTA)}\n` : `${JSON.stringify(reply)}\n`,
           stderr: '',
           isStdoutTruncated: false,
           isStderrTruncated: false,
@@ -455,6 +459,20 @@ describe('delegate tool', () => {
     expect(jobs[1]).toMatchObject({ resume: 'sid-g3', model: 'gpt-6-astra', effort: 'xhigh' })
     await call($ as never, { task: 'c', tier: 'gpt', resume: 'sid-g3', model: 'gpt-6.1-sol', effort: 'high' })
     expect(jobs[2]).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' })
+  })
+
+  test('a gpt result carries the subscription quota, a ds result does not', { timeoutMs: 10_000 }, async ($, on) => {
+    setup(on as never, 'k-1', { ok: true, text: 'done', sessionId: 'sid-q', turns: 1, ms: 1 })
+    await start($ as never)
+    const gptRan = JSON.stringify(await call($ as never, { task: 'a', tier: 'gpt' }))
+    expect(gptRan).toContain('GPT 额度：5 小时剩 15%')
+    expect(gptRan).toContain('后重置')
+    expect(gptRan).toContain('本周剩 75%')
+    const started = JSON.stringify(await call($ as never, { task: 'c', tier: 'gpt', background: true }))
+    expect(started).toContain('后台任务 bg-')
+    expect(started).toContain('GPT 额度：5 小时剩 15%')
+    const dsRan = JSON.stringify(await call($ as never, { task: 'b' }))
+    expect(dsRan).not.toContain('GPT 额度')
   })
 
   test('gpt effort never goes below medium', { timeoutMs: 10_000 }, async ($, on) => {
