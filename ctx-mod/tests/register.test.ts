@@ -47,6 +47,10 @@ type World = {
   ledgerAtCompact: string | null
   /** Files `$.fs.read` answers with; empty unless a test puts one here, so every other read is denied as before. */
   readable: Map<string, string>
+  /** Directories `$.fs.list` answers with, by slashed path; their parents list the names below them. */
+  dirs: Map<string, { name: string; kind: string; size: number; mtimeMs: number }[]>
+  /** The working directory `$.session.cwd()` answers with. */
+  cwd: string
   /** The paths `$.fs.read` was asked for, in order. */
   reads: string[]
   /** Awaited inside every `$.fs.write`, so a test can hold writes open; none unless set. */
@@ -127,6 +131,8 @@ const world = (
     clock: mock.clock(on, { now }),
     files: new Map(),
     readable: new Map(),
+    dirs: new Map(),
+    cwd: '/work',
     reads: [],
     messages: [],
     tools: [],
@@ -168,6 +174,24 @@ const world = (
 
     return text === undefined ? { deny: `ENOENT: ${e.path}` } : ({ value: text } as never)
   })
+  on('fs.list', (_$, e) => {
+    const path = slashed(e.path)
+    const known = w.dirs.get(path)
+    if (known !== undefined) return { value: known } as never
+    // A directory above a known one names it; anything else is not there.
+    const prefix = `${path.replace(/\/+$/, '')}/`
+    const names = new Set<string>()
+    for (const key of w.dirs.keys()) {
+      if (!key.startsWith(prefix)) continue
+      const [name] = key.slice(prefix.length).split('/')
+      if (name !== undefined && name !== '') names.add(name)
+    }
+    if (names.size === 0) throw new Error(`ENOENT: ${e.path}`)
+
+    return {
+      value: [...names].map(name => ({ name, kind: 'directory', size: 0, mtimeMs: 0, isLink: false })),
+    } as never
+  })
   // Like every bottom answer, wrapped once more: the read itself is { value, version }.
   on('state.get', (_$, e) => {
     const held = (e as { key?: string }).key === 'snapshot' ? w.snapshot : w.keeper
@@ -175,6 +199,7 @@ const world = (
     return { value: { value: held ?? undefined, version: 1 } } as never
   })
   on('session.id', () => ({ value: w.sessionId }))
+  on('session.cwd', () => ({ value: w.cwd }))
   on('session.messages', () => ({ value: w.messages }) as never)
   on('session.usage', () => ({
     value: {
@@ -1541,6 +1566,155 @@ test('a cold cache below 80k lets the prompt in: the switch would not pay', asyn
   w.keeper = { expiresAt: 1, lastActivityAt: 0, ttl: '1h', cachedPrefixTokens: 0, isEnabled: true, pausedReason: null, bridgePhase: 'idle' }
   expect(isDropped(await sayWhileCold($, '差一点'))).toBe(false)
   expect(w.runs).toEqual([])
+})
+
+// ---- 重启后的第一次请求：引擎还没有上下文数字，用 cache-keeper 记下的前缀 ----
+
+/** cache-keeper's published state, warm or cold, carrying a prefix of its own. */
+const keeperWith = (cachedPrefixTokens: number, expiresAt: number): Record<string, unknown> => ({
+  expiresAt,
+  lastActivityAt: 0,
+  ttl: '1h',
+  cachedPrefixTokens,
+  isEnabled: true,
+  pausedReason: null,
+  bridgePhase: 'idle',
+})
+
+/** A prompt carrying pasted images: the engine names their kind, never their bytes. */
+const sayWithImage = async ($: Engine, text: string, count = 1): Promise<unknown> =>
+  await $.prompt.submit({
+    text,
+    wait: false,
+    origin: { kind: 'composer' },
+    attachments: Array.from({ length: count }, () => ({ type: 'image', mediaType: 'image/png' })),
+  } as never)
+
+test('a restarted process with no fill of its own holds the prompt on the keeper prefix', async ($, on) => {
+  const w = world(on, 's-restart-prefix', { CTX_MOD: '1' })
+  await boot($)
+  await personRequest($, '先做点事', 'person-1')
+  // Nothing has asked the engine for a fill since the restart.
+  w.usage.tokens = undefined
+  w.keeper = keeperWith(238_000, 1)
+  expect(isDropped(await sayWhileCold($, '重启后第一句'))).toBe(true)
+  expect(heldLeft(w)).toEqual(['重启后第一句'])
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:重启后第一句'])
+})
+
+test('a restarted process whose cache is still warm is not held', async ($, on) => {
+  const w = world(on, 's-restart-warm', { CTX_MOD: '1' })
+  await boot($)
+  await personRequest($, '先做点事', 'person-1')
+  w.usage.tokens = undefined
+  w.keeper = keeperWith(238_000, Date.now() + 3_600_000)
+  expect(isDropped(await sayWhileCold($, '还在热的时候'))).toBe(false)
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs).toEqual([])
+})
+
+test('a keeper prefix below 80k lets a restarted process prompt in', async ($, on) => {
+  const w = world(on, 's-restart-small', { CTX_MOD: '1' })
+  await boot($)
+  await personRequest($, '先做点事', 'person-1')
+  w.usage.tokens = undefined
+  w.keeper = keeperWith(79_999, 1)
+  expect(isDropped(await sayWhileCold($, '差一点'))).toBe(false)
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs).toEqual([])
+})
+
+test('a held prompt that carried an image is re-submitted as text, and both sides are told what was lost', async ($, on) => {
+  const w = world(on, 's-attach-cold', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  expect(isDropped(await sayWithImage($, '看图改一下'))).toBe(true)
+  // The count and the kind sit on the shelf, so the re-submission can say what went missing.
+  const held = JSON.parse(fileAt(w, 'held.json') ?? '{"items":[]}') as {
+    items: { text: string; attachments?: { type: string; mediaType?: string }[] }[]
+  }
+  expect(held.items[0]?.attachments).toEqual([{ type: 'image', mediaType: 'image/png' }])
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs).toEqual(['compact'])
+  // Only the words went back, with the note the model needs: no attachment is forged.
+  expect(w.resubmits).toHaveLength(1)
+  expect(w.resubmits[0]).toContain('看图改一下')
+  expect(w.resubmits[0]).toContain('原本带了 1 个附件（图片）')
+  expect(w.resubmits[0]).toContain('不要猜测附件里是什么')
+  // The person is told to paste the image again.
+  expect(w.notices).toEqual(['ctx-mod：这条消息带了 1 个图片/附件，换窗后只补发了文字，请重新粘贴附件'])
+  expect(heldLeft(w)).toEqual([])
+})
+
+test('a held prompt whose images Claude saved hands their paths to the new window', async ($, on) => {
+  const temp = 'C:/Users/someone/AppData/Local/Temp'
+  const w = world(on, 's-image-found', { CTX_MOD: '1', TEMP: temp })
+  await boot($)
+  await goCold($, w)
+  // The paste lands in this session's own directory, named after the working directory.
+  const dir = `${temp}/claude/-work/s-image-found/images`
+  const now = Date.now()
+  w.dirs.set(dir, [
+    { name: '56.webp', kind: 'file', size: 10, mtimeMs: now - 1_500 },
+    { name: '57.png', kind: 'file', size: 10, mtimeMs: now - 1_000 },
+    // Too old to be part of this paste.
+    { name: '50.png', kind: 'file', size: 10, mtimeMs: now - 3_600_000 },
+  ])
+  expect(isDropped(await sayWithImage($, '看这两张', 2))).toBe(true)
+  const held = JSON.parse(fileAt(w, 'held.json') ?? '{"items":[]}') as { items: { images?: string[] }[] }
+  expect(w.logs.join('\n')).not.toContain('prompt.submit images')
+  expect(held.items[0]?.images).toEqual([`${dir}/56.webp`, `${dir}/57.png`])
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.resubmits).toHaveLength(1)
+  expect(w.resubmits[0]).toContain('用户原消息附了图片，已保存在：')
+  expect(w.resubmits[0]).toContain(`${dir}/57.png`)
+  expect(w.resubmits[0]).toContain('请用 Read 查看')
+  expect(w.notices).toEqual(['ctx-mod：图片已按路径转交（2 张），不用重新粘贴'])
+  expect(heldLeft(w)).toEqual([])
+})
+
+test('a paste with fewer files than the message attached is not guessed at', async ($, on) => {
+  const temp = 'C:/Users/someone/AppData/Local/Temp'
+  const w = world(on, 's-image-short', { CTX_MOD: '1', TEMP: temp })
+  await boot($)
+  await goCold($, w)
+  // Two images were attached, but only one was ever written: handing that one over would
+  // pass off half a paste as the whole of it.
+  w.dirs.set(`${temp}/claude/-work/s-image-short/images`, [
+    { name: '60.png', kind: 'file', size: 10, mtimeMs: Date.now() - 1_000 },
+  ])
+  expect(isDropped(await sayWithImage($, '看这两张', 2))).toBe(true)
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.resubmits).toHaveLength(1)
+  expect(w.resubmits[0]).not.toContain('已保存在：')
+  expect(w.resubmits[0]).toContain('原本带了 2 个附件（图片）')
+  expect(w.notices).toEqual(['ctx-mod：这条消息带了 2 个图片/附件，换窗后只补发了文字，请重新粘贴附件'])
+  expect(heldLeft(w)).toEqual([])
+})
+
+test('an image-carrying prompt with a warm cache goes in untouched', async ($, on) => {
+  const w = world(on, 's-attach-warm', { CTX_MOD: '1' })
+  await boot($)
+  await personRequest($, '先做点事', 'person-1')
+  w.usage.tokens = 150_000
+  w.keeper = keeperWith(150_000, Date.now() + 3_600_000)
+  expect(isDropped(await sayWithImage($, '看图'))).toBe(false)
+  expect(w.submits.filter(text => text === '看图')).toHaveLength(1)
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs).toEqual([])
+  expect(heldLeft(w)).toEqual([])
 })
 
 // ---- 冷换窗前消费 cache-keeper 的保活快照 ----

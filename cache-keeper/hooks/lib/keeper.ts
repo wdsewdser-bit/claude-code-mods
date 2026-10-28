@@ -27,6 +27,13 @@ export type KeeperState = {
   /** Set by a cache-invalidating change until a real request hits again. */
   pausedReason: string | null
   ttl: Ttl | null
+  /**
+   * Snapshot keepalives sent in this idle stretch: at most two, the second
+   * only after the first one's answer was not a snapshot.
+   */
+  snapshotAttempts: number
+  /** Whether this stretch's snapshot came back readable and was published. */
+  isSnapshotParsed: boolean
 }
 
 export const TTL_MS: Record<Ttl, number> = { '5m': 300_000, '1h': 3_600_000 }
@@ -60,6 +67,8 @@ export const initialKeeperState = (enabled: boolean): KeeperState => ({
   idleKeepaliveBudget: null,
   pausedReason: null,
   ttl: null,
+  snapshotAttempts: 0,
+  isSnapshotParsed: false,
 })
 
 export const keepaliveAtMs = (ttl: Ttl, config: KeeperConfig): number =>

@@ -69,7 +69,7 @@
     "ledgerSnapshot": {
       "type": "boolean",
       "title": "Ledger snapshot on the last keepalive",
-      "description": "The last keepalive of an idle stretch asks the model, over the same cached prefix, which tasks are still open and what their next step is, and publishes them in its state for ctx-mod to book before it switches windows. Off: every keepalive sends the plain probe prompt.",
+      "description": "The first keepalive of an idle stretch (once more if that answer was unreadable) asks the model, over the same cached prefix, which tasks are still open and what their next step is, and publishes them in its state for ctx-mod to book before it switches windows. Off: every keepalive sends the plain probe prompt.",
       "default": true
     },
     "writeCsv": {

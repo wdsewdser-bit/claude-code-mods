@@ -659,25 +659,60 @@ const snapshots = (sets: { key: string; value: unknown }[]): { at?: unknown; ent
   sets.filter(set => set.key === 'snapshot').map(set => set.value as { at?: unknown; entries?: unknown })
 
 describe('ledger snapshot', () => {
-  test('only the last keepalive of an idle stretch asks for the open tasks', DEFAULTS, async ($, on) => {
+  test('one snapshot per idle stretch: the three keepalives here ask once, then stay plain', DEFAULTS, async ($, on) => {
     const w = world(on, FIVE)
     // A cached prefix at least as large as the fill ctx-mod switches a window at.
     w.stepUsage = usage(90_000, 200)
+    // A readable answer the first time: a bad one would earn the retry and blur the count.
+    w.forkTexts = [ANSWER]
     await boot($)
     await turn($, 't1', 'hello')
     await w.clock.advance(1_200_000)
     expect(w.forks).toHaveLength(3)
-    expect(w.forks.slice(0, 2)).toEqual([PLAIN, PLAIN])
-    expect(w.forks[2]).toContain('JSON array')
+    expect(w.forks[0]).toContain('JSON array')
+    expect(w.forks.slice(1)).toEqual([PLAIN, PLAIN])
   })
 
-  test('a keepalive that is not the last one keeps the plain probe prompt', DEFAULTS, async ($, on) => {
+  test('with no idle budget the stretch still asks once', CAPPED, async ($, on) => {
     const w = world(on, FIVE)
     w.stepUsage = usage(90_000, 200)
+    w.forkTexts = [ANSWER]
+    await boot($)
+    await turn($, 't1', 'hello')
+    // An anchor has no idle cap, so its keepalives go on and on: the snapshot still does not.
+    await command($, 'anchor on')
+    await w.clock.advance(1_200_000)
+    expect(w.forks.length).toBeGreaterThanOrEqual(3)
+    expect(w.forks[0]).toContain('JSON array')
+    expect(w.forks.slice(1).every(prompt => prompt === PLAIN)).toBe(true)
+  })
+
+  test('an answer that was no snapshot earns one retry on the next keepalive', DEFAULTS, async ($, on) => {
+    const sets = watchState(on)
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    w.forkTexts = ['I cannot read that.', ANSWER]
     await boot($)
     await turn($, 't1', 'hello')
     await w.clock.advance(490_000)
-    expect(w.forks).toEqual([PLAIN, PLAIN])
+    expect(w.forks).toHaveLength(2)
+    expect(w.forks[0]).toContain('JSON array')
+    expect(w.forks[1]).toContain('JSON array')
+    expect(snapshots(sets)).toHaveLength(1)
+    expect(snapshots(sets)[0]?.entries).toEqual([ENTRY])
+  })
+
+  test('after the retry is spent the stretch asks no more', DEFAULTS, async ($, on) => {
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    w.forkTexts = ['I cannot read that.', 'Still nothing.', PLAIN]
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(1_200_000)
+    expect(w.forks).toHaveLength(3)
+    expect(w.forks[0]).toContain('JSON array')
+    expect(w.forks[1]).toContain('JSON array')
+    expect(w.forks[2]).toBe(PLAIN)
   })
 
   test('a prefix below 80k keeps every keepalive plain', DEFAULTS, async ($, on) => {
@@ -713,7 +748,7 @@ describe('ledger snapshot', () => {
     const sets = watchState(on)
     const w = world(on, FIVE)
     w.stepUsage = usage(90_000, 200)
-    w.forkTexts = [PLAIN, PLAIN, ANSWER]
+    w.forkTexts = [ANSWER, PLAIN, PLAIN]
     await boot($)
     await turn($, 't1', 'hello')
     await w.clock.advance(1_200_000)
@@ -731,7 +766,7 @@ describe('ledger snapshot', () => {
     const sets = watchState(on)
     const w = world(on, FIVE)
     w.stepUsage = usage(90_000, 200)
-    w.forkTexts = [PLAIN, PLAIN, 'Nothing else is open: ' + ANSWER]
+    w.forkTexts = ['Nothing else is open: ' + ANSWER, PLAIN, PLAIN]
     await boot($)
     await turn($, 't1', 'hello')
     await w.clock.advance(1_200_000)
@@ -742,7 +777,7 @@ describe('ledger snapshot', () => {
     const sets = watchState(on)
     const w = world(on, FIVE)
     w.stepUsage = usage(90_000, 200)
-    w.forkTexts = [PLAIN, PLAIN, 'I cannot read that.']
+    w.forkTexts = ['I cannot read that.', PLAIN, PLAIN]
     await boot($)
     await turn($, 't1', 'hello')
     await w.clock.advance(1_200_000)

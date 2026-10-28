@@ -409,6 +409,8 @@ const boot = async ($: EngineInterface): Promise<Session> => {
     }
     s.keeper.consecutiveFailures = numberOf(saved.consecutiveFailures, 0)
     s.keeper.idleKeepalives = numberOf(saved.idleKeepalives, 0)
+    s.keeper.snapshotAttempts = numberOf(saved.snapshotAttempts, 0)
+    s.keeper.isSnapshotParsed = saved.isSnapshotParsed === true
     s.keeper.pausedReason =
       typeof saved.pausedReason === 'string' ? saved.pausedReason : null
     s.observed =
@@ -502,6 +504,8 @@ const save = async ($: EngineInterface, s: Session): Promise<void> => {
         cachedPrefixTokens: s.keeper.cachedPrefixTokens,
         consecutiveFailures: s.keeper.consecutiveFailures,
         idleKeepalives: s.keeper.idleKeepalives,
+        snapshotAttempts: s.keeper.snapshotAttempts,
+        isSnapshotParsed: s.keeper.isSnapshotParsed,
         pausedReason: s.keeper.pausedReason,
         observed: s.observed,
         baseline: s.baseline,
@@ -693,16 +697,24 @@ const stopKeeper = ($: EngineInterface, s: Session, reason: string): void => {
 // worth the longer prompt: the same fill at which ctx-mod switches a window.
 const LEDGER_SNAPSHOT_MIN_TOKENS = 80_000
 
+/** Snapshot keepalives one idle stretch may spend: the first, and one retry after a bad answer. */
+const MAX_SNAPSHOT_ATTEMPTS = 2
+
 /**
- * Whether this keepalive is the idle stretch's last one, on a large enough
- * prefix, with the switch on: only that one asks what is still open, so the
- * keepalives that follow nothing have nothing left to spend.
+ * Whether this keepalive asks what is still open, on a large enough prefix,
+ * with the switch on. Only one per idle stretch does — the first — because the
+ * conversation does not change while it idles: a later snapshot would say the
+ * same thing and spend the output tokens again. Only an answer that was not a
+ * snapshot earns a second try, and then the stretch is done. Whether the
+ * keepalives are capped (or unbounded, as under a bridge or an anchor) makes
+ * no difference.
  */
 const isSnapshotKeepalive = (keeper: KeeperState): boolean =>
   config.ledgerSnapshot &&
-  keeper.idleKeepaliveBudget !== null &&
-  keeper.idleKeepalives + 1 >= keeper.idleKeepaliveBudget &&
-  keeper.cachedPrefixTokens >= LEDGER_SNAPSHOT_MIN_TOKENS
+  keeper.cachedPrefixTokens >= LEDGER_SNAPSHOT_MIN_TOKENS &&
+  !keeper.isSnapshotParsed &&
+  keeper.snapshotAttempts < MAX_SNAPSHOT_ATTEMPTS &&
+  keeper.idleKeepalives === keeper.snapshotAttempts
 
 // What a snapshot keepalive answered is published for ctx-mod under the
 // snapshot key; a failed parse, publish or write leaves the keepalive's own
@@ -711,24 +723,29 @@ const publishSnapshot = async (
   $: EngineInterface,
   startedAt: number,
   reply: { isAnswered: boolean; text?: string },
-): Promise<void> => {
-  if (!reply.isAnswered || typeof reply.text !== 'string') return
+): Promise<boolean> => {
+  if (!reply.isAnswered || typeof reply.text !== 'string') return false
   try {
     const entries = parseSnapshot(reply.text)
-    if (entries === null) return
+    if (entries === null) return false
     const snapshot: LedgerSnapshot = { at: startedAt, entries }
     const held = await read($, snapshotAtom)
-    if (JSON.stringify(held) === JSON.stringify(snapshot)) return
-    await update($, snapshotAtom, () => snapshot)
+    if (JSON.stringify(held) !== JSON.stringify(snapshot)) {
+      await update($, snapshotAtom, () => snapshot)
+    }
+
+    return true
   } catch (error) {
     debug($, error)
+
+    return false
   }
 }
 
 // One cache-sharing fork over the session's own transcript: the keepalive,
-// a manual probe, or an experiment's keeper step. Only a keepalive that is
-// the idle stretch's last asks for the ledger snapshot; a manual probe and an
-// experiment's keeper step keep the plain probe prompt.
+// a manual probe, or an experiment's keeper step. Only the keepalive that opens
+// an idle stretch asks for the ledger snapshot (with one retry after a bad
+// answer); a manual probe and an experiment's keeper step keep the plain prompt.
 const probe = async (
   $: EngineInterface,
   s: Session,
@@ -738,6 +755,7 @@ const probe = async (
 ): Promise<EventRow> => {
   s.keeper.isProbing = true
   try {
+    if (isSnapshot) s.keeper.snapshotAttempts += 1
     const before = await limitsNow($)
     const startedAt = await $.clock.now()
     const reply = await $.model.fork({
@@ -795,7 +813,9 @@ const probe = async (
     await flush($, s)
     await rememberMeter($, endedAt, after?.rateLimits ?? [])
     await save($, s)
-    if (isSnapshot) await publishSnapshot($, startedAt, reply)
+    if (isSnapshot) {
+      s.keeper.isSnapshotParsed = await publishSnapshot($, startedAt, reply)
+    }
 
     return row
   } finally {
@@ -1950,7 +1970,10 @@ export const register: Register = (on, options) => {
       if (origin.kind === 'composer' || origin.kind === 'bridge' || isHeldPerson) {
         const s = await ensure($)
         s.lastRealAt = await $.clock.now()
+        // A real message ends the idle stretch, and with it the one snapshot it was given.
         s.keeper.idleKeepalives = 0
+        s.keeper.snapshotAttempts = 0
+        s.keeper.isSnapshotParsed = false
         // Only the person is a takeover: a plugin's own message (the wrap-up itself, a finished background job) is not.
         if (s.bridge.phase === 'wrapped' && (origin.kind === 'composer' || isHeldPerson)) {
           s.bridge.isTakenOver = true

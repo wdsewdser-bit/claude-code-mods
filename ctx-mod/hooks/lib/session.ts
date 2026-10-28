@@ -272,7 +272,44 @@ const HELD_FILE = 'held.json'
 /** The decisions the person took back, kept beside the ledger so a new window still knows. */
 const DECISION_FILE = 'decisions.jsonl'
 
-type HeldItem = { id: number; text: string; at: number }
+/**
+ * A non-text item a held prompt carried, as the engine names it: the kind, and
+ * the media type or file name when it had them. Never its bytes, which no
+ * plugin is given.
+ */
+export type HeldAttachment = { type: string; mediaType?: string; filename?: string }
+
+type HeldItem = {
+  id: number
+  text: string
+  at: number
+  attachments: HeldAttachment[]
+  /** Where Claude saved the pasted images, when it saved them: a re-submission points there. */
+  images: string[]
+}
+
+/** The paths a held row kept; a row written before this field has none. */
+const imagesOf = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item !== '')
+    : []
+
+/** The attachments a held row carried; a row written before this field has none. */
+const attachmentsOf = (value: unknown): HeldAttachment[] => {
+  if (!Array.isArray(value)) return []
+  const kept: HeldAttachment[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const row = entry as Record<string, unknown>
+    if (typeof row.type !== 'string' || row.type === '') continue
+    const attachment: HeldAttachment = { type: row.type }
+    if (typeof row.mediaType === 'string') attachment.mediaType = row.mediaType
+    if (typeof row.filename === 'string') attachment.filename = row.filename
+    kept.push(attachment)
+  }
+
+  return kept
+}
 
 /** Reads held.json; a missing or damaged file means nothing is held, never an error. */
 const heldFrom = (text: string | null): HeldItem[] => {
@@ -286,7 +323,13 @@ const heldFrom = (text: string | null): HeldItem[] => {
       if (typeof item !== 'object' || item === null) continue
       const row = item as Record<string, unknown>
       if (typeof row.id !== 'number' || !Number.isInteger(row.id) || typeof row.text !== 'string') continue
-      kept.push({ id: row.id, text: row.text, at: typeof row.at === 'number' ? row.at : 0 })
+      kept.push({
+        id: row.id,
+        text: row.text,
+        at: typeof row.at === 'number' ? row.at : 0,
+        attachments: attachmentsOf(row.attachments),
+        images: imagesOf(row.images),
+      })
     }
 
     return kept.sort((a, b) => a.id - b.id)
@@ -417,9 +460,13 @@ export type Session = {
    * Keeps a user's message on disk before it is held back, so a reload cannot lose it. Resolves to
    * the item's id, or null when the write failed and the message must not be held.
    */
-  hold: (text: string) => Promise<number | null>
+  hold: (
+    text: string,
+    attachments?: readonly HeldAttachment[],
+    images?: readonly string[],
+  ) => Promise<number | null>
   /** The held messages, oldest first; `await ready()` first. */
-  heldItems: () => { id: number; text: string; at: number }[]
+  heldItems: () => HeldItem[]
   /** Drops one held message and writes the rest back; an unknown id changes nothing. */
   release: (id: number) => Promise<void>
   /** The latest person prompt's seq; `await ready()` first. */
@@ -2536,10 +2583,23 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
 
   // Only this session's own files: the cross-session table sits outside the directory, and a
   // new window never needs it to pick the work up.
-  const hold = async (text: string): Promise<number | null> => {
+  const hold = async (
+    text: string,
+    attachments: readonly HeldAttachment[] = [],
+    images: readonly string[] = [],
+  ): Promise<number | null> => {
     await ensureLoaded()
     const id = held.reduce((top, item) => Math.max(top, item.id), 0) + 1
-    held = [...held, { id, text, at: io.now() }]
+    held = [
+      ...held,
+      {
+        id,
+        text,
+        at: io.now(),
+        attachments: attachments.map(item => ({ ...item })),
+        images: [...images],
+      },
+    ]
     const isWritten = await queue.push(pathIn(HELD_FILE), heldJson())
     if (isWritten) return id
 
@@ -2551,7 +2611,12 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return null
   }
 
-  const heldItems = (): HeldItem[] => held.map(item => ({ ...item }))
+  const heldItems = (): HeldItem[] =>
+    held.map(item => ({
+      ...item,
+      attachments: item.attachments.map(attachment => ({ ...attachment })),
+      images: [...item.images],
+    }))
 
   const release = async (id: number): Promise<void> => {
     await ensureLoaded()
