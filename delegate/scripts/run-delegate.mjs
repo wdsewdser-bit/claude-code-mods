@@ -428,6 +428,8 @@ const main = async () => {
       '--verbose',
       // 半成品事件（stream_event）里才有运行中的用量：assistant 行的 usage.output_tokens 恒为 0。
       '--include-partial-messages',
+      // GPT 的推理摘要要请求里带 thinking.display=summarized，CPA 才向上游要 reasoning.summary；不带时思考块只有加密签名、没有文字。
+      ...(gpt ? ['--thinking-display', 'summarized'] : []),
       '--allowedTools',
       only ? tools : ptc ? `${tools},${PTC_TOOL}` : tools,
       '--tools',
