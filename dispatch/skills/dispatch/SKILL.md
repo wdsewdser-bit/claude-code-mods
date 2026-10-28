@@ -17,9 +17,9 @@ description: 根代理需要派发时加载：分包、模型与档位、精简�
 - 主会话 Opus 5.5 / medium，复杂判断用 high；不把主模型的档位继承当作所有子代理的默认。
 - 额度：套餐所有 Claude 模型共用一个额度池；DS（delegate_flash / delegate_pro）不占 Claude 额度。执行默认交给 DS（见“delegate（DS）派发”），含密钥或敏感数据的活也交给 DS（用户 2026-10-18 决定接受该链路）。不用 Sonnet。
 - Haiku 5.5 只用于需要 DS 没有的工具（浏览器、LSP、Artifact 等）的执行：worker、worker-ptc、researcher 默认 low（2026-10-20 实测三组题，含 20 多个文件的遗留代码题，low 与 medium 得分相同，省 15–42%；按步自适应升档从未触发，已放弃）；browser-worker、artifact-worker 暂留 high（未覆盖）；判断明显吃力或做过一次不稳时单次覆盖 medium/high，不能跳过必要验证。
-- DS 做过一次仍不稳，或需要深度独立审查时，派 Opus 5.5（reviewer 按其定义为 high；worker-ptc / worker 单次覆盖 model=opus 时用 medium）。实测 Opus reviewer 挖得更深但单次成本约为 DS 的 25 倍，只在值得时用。文件多不等于必须升级模型。
+- Opus 5.5 干活只负责需要前端审美的部分：前端、设计、UI、动画（2026-10-27 用户决定，取代引入 GPT 前的“DS 不稳或深度审查派 Opus”）。Opus 定好样式和视觉方案后，后续实现、接线、修 bug 交给 DS 或 GPT，不再派 Opus。DS 做过一次仍不稳、高风险改动和独立审查，按“delegate_gpt（GPT）派发”升级到 GPT。派 Opus 时 worker-ptc / worker 单次覆盖 model=opus，用 medium。
 - 在 Agent 调用中用实际支持的 model 别名 haiku / opus；档位写在代理定义或单次派发参数里，不设全局 CLAUDE_CODE_EFFORT_LEVEL，也不强制全 Haiku。
-- Haiku 未完成时先检查具体缺口；只是漏一项验证就续跑补齐，需要重新判断路线再升级或由 Opus 收回。reviewer / oracle 只在独立审查或重大不确定性有价值时使用。
+- Haiku 未完成时先检查具体缺口；只是漏一项验证就续跑补齐，需要重新判断路线就由主会话收回判断，再改派 DS 或 GPT 执行。reviewer / oracle 只在独立审查或重大不确定性有价值时使用。
 ## 稳定的工具配置
 
 | subagent_type | 默认模型 / 档位 | 工具与用途 |
