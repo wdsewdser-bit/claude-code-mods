@@ -880,9 +880,10 @@ const callTool = async (
   }
   if (background) {
     void runBackground($, record, wire)
+    const startQuota = target === 'gpt' ? await gptQuotaLine($) : ''
 
     return {
-      result: `[delegate ${target} · ${mode} · 后台任务 ${jobId}] 已启动（agent ${record.sessionId ?? '?'}）。完成后会自动通知你（结果和 agent ID 都在通知里）。期间继续做别的，不要轮询，也不要为同一件事再派一个；要看进度用 delegate_status("${jobId}")，要停用 delegate_cancel("${jobId}")，要补充要求用 delegate_send("${jobId}", "…")。${cwdNote}`,
+      result: `[delegate ${target} · ${mode} · 后台任务 ${jobId}] 已启动（agent ${record.sessionId ?? '?'}）。完成后会自动通知你（结果和 agent ID 都在通知里）。期间继续做别的，不要轮询，也不要为同一件事再派一个；要看进度用 delegate_status("${jobId}")，要停用 delegate_cancel("${jobId}")，要补充要求用 delegate_send("${jobId}", "…")。${cwdNote}${startQuota === '' ? '' : `\n${startQuota}`}`,
     }
   }
 
@@ -911,7 +912,8 @@ const settle = async (
   if (!reply.ok) record.error = (reply.error ?? reply.text ?? '').slice(0, 300)
   await saveJob($, record)
   const id = record.sessionId ?? ''
-  const head = `[delegate ${record.tier} · ${record.mode} · agent ${id === '' ? '?' : id} · ${reply.turns ?? '?'} 轮 · ${Math.round((reply.ms ?? 0) / 1000)} 秒 · ${record.jobId}]`
+  const quotaNote = record.tier === 'gpt' ? await gptQuotaLine($) : ''
+  const head = `[delegate ${record.tier} · ${record.mode} · agent ${id === '' ? '?' : id} · ${reply.turns ?? '?'} 轮 · ${Math.round((reply.ms ?? 0) / 1000)} 秒 · ${record.jobId}]${quotaNote === '' ? '' : `\n${quotaNote}`}`
   const note = runnerNote(reply)
   const tail = note === '' ? '' : `\n${note}`
   if (!reply.ok) {
@@ -1267,6 +1269,26 @@ const refreshQuota = async ($: EngineInterface, force = false): Promise<void> =>
     quotaPending = false
   }
   await update($, liveTickAtom, n => n + 1)
+}
+
+// GPT 作业结束时附上订阅额度，方便主会话决定还能不能接着派 GPT。15 秒内查过就复用。
+const gptQuotaLine = async ($: EngineInterface): Promise<string> => {
+  if (Date.now() - quotaAt > 15_000) await refreshQuota($, true)
+  if (quota === undefined) return ''
+  if (!quota.ok) return `[GPT 额度查询失败：${quota.error}]`
+  const now = Date.now()
+  const at = (t: number): string => {
+    const d = new Date(t)
+    const p = (n: number): string => String(n).padStart(2, '0')
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  }
+  const parts = quota.windows.map(w => {
+    const reset = w.resetAt === undefined ? '' : `，${resetIn(w.resetAt, now)}（${at(w.resetAt)}）`
+    return `${w.label}剩 ${Math.round(100 - w.used)}%${reset}`
+  })
+  const stale = quota.source === 'cached' ? `；缓存值，${Math.round((now - quota.at) / 60_000)} 分钟前` : ''
+
+  return `[GPT 额度：${parts.join(' · ')}${quota.limitReached ? '；已触顶' : ''}${stale}]`
 }
 
 const AGENT_TAG: Record<Agent, { text: string; color: string; bg: string }> = {
