@@ -6,8 +6,9 @@
 import type { CommandRunResult, EngineInterface, Register, SessionCompactResult, SessionMessage } from 'claude-code'
 
 import { formatArgs, isBackgroundRow, nonTextNote } from './lib/history.ts'
+import { cwdSlug, pickPastedImages } from './lib/images.ts'
 import { createSession, isHandoffText, looksLikePerson, stripInjected } from './lib/session.ts'
-import type { AgentNote, Env, ImportedMessage, Io, Session } from './lib/session.ts'
+import type { AgentNote, Env, HeldAttachment, ImportedMessage, Io, Session } from './lib/session.ts'
 import { describeFill, isCold, limitOf, shouldContinue } from './lib/usage.ts'
 import type { LedgerSnapshot } from './lib/types.ts'
 import { DEFAULTS, OWN_TOOL_PREFIX } from './lib/types.ts'
@@ -228,6 +229,46 @@ const unsentNotice = (lead: string, text: string): string =>
 const RESUBMIT_LEAD = 'ctx-mod：换窗口后没能重新提交你的消息，请重发：'
 const LEFTOVER_LEAD = 'ctx-mod：上次换窗口时扣下的一条消息没有送达，请重发：'
 
+/** How an attachment kind reads in a sentence; anything the engine adds stays as it spells it. */
+const ATTACHMENT_NAMES: Readonly<Record<string, string>> = {
+  image: '图片',
+  audio: '音频',
+  document: '文档',
+}
+
+/** What the person is told once a held message's text has gone in without its attachments. */
+const lostAttachmentsNotice = (count: number): string =>
+  `ctx-mod：这条消息带了 ${count} 个图片/附件，换窗后只补发了文字，请重新粘贴附件`
+
+/**
+ * What the person is told after the re-submission: images handed over by path
+ * need no re-pasting, anything else does.
+ */
+const attachmentNotice = (item: {
+  images: readonly string[]
+  attachments: readonly HeldAttachment[]
+}): string => {
+  const images = item.images.length
+  if (images === 0) return lostAttachmentsNotice(item.attachments.length)
+  const rest = item.attachments.filter(
+    attachment => !(images > 0 && attachment.type === 'image'),
+  ).length
+
+  return rest === 0
+    ? `ctx-mod：图片已按路径转交（${images} 张），不用重新粘贴`
+    : `ctx-mod：图片已按路径转交（${images} 张），另有 ${rest} 个附件无法保留，请重新粘贴附件`
+}
+
+/**
+ * What the model reads under such a message: the attachments are gone, and
+ * guessing at them is worse than waiting for the person to send them again.
+ */
+const lostAttachmentsNote = (attachments: readonly HeldAttachment[]): string => {
+  const kinds = [...new Set(attachments.map(item => ATTACHMENT_NAMES[item.type] ?? item.type))].join('、')
+
+  return `（附件提示：这条消息原本带了 ${attachments.length} 个附件（${kinds}），换窗口时无法保留，只补发了文字。请不要猜测附件里是什么，等用户重新粘贴。）`
+}
+
 /** Puts a system line in the conversation; false when it could not be shown. */
 const tellPerson = async ($: EngineInterface, text: string): Promise<boolean> => {
   try {
@@ -268,9 +309,20 @@ const deliverHeld = async ($: EngineInterface, session: Session): Promise<void> 
   for (;;) {
     const item = session.heldItems()[0]
     if (item === undefined) return
+    // The engine hands over an attachment's kind, never its bytes. The images Claude
+    // saved are handed over by path; anything else is gone, and both sides are told so.
+    const notes: string[] = []
+    if (item.images.length > 0) {
+      notes.push(`（用户原消息附了图片，已保存在：${item.images.join('、')}，请用 Read 查看。）`)
+    }
+    const lost = item.attachments.filter(
+      attachment => !(item.images.length > 0 && attachment.type === 'image'),
+    )
+    if (lost.length > 0) notes.push(lostAttachmentsNote(lost))
+    const text = notes.length === 0 ? item.text : `${item.text}\n\n${notes.join('\n')}`
     let isDelivered = false
     try {
-      const entered = await $.prompt.submit({ text: item.text, asUser: true })
+      const entered = await $.prompt.submit({ text, asUser: true })
       isDelivered = !(typeof entered === 'object' && entered !== null && 'drop' in entered)
       if (!isDelivered) logError($, 'prompt.submit resubmit', 'the re-submitted prompt was dropped')
     } catch (error) {
@@ -278,6 +330,7 @@ const deliverHeld = async ($: EngineInterface, session: Session): Promise<void> 
     }
     // The person's words are gone unless the session says so.
     if (!isDelivered && !(await tellPerson($, unsentNotice(RESUBMIT_LEAD, item.text)))) return
+    if (isDelivered && notes.length > 0) await tellPerson($, attachmentNotice(item))
     await session.release(item.id)
   }
 }
@@ -368,6 +421,82 @@ const envOf = async ($: EngineInterface, id: string): Promise<Env> => {
  */
 const snapshotOf = async ($: EngineInterface): Promise<LedgerSnapshot | null> =>
   attempt(async () => (await $.state.get(KEEPER_SNAPSHOT)).value ?? null, null)
+
+/**
+ * The temp tree Claude writes pasted images into: one directory per working
+ * directory, then one per session, then `images/<n>.<ext>`.
+ */
+const envPath = (value: string | undefined): string | undefined =>
+  typeof value === 'string' && value !== ''
+    ? value.replaceAll('\\', '/').replace(/\/+$/, '')
+    : undefined
+
+const tempRoot = async ($: EngineInterface): Promise<string | undefined> => {
+  const temp = envPath(await attempt(async () => await $.env.get('TEMP'), undefined))
+  if (temp !== undefined) return temp
+  const local = envPath(await attempt(async () => await $.env.get('LOCALAPPDATA'), undefined))
+
+  return local === undefined ? undefined : `${local}/Temp`
+}
+
+/** A directory's entries, or none when it is not there or cannot be listed. */
+const entriesAt = async (
+  $: EngineInterface,
+  path: string,
+): Promise<{ name: string; kind: string; mtimeMs: number }[] | undefined> =>
+  attempt(async () => await $.fs.list(path), undefined)
+
+/**
+ * This session's `images` directory, by the path its slug implies or, when that
+ * one is not there, by looking through the temp root for the session's own.
+ */
+const pastedImageDir = async (
+  $: EngineInterface,
+  cwd: string | undefined,
+  id: string,
+): Promise<string | undefined> => {
+  if (cwd === undefined || cwd === '') return undefined
+  const temp = await tempRoot($)
+  if (temp === undefined) return undefined
+  const root = `${temp}/claude`
+  const direct = `${root}/${cwdSlug(cwd)}/${id}/images`
+  if ((await entriesAt($, direct)) !== undefined) return direct
+  // The slug is this build's convention, not a promise: any directory under the
+  // temp root holding this session's images is the right one.
+  for (const entry of (await entriesAt($, root)) ?? []) {
+    const candidate = `${root}/${entry.name}/${id}/images`
+    if ((await entriesAt($, candidate)) !== undefined) return candidate
+  }
+
+  return undefined
+}
+
+/**
+ * The paths of the images Claude saved for a submission: only when it saved as
+ * many as the submission attached, all written just now. Empty means the new
+ * window cannot be pointed at them, and the person is asked to paste again.
+ */
+const pastedImages = async (
+  $: EngineInterface,
+  attachments: readonly HeldAttachment[],
+  id: string,
+): Promise<string[]> => {
+  const count = attachments.filter(item => item.type === 'image').length
+  if (count === 0) return []
+  try {
+    // Awaited: the engine answers it directly, a test harness may answer a promise.
+    const cwd: string | undefined = await attempt(async () => await $.session.cwd(), undefined)
+    const dir = await pastedImageDir($, cwd, id)
+    if (dir === undefined) return []
+    const entries = await entriesAt($, dir)
+
+    return pickPastedImages(entries ?? [], count, Date.now()).map(name => `${dir}/${name}`)
+  } catch (error) {
+    logError($, 'prompt.submit images', error)
+
+    return []
+  }
+}
 
 /**
  * Books cache-keeper's snapshot of the still-open tasks before a cold switch,
@@ -1577,24 +1706,29 @@ export const register: Register = (on, options) => {
     try {
       const session = await sessionOf($)
       const id = await idOf($)
-      if (
-        session !== undefined &&
-        id !== undefined &&
-        isPersonOrigin(e.origin) &&
-        (e.attachments?.length ?? 0) === 0
-      ) {
+      if (session !== undefined && id !== undefined && isPersonOrigin(e.origin)) {
         // During a switch every such message waits its turn; otherwise only a cold cache holds one.
         let wants = isHoldingFlow
         if (!wants) {
           const env = await envOf($, id)
+          // A restarted process has no fill of its own before its first request, so the
+          // keeper's cached prefix — kept across restarts — stands in for it: the cache
+          // that went cold is at least as large as the prefix it last served.
+          const size = env.tokens ?? env.cache?.cachedPrefixTokens
           wants =
-            env.tokens !== undefined &&
-            env.tokens >= DEFAULTS.coldMinTokens &&
+            size !== undefined &&
+            size >= DEFAULTS.coldMinTokens &&
             isCold({ now: Date.now(), cache: env.cache, lastRequestAt: session.lastRequestAt() }, DEFAULTS)
           isExpired = wants
         }
-        // Held only once it is on disk: a message that could not be saved goes in as usual.
-        const heldId = wants ? await session.hold(e.text) : null
+        // A message is held whether or not it carries attachments: the engine names an
+        // attachment's kind, never its bytes, so only the text comes back — plus the
+        // paths of the images Claude saved, when it saved them. Held only once it is on
+        // disk: a message that could not be saved goes in as usual.
+        const attachments = e.attachments ?? []
+        const images =
+          wants && attachments.length > 0 ? await pastedImages($, attachments, id) : []
+        const heldId = wants ? await session.hold(e.text, attachments, images) : null
         if (heldId !== null) {
           holds = true
           heldSession = session

@@ -33,7 +33,7 @@ Claude Code mod（function hooks 插件）：观察 prompt cache、在同一进�
 - 连续 `maxConsecutiveProbeFailures` 次 miss / 失败，或 5 小时额度超阈值：自动停止并提示。周额度不参与：它没用完时停保活只会换来一次整段重写，用完后请求失败，按失败次数停。
 - 模型或 effort 变化、compact 之后：暂停，直到下一次真实请求再次命中缓存。`/clear` 后等待新基线。
 - 不启动第二个 `claude --resume` 进程，不碰认证 token，不调用私有接口。
-- 一段闲置的**最后一次**保活（发完这次 `idleKeepalives` 就等于 budget）、缓存前缀 ≥ 80k、且 `ledgerSnapshot`（默认 `true`）开着时，fork 的 prompt 换成要求模型只输出一个 JSON 数组：主会话里还开着的任务，每项 `{task_id, title, status: in_progress|blocked, text, next_step}`，最多 8 项，没有就是 `[]`。这次请求照常算作保活（命中、计数、TTL 续期都与普通保活一致）；解析失败（前后有文字、被代码块包裹都允许）就当没有快照，不影响保活结果。手动 `probe` 和实验里的 keeper 步骤永远用 `probePrompt`。
+- 一段闲置的**第一次**保活（`idleKeepalives` 为 0）、缓存前缀 ≥ 80k、且 `ledgerSnapshot`（默认 `true`）开着时，fork 的 prompt 换成要求模型只输出一个 JSON 数组：主会话里还开着的任务，每项 `{task_id, title, status: in_progress|blocked, text, next_step}`，最多 8 项，没有就是 `[]`。这次请求照常算作保活（命中、计数、TTL 续期都与普通保活一致）；解析失败（前后有文字、被代码块包裹都允许）就当没有快照，不影响保活结果。一段闲置只问一次：闲置期间对话不会变，后面的快照只会重复花输出 token，所以不再发（预算为 `null` 的桥接、后台任务、锚点也一样）。第一次的答案解析不出来时，下一次保活再试一次，一段闲置最多两次；用户发了消息、闲置段结束就清零。每次快照覆盖上一份，ctx-mod 只认最新的那份。手动 `probe` 和实验里的 keeper 步骤永远用 `probePrompt`。
 
 ## 子代理保活
 
@@ -130,7 +130,7 @@ hash 的输入是 transcript 里的 `prompt_snapshot`、`deferred_tools_record` 
 
 ## 影子模式与净收益（CACHE-02）
 
-`ledgerSnapshot`（默认 `true`）：一段闲置的最后一次保活顺便问一次还开着的任务，结果发布在 `snapshot` 槽里（见下）。关掉后每次保活都只发 `probePrompt`。
+`ledgerSnapshot`（默认 `true`）：一段闲置的第一次保活顺便问一次还开着的任务（解析失败时下一次再试一次，一段最多两次），结果发布在 `snapshot` 槽里（见下）。关掉后每次保活都只发 `probePrompt`。
 
 `shadowMode`（默认 `false`）：不发送任何保活请求，只把"这次本该保活"记成 `kind: shadow` / `result: would_have_keepalive` 的事件；用户下一次请求到来时再记一行 `kind: recovery`，带 `shadow_recovery_sec`（距上一次请求的真实间隔）。影子模式不改动真实保活的状态（`lastActivityAt`、`idleKeepalives`、失败计数、暂停原因），关掉开关后行为与原来一致；子代理的 would-have 也会记录（带 `agent_id`）。
 
@@ -169,7 +169,7 @@ node scripts/keepalive-net.ts --prices '[["opus-5-5",{"input":4,"write5m":5,"wri
 ## 给其他 mod 读的缓存状态（v0.4.1）
 
 - `$.state` 里发布 `cache-keeper.cache`：`{ lastActivityAt, ttl, expiresAt, cachedPrefixTokens, isEnabled, pausedReason, bridgePhase }`。`expiresAt` 之后缓存就是冷的；`bridgePhase` 为 `wrapped` 表示已发收尾、正在等 5 小时额度重置。别的 mod 把 `cache-keeper` 列进 `dependencies` 后用 `$.state.get({ plugin: 'cache-keeper', key: 'cache' })` 读，只读。
-- `cache-keeper.snapshot`：`{ at, entries }`，最后一次保活看到的还开着的任务（`at` 是那次请求开始的时间，`entries` 最多 8 项，每项 `{ task_id, title, status, text, next_step? }`）。只在 `ledgerSnapshot` 开着、前缀 ≥ 80k、且是一段闲置的最后一次保活时写；解析失败就不写。ctx-mod 在冷缓存换窗前读它：`at` 不早于最后一次真实主线程请求、且这份快照没被消费过，就把每条写进账本。
+- `cache-keeper.snapshot`：`{ at, entries }`，保活看到的还开着的任务（`at` 是那次请求开始的时间，`entries` 最多 8 项，每项 `{ task_id, title, status, text, next_step? }`）。只在 `ledgerSnapshot` 开着、前缀 ≥ 80k、且是一段闲置的第一次保活时写（解析失败时下一次保活重试一次，一段闲置最多两次，用户发消息后清零）；每次覆盖上一份；解析失败就不写。ctx-mod 在冷缓存换窗前读它：`at` 不早于最后一次真实主线程请求、且这份快照没被消费过，就把每条写进账本。
 - 别的 mod 回答了压缩（不调 `next`）时，本 mod 的 `session.compact` 钩子可能收不到。另加两道判断，任一成立就按"已压缩"暂停保活，直到下一次真实请求再次命中：引擎存下压缩边界行（`session.append`，`door: compaction`）；或保活前发现当前上下文不到所记前缀的一半。
 
 ## 锚点会话（v0.5.0）
