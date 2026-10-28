@@ -63,6 +63,12 @@ import {
 } from './lib/pricing.ts'
 import type { CacheSplit, Ttl, Usage } from './lib/pricing.ts'
 import { parseJsonl, renderReport, summarize, toCsv } from './lib/report.ts'
+import {
+  EMPTY_SNAPSHOT,
+  LEDGER_SNAPSHOT_PROMPT,
+  parseSnapshot,
+} from './lib/snapshot.ts'
+import type { LedgerSnapshot } from './lib/snapshot.ts'
 import type { EventRow, RunRecord, RunStep } from './lib/report.ts'
 
 const COMMAND = 'cache-keeper'
@@ -81,6 +87,12 @@ const cacheAtom = atom(
   { plugin: 'cache-keeper', key: 'cache' } as const,
   cacheStateOf(initialKeeperState(false), 'idle'),
 )
+// What the last keepalive of an idle stretch saw still open in the main
+// conversation, for ctx-mod to book before it switches windows.
+const snapshotAtom = atom(
+  { plugin: 'cache-keeper', key: 'snapshot' } as const,
+  EMPTY_SNAPSHOT,
+)
 const METER_CARRY_MS = 120_000
 // What a finished subagent is resumed with to have its cached prefix read
 // again. It answers in its own loop; the notice of that never reaches the model.
@@ -98,6 +110,8 @@ type Config = KeeperConfig & {
   bridgeAtPercent: number
   weeklyHandoffAtPercent: number
   probePrompt: string
+  /** The last keepalive of an idle stretch also asks for the open tasks. */
+  ledgerSnapshot: boolean
   writeCsv: boolean
   writeJson: boolean
   showStatus: boolean
@@ -228,6 +242,7 @@ const readConfig = (options: PluginOptions): Config => ({
   weeklyHandoffAtPercent: numberOf(options.weeklyHandoffAtPercent, 98),
   subagentKeepalives: numberOf(options.subagentKeepalives, 2),
   probePrompt: stringOf(options.probePrompt, 'Reply with OK only.'),
+  ledgerSnapshot: booleanOf(options.ledgerSnapshot, true),
   writeCsv: booleanOf(options.writeCsv, true),
   writeJson: booleanOf(options.writeJson, true),
   showStatus: booleanOf(options.showStatus, false), // 按钮栏已实时显示保活信息，状态行默认不再重复
@@ -674,19 +689,60 @@ const stopKeeper = ($: EngineInterface, s: Session, reason: string): void => {
   $.ui.log(`keeper stopped: ${reason}`)
 }
 
+// The main conversation's cached prefix from which a keepalive's answer is
+// worth the longer prompt: the same fill at which ctx-mod switches a window.
+const LEDGER_SNAPSHOT_MIN_TOKENS = 80_000
+
+/**
+ * Whether this keepalive is the idle stretch's last one, on a large enough
+ * prefix, with the switch on: only that one asks what is still open, so the
+ * keepalives that follow nothing have nothing left to spend.
+ */
+const isSnapshotKeepalive = (keeper: KeeperState): boolean =>
+  config.ledgerSnapshot &&
+  keeper.idleKeepaliveBudget !== null &&
+  keeper.idleKeepalives + 1 >= keeper.idleKeepaliveBudget &&
+  keeper.cachedPrefixTokens >= LEDGER_SNAPSHOT_MIN_TOKENS
+
+// What a snapshot keepalive answered is published for ctx-mod under the
+// snapshot key; a failed parse, publish or write leaves the keepalive's own
+// result untouched.
+const publishSnapshot = async (
+  $: EngineInterface,
+  startedAt: number,
+  reply: { isAnswered: boolean; text?: string },
+): Promise<void> => {
+  if (!reply.isAnswered || typeof reply.text !== 'string') return
+  try {
+    const entries = parseSnapshot(reply.text)
+    if (entries === null) return
+    const snapshot: LedgerSnapshot = { at: startedAt, entries }
+    const held = await read($, snapshotAtom)
+    if (JSON.stringify(held) === JSON.stringify(snapshot)) return
+    await update($, snapshotAtom, () => snapshot)
+  } catch (error) {
+    debug($, error)
+  }
+}
+
 // One cache-sharing fork over the session's own transcript: the keepalive,
-// a manual probe, or an experiment's keeper step.
+// a manual probe, or an experiment's keeper step. Only a keepalive that is
+// the idle stretch's last asks for the ledger snapshot; a manual probe and an
+// experiment's keeper step keep the plain probe prompt.
 const probe = async (
   $: EngineInterface,
   s: Session,
   tag: Tag | undefined,
   note: string,
+  isSnapshot = false,
 ): Promise<EventRow> => {
   s.keeper.isProbing = true
   try {
     const before = await limitsNow($)
     const startedAt = await $.clock.now()
-    const reply = await $.model.fork({ prompt: config.probePrompt })
+    const reply = await $.model.fork({
+      prompt: isSnapshot ? LEDGER_SNAPSHOT_PROMPT : config.probePrompt,
+    })
     const endedAt = await $.clock.now()
     const after = await attempt(() => $.session.usage(), undefined)
     const usage: Usage = 'usage' in reply ? { ...reply.usage } : ZERO_USAGE
@@ -739,6 +795,7 @@ const probe = async (
     await flush($, s)
     await rememberMeter($, endedAt, after?.rateLimits ?? [])
     await save($, s)
+    if (isSnapshot) await publishSnapshot($, startedAt, reply)
 
     return row
   } finally {
@@ -1501,7 +1558,9 @@ const tick = async ($: EngineInterface): Promise<void> => {
             index,
           )
         } else {
-          await probe($, s, undefined, 'keepalive')
+          // The view, not the raw state: a bridged or anchored session has no idle cap,
+          // so it has no last keepalive to spare either.
+          await probe($, s, undefined, 'keepalive', isSnapshotKeepalive(decisionKeeper))
         }
       }
       await keepAgents($, s, await $.clock.now())

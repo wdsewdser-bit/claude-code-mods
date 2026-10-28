@@ -12,6 +12,7 @@ import type {
   HistoryRecord,
   LedgerEntry,
   LedgerInput,
+  LedgerSnapshot,
   Overflow,
   Role,
   TaskStatus,
@@ -363,6 +364,8 @@ type State = {
   gateWanted: string[]
   lastPrefix: number | null
   lastHandoff: number | null
+  /** The `at` of the last cache-keeper snapshot booked into the ledger, so it is booked once. */
+  bookedSnapshotAt: number | null
   /** The current ledger page, exactly what ledger.jsonl holds. */
   page: LedgerEntry[]
   pending: Pending | null
@@ -374,6 +377,11 @@ export type Session = {
   noteRequest: () => void
   reminder: (env: Env) => string | null
   ledgerAppend: (input: unknown, env: Env) => Promise<ToolResult>
+  /**
+   * Books cache-keeper's snapshot of the still-open tasks, once per snapshot: the entries
+   * that pass the ledger's check, as a count. Never throws, so a switch goes on regardless.
+   */
+  ledgerSnapshot: (snapshot: LedgerSnapshot | null, env: Env) => Promise<number>
   ledgerRead: (input: unknown) => Promise<ToolResult>
   historyTool: (input: unknown) => Promise<ToolResult>
   /** The history write-amplification counters as one line, for the context tool's status. */
@@ -463,6 +471,7 @@ const emptyState = (): State => ({
   gateWanted: [],
   lastPrefix: null,
   lastHandoff: null,
+  bookedSnapshotAt: null,
   page: [],
   pending: null,
 })
@@ -695,6 +704,8 @@ const stateFrom = (raw: Record<string, unknown> | null): State => {
   state.costlyLoads = costlyFrom(raw.costlyLoads)
   state.lastPrefix = typeof raw.lastPrefix === 'number' ? raw.lastPrefix : null
   state.lastHandoff = typeof raw.lastHandoff === 'number' ? raw.lastHandoff : null
+  state.bookedSnapshotAt =
+    typeof raw.bookedSnapshotAt === 'number' && Number.isFinite(raw.bookedSnapshotAt) ? raw.bookedSnapshotAt : null
   const reminded = typeof raw.reminded === 'object' && raw.reminded !== null ? (raw.reminded as Record<string, unknown>) : {}
   state.reminded = {
     boundary: reminded.boundary === true,
@@ -1031,6 +1042,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       lastRequestAt: state.lastRequestAt,
       lastPrefix: state.lastPrefix,
       lastHandoff: state.lastHandoff,
+      bookedSnapshotAt: state.bookedSnapshotAt,
     })
 
   /** Only ever writes what is loaded: saving before the load would erase the file. */
@@ -1792,6 +1804,70 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return { result }
   }
 
+  /** The longest a snapshot's own text may run, so the entry passes the ledger's length check. */
+  const SNAPSHOT_TEXT_CHARS = 600
+  /** Every entry a keepalive's answer books says where it came from. */
+  const SNAPSHOT_PREFIX = '保活快照：'
+
+  /** The ledger's own check on one snapshot entry, before it is booked. */
+  const checkSnapshotEntry = (input: unknown): string[] =>
+    validate(input as LedgerInput, {
+      entries: state.page,
+      history: seq => bySeq(seq),
+      latestPersonSeq: latestPersonRow()?.seq ?? null,
+      latestRelaySeq: latestRelayRow()?.seq ?? null,
+      checkAnchor: () => 'missing-file',
+      config,
+    })
+
+  /**
+   * Books what cache-keeper's last keepalive saw still open, just before a
+   * window switch: that keepalive was the last request the warm cache served,
+   * so its answer states the work more freshly than anything on disk.
+   *
+   * A snapshot is consumed once, by its `at` (which request answered), and only
+   * when it is not older than the latest real main-thread request, so a stale
+   * one never books over newer work. Each entry goes through the same check the
+   * model's own calls pass; one that fails it is left out alone.
+   */
+  const ledgerSnapshot = async (snapshot: LedgerSnapshot | null, env: Env): Promise<number> => {
+    if (snapshot === null || typeof snapshot.at !== 'number' || !Number.isFinite(snapshot.at)) return 0
+    // Off the disk first: `bookedSnapshotAt` and `lastRequestAt` are what the last run left.
+    await ensureLoaded()
+    if (state.bookedSnapshotAt !== null && snapshot.at <= state.bookedSnapshotAt) return 0
+    const lastRequestAt = state.lastRequestAt
+    if (lastRequestAt !== null && snapshot.at < lastRequestAt) return 0
+    state.bookedSnapshotAt = snapshot.at
+    saveMeta()
+    let booked = 0
+    // The state is another mod's: a shape it did not promise is no snapshot.
+    for (const item of Array.isArray(snapshot.entries) ? snapshot.entries : []) {
+      const text =
+        item.text.length > SNAPSHOT_TEXT_CHARS
+          ? item.text.slice(0, SNAPSHOT_TEXT_CHARS) + '…'
+          : item.text
+      // The model names its own ids: what the ledger would refuse is made to fit,
+      // so one odd character does not cost the entry.
+      const taskId = item.task_id.replaceAll(/[^\w.-]/g, '-').slice(0, 64)
+      if (taskId === '') continue
+      const input: Record<string, unknown> = {
+        task_id: taskId,
+        title: item.title.slice(0, 200),
+        status: item.status,
+        text: SNAPSHOT_PREFIX + text,
+      }
+      const nextStep = (item.next_step ?? '').trim()
+      // An in_progress entry without a next step fails the whole check; blocked takes none.
+      if (nextStep !== '') input.next_step = nextStep
+      else if (item.status === 'in_progress') continue
+      if (checkSnapshotEntry(input).length > 0) continue
+      const result = await ledgerAppend(input, env)
+      if (result.isError !== true) booked += 1
+    }
+
+    return booked
+  }
+
   const queryLedger = async (query: string, limit: number): Promise<string> => {
     // Every page, current first: a query is a lookup over the whole ledger.
     const all: LedgerEntry[] = [...state.page]
@@ -2513,6 +2589,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     noteRequest,
     reminder,
     ledgerAppend,
+    ledgerSnapshot,
     ledgerRead,
     decisionRevoke,
     historyTool,

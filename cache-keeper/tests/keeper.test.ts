@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { decide, initialKeeperState, unboundedView } from '../hooks/lib/keeper.ts'
 import type { KeeperConfig, KeeperState, RateLimit } from '../hooks/lib/keeper.ts'
-import { boot, command, events, START, turn, usage, world } from './world.ts'
+import { boot, command, events, START, turn, usage, watchState, world } from './world.ts'
 
 const FIVE = { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }
 // Most tests pin the keeper off until started and unbounded, whatever the manifest's defaults.
@@ -643,5 +643,113 @@ describe('for other mods', () => {
     await turn($, 't2', 'back')
     await w.clock.advance(245_000)
     expect(w.forks).toHaveLength(1)
+  })
+})
+
+// ---- 保活快照：一段闲置的最后一次保活顺便问一次还开着的任务 ----
+
+const PLAIN = 'Reply with OK only.'
+const ANSWER = JSON.stringify([
+  { task_id: 't1', title: '改解析器', status: 'in_progress', text: '改了一半', next_step: '跑测试' },
+])
+const ENTRY = { task_id: 't1', title: '改解析器', status: 'in_progress', text: '改了一半', next_step: '跑测试' }
+
+/** Every value the mod published under its own `snapshot` key, in order. */
+const snapshots = (sets: { key: string; value: unknown }[]): { at?: unknown; entries?: unknown }[] =>
+  sets.filter(set => set.key === 'snapshot').map(set => set.value as { at?: unknown; entries?: unknown })
+
+describe('ledger snapshot', () => {
+  test('only the last keepalive of an idle stretch asks for the open tasks', DEFAULTS, async ($, on) => {
+    const w = world(on, FIVE)
+    // A cached prefix at least as large as the fill ctx-mod switches a window at.
+    w.stepUsage = usage(90_000, 200)
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(1_200_000)
+    expect(w.forks).toHaveLength(3)
+    expect(w.forks.slice(0, 2)).toEqual([PLAIN, PLAIN])
+    expect(w.forks[2]).toContain('JSON array')
+  })
+
+  test('a keepalive that is not the last one keeps the plain probe prompt', DEFAULTS, async ($, on) => {
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(490_000)
+    expect(w.forks).toEqual([PLAIN, PLAIN])
+  })
+
+  test('a prefix below 80k keeps every keepalive plain', DEFAULTS, async ($, on) => {
+    const w = world(on, FIVE)
+    w.stepUsage = usage(70_000, 200)
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(1_200_000)
+    expect(w.forks).toHaveLength(3)
+    expect(w.forks.every(prompt => prompt === PLAIN)).toBe(true)
+  })
+
+  test('with ledgerSnapshot off every keepalive stays plain', { timeoutMs: 20_000, options: { ledgerSnapshot: false } }, async ($, on) => {
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(1_200_000)
+    expect(w.forks).toHaveLength(3)
+    expect(w.forks.every(prompt => prompt === PLAIN)).toBe(true)
+  })
+
+  test('a manual probe keeps the plain prompt even late in an idle stretch', DEFAULTS, async ($, on) => {
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    await boot($)
+    await turn($, 't1', 'hello')
+    await command($, 'probe')
+    expect(w.forks).toEqual([PLAIN])
+  })
+
+  test('a parsed answer is published once, under the snapshot key', DEFAULTS, async ($, on) => {
+    const sets = watchState(on)
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    w.forkTexts = [PLAIN, PLAIN, ANSWER]
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(1_200_000)
+    const published = snapshots(sets)
+    expect(published).toHaveLength(1)
+    expect(published[0]?.entries).toEqual([ENTRY])
+    expect(typeof published[0]?.at).toBe('number')
+    // The longer answer is still an ordinary keepalive: a hit, counted, renewing the TTL.
+    const rows = events(w).filter(row => row.kind === 'keeper')
+    expect(rows.map(row => row.result)).toEqual(['hit', 'hit', 'hit'])
+    expect(await command($, 'status')).toContain('keepalives this idle stretch: 3 of 3')
+  })
+
+  test('an answer with prose around the array is still read', DEFAULTS, async ($, on) => {
+    const sets = watchState(on)
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    w.forkTexts = [PLAIN, PLAIN, 'Nothing else is open: ' + ANSWER]
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(1_200_000)
+    expect(snapshots(sets)[0]?.entries).toEqual([ENTRY])
+  })
+
+  test('a damaged answer publishes no snapshot and leaves the keepalive untouched', DEFAULTS, async ($, on) => {
+    const sets = watchState(on)
+    const w = world(on, FIVE)
+    w.stepUsage = usage(90_000, 200)
+    w.forkTexts = [PLAIN, PLAIN, 'I cannot read that.']
+    await boot($)
+    await turn($, 't1', 'hello')
+    await w.clock.advance(1_200_000)
+    expect(w.forks).toHaveLength(3)
+    expect(snapshots(sets)).toEqual([])
+    const rows = events(w).filter(row => row.kind === 'keeper')
+    expect(rows.map(row => row.result)).toEqual(['hit', 'hit', 'hit'])
+    expect(await command($, 'status')).toContain('keepalives this idle stretch: 3 of 3')
   })
 })

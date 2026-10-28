@@ -45,6 +45,8 @@ export type World = {
   status: (string | undefined)[]
   /** What the next forks answer with, in order; the last one repeats. */
   forkUsage: Usage[]
+  /** The text the next forks answer with, in order; the last one repeats, and the default answers OK. */
+  forkTexts: string[]
   limits: SessionRateLimit[]
   /** The context window's fill: none until the model has answered once. */
   contextTokens: number | undefined
@@ -77,6 +79,7 @@ export const world = (
     logs: [],
     status: [],
     forkUsage: [usage(50_000)],
+    forkTexts: ['OK'],
     limits: [{ kind: 'five_hour', percentUsed: 10, resetsAt: '2026-10-06T05:00:00Z' }],
     contextTokens: undefined,
     stepUsage: usage(50_000, 200),
@@ -145,8 +148,10 @@ export const world = (
   on('model.fork', (_$, e) => {
     w.forks.push(e.prompt)
     const answer = w.forkUsage.length > 1 ? w.forkUsage.shift() : w.forkUsage[0]
-    return { value: { isAnswered: true, text: 'OK', usage: answer ?? usage(0) } }
+    const text = w.forkTexts.length > 1 ? (w.forkTexts.shift() ?? 'OK') : (w.forkTexts[0] ?? 'OK')
+    return { value: { isAnswered: true, text, usage: answer ?? usage(0) } }
   })
+
   on('agent.list', () => ({ value: w.agents.map(agent => ({ ...agent })) }))
   on('session.send', (_$, e) => {
     w.sent.push({ to: JSON.stringify(e.to), text: e.text })
@@ -177,6 +182,21 @@ export const world = (
   })
 
   return w
+}
+
+/**
+ * Records every value the mod writes under its own state, by key. A test opts in
+ * with it: a module may register one hook per event, so `world` does not.
+ */
+export const watchState = (on: On): { key: string; value: unknown }[] => {
+  const sets: { key: string; value: unknown }[] = []
+  on('state.set', (_$, e, next) => {
+    if (e.plugin === 'cache-keeper') sets.push({ key: e.key, value: e.value })
+
+    return next(e)
+  })
+
+  return sets
 }
 
 export const boot = async ($: Engine): Promise<void> => {
