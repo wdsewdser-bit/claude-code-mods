@@ -1645,7 +1645,11 @@ export const register: Register = on => {
     const at = Math.min(page, pages - 1)
     const end = events.length - at * PAGE
     const shownEvents = events.slice(Math.max(0, end - PAGE), end)
-    const s = sel === undefined ? undefined : live[sel.jobId]
+    // 已结束的作业不在 live 里：真实上下文仍在它的 status.json，不能退回事件流里 CPA 偏大的预估值。
+    const s =
+      sel === undefined
+        ? undefined
+        : (live[sel.jobId] ?? (root === undefined ? undefined : await readStatus($, jobDir(root, sel.jobId))))
     const current =
       sel?.status === 'running'
         ? s?.lastTool
