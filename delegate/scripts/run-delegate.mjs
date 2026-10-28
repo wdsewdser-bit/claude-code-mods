@@ -379,6 +379,8 @@ const main = async () => {
       })
       // Claude Code caps output at 32000 by default; DS max-effort thinking alone can use all of it.
       env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = gpt ? '128000' : '358000'
+      // CPA 的模型 CC 都不认识，窗口按 200K 处理（约 169K 就自动压缩）；DS 和 GPT 统一放到 400K。
+      env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = '400000'
     }
     // read + ptc: 'only' (the default; ptc: false gives the built-in Read/Grep/Glob/WebFetch): run_code is the only
     // tool, like work's ptc-only, but ptc-run runs it read-only (Node permission model: no writes, no child processes).
