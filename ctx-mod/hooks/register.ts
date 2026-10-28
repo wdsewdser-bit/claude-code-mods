@@ -9,6 +9,7 @@ import { formatArgs, isBackgroundRow, nonTextNote } from './lib/history.ts'
 import { createSession, isHandoffText, looksLikePerson, stripInjected } from './lib/session.ts'
 import type { AgentNote, Env, ImportedMessage, Io, Session } from './lib/session.ts'
 import { describeFill, isCold, limitOf, shouldContinue } from './lib/usage.ts'
+import type { LedgerSnapshot } from './lib/types.ts'
 import { DEFAULTS, OWN_TOOL_PREFIX } from './lib/types.ts'
 
 /** The section of the system prompt, the same all session long. */
@@ -21,6 +22,8 @@ const CONTINUE_TEXT = 'ctx-mod：已换到新的上下文窗口。先用一句�
 const COMMAND = 'ctx-mod'
 const PREFIX = OWN_TOOL_PREFIX
 const KEEPER_CACHE = { plugin: 'cache-keeper', key: 'cache' } as const
+/** cache-keeper's last keepalive's answer: what was still open when the cache went cold. */
+const KEEPER_SNAPSHOT = { plugin: 'cache-keeper', key: 'snapshot' } as const
 
 /** How many main-thread tool calls are kept, to name a result's tool and input. */
 const CALLS_KEPT = 200
@@ -355,6 +358,32 @@ const envOf = async ($: EngineInterface, id: string): Promise<Env> => {
     limit: (await limitFor($, id)) ?? limitOf(undefined, DEFAULTS),
     cache,
     fiveHourPercent,
+  }
+}
+
+
+/**
+ * cache-keeper's snapshot of the tasks still open, as that mod publishes it; none
+ * when the mod is not loaded or its last keepalive read no array out of the answer.
+ */
+const snapshotOf = async ($: EngineInterface): Promise<LedgerSnapshot | null> =>
+  attempt(async () => (await $.state.get(KEEPER_SNAPSHOT)).value ?? null, null)
+
+/**
+ * Books cache-keeper's snapshot of the still-open tasks before a cold switch,
+ * so the handoff that replaces the history carries them. Whatever goes wrong
+ * here is logged and the switch goes on: the ledger is a help, not a gate.
+ */
+const bookSnapshot = async ($: EngineInterface, session: Session): Promise<void> => {
+  try {
+    const snapshot = await snapshotOf($)
+    if (snapshot === null) return
+    const id = await idOf($)
+    if (id === undefined) return
+    const booked = await session.ledgerSnapshot(snapshot, await envOf($, id))
+    if (booked > 0) $.ui.log(`ctx-mod: 保活快照记账 ${booked} 条`, { to: 'debug' })
+  } catch (error) {
+    logError($, 'cold switch snapshot', error)
   }
 }
 
@@ -1601,6 +1630,9 @@ export const register: Register = (on, options) => {
           try {
             // Only a message held for the expired cache calls for a switch: one that queued behind a switch which has since ended just goes in.
             if (isExpired) {
+              // The last keepalive saw the conversation while the cache was still warm: book
+              // what it found still open before the history is replaced.
+              await bookSnapshot($, session)
               switchReason = 'cold'
               try {
                 await $.command.run({ command: 'compact' })

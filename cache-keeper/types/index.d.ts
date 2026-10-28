@@ -15,6 +15,21 @@ declare module 'claude-code' {
         /** `wrapped`: the wrap-up was sent and the session waits for the 5-hour reset. */
         bridgePhase: 'idle' | 'wrapped'
       }
+      /**
+       * What the last keepalive of an idle stretch saw still open in the main
+       * conversation, for a mod that will hand the work to a new window.
+       */
+      snapshot: {
+        /** When the request that asked for it started, in ms; null before the first one. */
+        at: number | null
+        entries: {
+          task_id: string
+          title: string
+          status: 'in_progress' | 'blocked'
+          text: string
+          next_step?: string
+        }[]
+      }
     }
   }
 }

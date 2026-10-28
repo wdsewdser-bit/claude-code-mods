@@ -69,7 +69,7 @@ export const DEFAULTS: Config = {
   boundaryTokens: 250_000,
   softTokens: 300_000,
   urgentTokens: 350_000,
-  coldMinTokens: 100_000,
+  coldMinTokens: 80_000,
   cacheTtlSec: 3_600,
   noContinueAtPercent: 90,
   cooldownRequests: 30,
@@ -306,6 +306,22 @@ export type Snippet =
       lastSeq?: number
       text?: undefined
     }
+
+/**
+ * What cache-keeper's last keepalive of an idle stretch saw still open in the
+ * main conversation, as that mod publishes it under its `snapshot` key.
+ */
+export type LedgerSnapshot = {
+  /** When the keepalive asking for it started, in ms; null before the first one. */
+  at: number | null
+  entries: readonly {
+    task_id: string
+    title: string
+    status: 'in_progress' | 'blocked'
+    text: string
+    next_step?: string
+  }[]
+}
 
 /** cache-keeper's published state, as `$.state` hands it over. */
 export type CacheState = {

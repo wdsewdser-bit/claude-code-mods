@@ -43,6 +43,8 @@ type World = {
   sessionId: string
   /** What `command.run` throws with, when a test wants the compaction to fail. */
   runError: unknown
+  /** The ledger file as it stood the moment `/compact` was run: what the switch had booked by then. */
+  ledgerAtCompact: string | null
   /** Files `$.fs.read` answers with; empty unless a test puts one here, so every other read is denied as before. */
   readable: Map<string, string>
   /** The paths `$.fs.read` was asked for, in order. */
@@ -69,6 +71,8 @@ type World = {
   timeline: string[]
   /** What cache-keeper's published state reads as; none until a test sets it. */
   keeper: Record<string, unknown> | null
+  /** What cache-keeper's `snapshot` key reads as; none until a test sets it. */
+  snapshot: Record<string, unknown> | null
 }
 
 const slashed = (path: string): string => path.replaceAll('\\', '/')
@@ -136,6 +140,7 @@ const world = (
     answered: undefined,
     sessionId: id,
     runError: undefined,
+    ledgerAtCompact: null,
     agents: [],
     spawnAnswer: { model: 'haiku', agentId: 'a1' },
     stepUsage: null,
@@ -146,6 +151,7 @@ const world = (
     submits: [],
     timeline: [],
     keeper: null,
+    snapshot: null,
     writeGate: undefined,
   }
   mock.env(on, { USERPROFILE: HOME, ...env })
@@ -163,7 +169,11 @@ const world = (
     return text === undefined ? { deny: `ENOENT: ${e.path}` } : ({ value: text } as never)
   })
   // Like every bottom answer, wrapped once more: the read itself is { value, version }.
-  on('state.get', () => ({ value: { value: w.keeper ?? undefined, version: 1 } }) as never)
+  on('state.get', (_$, e) => {
+    const held = (e as { key?: string }).key === 'snapshot' ? w.snapshot : w.keeper
+
+    return { value: { value: held ?? undefined, version: 1 } } as never
+  })
   on('session.id', () => ({ value: w.sessionId }))
   on('session.messages', () => ({ value: w.messages }) as never)
   on('session.usage', () => ({
@@ -231,6 +241,7 @@ const world = (
   on('command.run', async ($, e) => {
     w.runs.push(e.command)
     w.timeline.push(`run:${e.command}`)
+    if (e.command === 'compact') w.ledgerAtCompact = fileAt(w, 'ledger.jsonl') ?? ''
     if (w.runError !== undefined) throw w.runError
     if (e.command === 'compact' && w.compactsOnRun) {
       // The engine's own `/compact`: what core raises once the command returns.
@@ -1508,6 +1519,122 @@ test('a held message that cannot be written down goes in as usual and no switch 
   await w.clock.advance(300)
   await w.clock.settle()
   expect(w.runs).toEqual([])
+})
+
+test('a cold cache holds a prompt from 80k of context', async ($, on) => {
+  const w = world(on, 's-cold-80k', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  // 80k is where the cold rule starts: from it the window is worth switching.
+  w.usage.tokens = 80_000
+  expect(isDropped(await sayWhileCold($, '刚好到线'))).toBe(true)
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:刚好到线'])
+})
+
+test('a cold cache below 80k lets the prompt in: the switch would not pay', async ($, on) => {
+  const w = world(on, 's-cold-79k', { CTX_MOD: '1' })
+  await boot($)
+  await personRequest($, '先做点事', 'person-1')
+  w.usage.tokens = 79_999
+  w.keeper = { expiresAt: 1, lastActivityAt: 0, ttl: '1h', cachedPrefixTokens: 0, isEnabled: true, pausedReason: null, bridgePhase: 'idle' }
+  expect(isDropped(await sayWhileCold($, '差一点'))).toBe(false)
+  expect(w.runs).toEqual([])
+})
+
+// ---- 冷换窗前消费 cache-keeper 的保活快照 ----
+
+/** A snapshot as cache-keeper publishes one: when it answered, and what was still open. */
+const snapshotOf = (at: number, entries: Record<string, unknown>[]): Record<string, unknown> => ({ at, entries })
+
+const SNAPSHOT_ENTRY = {
+  task_id: 'keepalive-task',
+  title: '补记账本',
+  status: 'in_progress',
+  text: '保活时看到改了一半',
+  next_step: '跑测试',
+}
+
+const ledgerText = (w: World): string => fileAt(w, 'ledger.jsonl') ?? ''
+
+test('a cold switch books the keepalive snapshot before it compacts, and the handoff carries it', async ($, on) => {
+  const w = world(on, 's-snap-book', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  w.snapshot = snapshotOf(Date.now(), [SNAPSHOT_ENTRY])
+  await sayWhileCold($, '换完接着做')
+  await w.clock.advance(300)
+  await w.clock.settle()
+
+  // Booked before the compaction ran, so the handoff that replaced the history named it.
+  expect(w.ledgerAtCompact ?? '').toContain('keepalive-task')
+  expect(w.ledgerAtCompact ?? '').toContain('保活快照：')
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:换完接着做'])
+})
+
+test('the same snapshot is consumed once: a second cold switch books nothing more', async ($, on) => {
+  const w = world(on, 's-snap-once', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  w.snapshot = snapshotOf(Date.now(), [SNAPSHOT_ENTRY])
+  await sayWhileCold($, '第一次')
+  await w.clock.advance(300)
+  await w.clock.settle()
+  const afterFirst = ledgerText(w).split('\n').filter(line => line.trim() !== '').length
+
+  await goCold($, w)
+  await sayWhileCold($, '第二次')
+  await w.clock.advance(300)
+  await w.clock.settle()
+  const afterSecond = ledgerText(w).split('\n').filter(line => line.trim() !== '').length
+  expect(afterSecond).toBe(afterFirst)
+})
+
+test('a snapshot older than the last real main-thread request is not booked', async ($, on) => {
+  const w = world(on, 's-snap-stale', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  // A real main-thread request has run since the keepalive answered.
+  await step($, 0)
+  w.snapshot = snapshotOf(1, [SNAPSHOT_ENTRY])
+  await sayWhileCold($, '换完再说')
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(ledgerText(w)).not.toContain('keepalive-task')
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:换完再说'])
+})
+
+test('an entry the ledger would refuse is skipped alone: the rest is booked and the switch goes on', async ($, on) => {
+  const w = world(on, 's-snap-part', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  w.snapshot = snapshotOf(Date.now(), [
+    // No next step, and in_progress: the ledger refuses this one on its own.
+    { task_id: 'no-step', title: '没写下一步', status: 'in_progress', text: '进行中' },
+    { task_id: 'blocked-one', title: '缺权限', status: 'blocked', text: '等授权' },
+    SNAPSHOT_ENTRY,
+  ])
+  await sayWhileCold($, '换完再说')
+  await w.clock.advance(300)
+  await w.clock.settle()
+
+  const booked = ledgerText(w)
+  expect(booked).toContain('blocked-one')
+  expect(booked).toContain('keepalive-task')
+  expect(booked).not.toContain('no-step')
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:换完再说'])
+})
+
+test('no snapshot at all changes nothing about a cold switch', async ($, on) => {
+  const w = world(on, 's-snap-none', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  await sayWhileCold($, '换完再说')
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(ledgerText(w)).toBe('')
+  expect(w.timeline).toEqual(['run:compact', 'resubmit:换完再说'])
 })
 
 test('messages a former run left on the shelf are shown once, in order, not sent again', async ($, on) => {
