@@ -44,6 +44,12 @@ try {
   const r=await execute('providers');assert.ok(!JSON.stringify(r).includes('fake-upstream-secret'));assert.ok(!JSON.stringify(r).includes('fake-other-secret'))
   assert.equal(r.providers.find(x=>x.id==='sample').keyMask,'已设置（••••）')
   assert.equal(state['openai-compatibility'][1].keys[0]['api-key'],'fake-upstream-secret')
+  assert.deepEqual(state['openai-compatibility'][1].models.map(m=>m['is-compat']),[true,true])
+ })
+ await test('chat models keep an explicit is-compat choice',async()=>{
+  await execute('save',{id:'sample',protocol:'chat',baseUrl:base+'/v1',models:['m1','m2'],isCompat:false})
+  await execute('save',{id:'sample',protocol:'chat',baseUrl:base+'/v1',models:['m1','m2']})
+  assert.deepEqual(state['openai-compatibility'][1].models.map(m=>m['is-compat']),[false,false])
  })
  await test('fetch-models returns choices without adding them',async()=>{
   const before=JSON.stringify(state);const r=await execute('fetch-models',{id:'sample'})
