@@ -8,6 +8,54 @@ const BROKER = __BROKER__
 // The runner source is ~40KB, over the Windows 32K command-line limit, so it travels on stdin:
 // line 1 = input JSON, rest = runner source. BOOT is the only thing passed on the command line.
 const BOOT = 'const s=require("fs").readFileSync(0,"utf8"),k=s.indexOf("\\n");globalThis.__PTC_IN=s.slice(0,k);(0,eval)(s.slice(k+1))'
+// Read dedup (see src/runner.js): the runner records which line ranges this conversation has already been shown, one
+// file per session/agent in the scope dir. What is still valid is decided here, the way read-dedup does it: an earlier
+// run_code result only counts while its tool_result is still in the Messages-API view of this conversation, so
+// compaction, /clear and a ctx-mod window switch (which compacts) drop the record and every read returns its full text
+// again. Anything unknown fails towards the full text: no record -> dedupReset. Module memory on purpose: a hot reload
+// empties it, and an empty record only means one extra full read.
+type DedupRun = { ids: { id: string; probe: string }[]; cut: boolean }
+const dedupRuns = new Map<string, DedupRun>()
+const DEDUP_MAX_IDS = 20
+/** A short ASCII fragment of what a run_code result showed, to recognise that result in the context later. */
+const dedupProbe = (text: string): string => {
+  for (const line of String(text).split('\n')) {
+    const t = line.trim()
+    if (t.length >= 6 && /^[\x20-\x7e]+$/.test(t)) return t.slice(0, 48)
+  }
+  const t = String(text).trim()
+  return t.length >= 4 ? t.slice(0, 24) : ''
+}
+const DEDUP_CLEARED = /^\s*\[(old )?(tool )?(result|output|content)[^\]]{0,80}(cleared|removed|truncated|omitted|elided)/i
+const dedupBlockText = (content: unknown): string => {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(c => (c && typeof c === 'object' && typeof (c as { text?: unknown }).text === 'string' ? (c as { text: string }).text : ''))
+    .join('')
+}
+/** Whether every recorded run_code result is still in the conversation and still holds its text. */
+const dedupStillLive = (messages: unknown, ids: { id: string; probe: string }[]): boolean => {
+  if (!Array.isArray(messages)) return false
+  const want = new Map(ids.map(i => [i.id, i.probe]))
+  const ok = new Set<string>()
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue
+    const msg = m as { role?: unknown; content?: unknown }
+    if (msg.role !== 'user' || !Array.isArray(msg.content)) continue
+    for (const block of msg.content) {
+      if (!block || typeof block !== 'object') continue
+      const b = block as { type?: unknown; tool_use_id?: unknown; is_error?: unknown; content?: unknown }
+      if (b.type !== 'tool_result' || typeof b.tool_use_id !== 'string' || b.is_error === true) continue
+      const probe = want.get(b.tool_use_id)
+      if (probe === undefined) continue
+      const text = dedupBlockText(b.content)
+      if (text.trim() === '' || DEDUP_CLEARED.test(text)) continue
+      if (probe === '' || text.includes(probe)) ok.add(b.tool_use_id)
+    }
+  }
+  return ok.size === want.size
+}
 const NAME = 'mcp__ptc-run__run_code'
 // On an outer timeout the runner has already been killed, so the hook reads the streaming log and write-op journal it
 // left in the session scope dir. The reader is a separate node process because this hook has no fs access.
@@ -27,7 +75,7 @@ const PARTIAL_READER = 'const fs=require("fs"),path=require("path"),os=require("
 const DESC_PARTS = [
   'Run a JavaScript async-function body in a sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch work (loops, grep+aggregate, edits). timeoutMs is the whole-program timeout (default 300000 ms, max 1800000). root:"D:/abs/dir" makes relative paths, path-less glob/grep and cwd-less bash use that existing absolute directory (tools.root exposes it).',
   'Paths: relative to cwd (or root). On big trees give glob/grep a path or specific pattern. Errors carry .code/.nextAction and "[CODE]" prefix: INVALID_ARGUMENT NOT_FOUND NOT_UNIQUE COUNT_MISMATCH STALE LOCKED EXISTS POLICY_DENIED BUSY OUTPUT_LIMIT RG_UNAVAILABLE RESULT_UNKNOWN.',
-  'tools.read({path,offset?,limit?,numbered?}) (numbered:true -> "N: text" lines with real line numbers). tools.revision({path}) -> 16-hex sha256 prefix of the file content; pass it as expectedRevision to tools.edit (or as {path: revision} to tools.replace) to get STALE and write nothing if the content changed since (works across run_code calls). tools.write({path,content}) (write/edit/replace results are capped at 32 MiB per file: over it nothing is written and OUTPUT_LIMIT is thrown); tools.edit({path,old,new,all?,expect?,expectedRevision?}) -> {replaced,lines} (atomic; the mtime STALE check still applies only if this same program read the file first; expectedRevision adds a cross-call content check; revision-guarded writes also take a cross-process lock (one writer at a time; LOCKED after ~2 s, a lock left by a crash is taken over after 30 s); with all:true pass expect:<count you mean to change>, a different count writes nothing and throws COUNT_MISMATCH).',
+  'tools.read({path,offset?,limit?,numbered?,fresh?}) (numbered:true -> "N: text" lines with real line numbers; it always returns the file text itself, dedup never changes what the program sees). Dedup happens on the program output: a read result printed back unchanged (at least 300 chars) whose content this conversation already showed comes back as a one-line [read-dedup] note, and a changed file as a diff; filtered/partial/transformed prints are never touched, and fresh:true on a read turns dedup off for that program output (PTC_RUN_READ_DEDUP=0 turns it off everywhere). tools.revision({path}) -> 16-hex sha256 prefix of the file content; pass it as expectedRevision to tools.edit (or as {path: revision} to tools.replace) to get STALE and write nothing if the content changed since (works across run_code calls). tools.write({path,content}) (write/edit/replace results are capped at 32 MiB per file: over it nothing is written and OUTPUT_LIMIT is thrown); tools.edit({path,old,new,all?,expect?,expectedRevision?}) -> {replaced,lines} (atomic; the mtime STALE check still applies only if this same program read the file first; expectedRevision adds a cross-call content check; revision-guarded writes also take a cross-process lock (one writer at a time; LOCKED after ~2 s, a lock left by a crash is taken over after 30 s); with all:true pass expect:<count you mean to change>, a different count writes nothing and throws COUNT_MISMATCH).',
   'tools.glob({pattern?:string|string[],path?,sort?:"path"|"modified",details?,offset?,limit?=5000}) and tools.grep({pattern,path?,glob?,ignoreCase?,outputMode?:"content"|"files_with_matches"|"count",before?,after?,multiline?,offset?=0,limit?=500}) -> {items,total,complete,nextOffset} (ripgrep: .gitignore honoured; skips hidden, node_modules, target, .venv, files>2MB). glob items: path, or {path,size,mtime} with details. grep items: {file,line,text<=300} (+uncounted context:true rows), {file,count}, or paths.',
   'tools.replace({pattern(JS regex; lookaround, \\1, named groups ok),replacement($1 ok),path?,glob?,flags?,dryRun?,maxReplacements?,expect?,expectedRevision?}) -> {files,matches,changed,items:[{file,count,lines}],dryRun} (expect: total matches you mean to change; a different count writes nothing and throws COUNT_MISMATCH). Any write that changed several places is listed at the top of the output with its line numbers: check each one was intended.',
   'tools.batch({action:"plan"|"run"|"resume"|"list",operations:[{op:"copy"|"move"|"remove",path,to?}],protect?:string[],root?,toRoot?,id?}): root-relative "/" paths (to is relative to toRoot if given: another dir/drive), <=512 ops, no overwrite, destination parent must exist, no links, protect untouched; preflighted first. plan only journals; run needs operations; resume takes only id (unknown items: checked, not redone); list shows jobs. -> {id,status:"completed"|"partial"|"failed"|"planned",done,failed,unknown,total,detailsRef}.',
@@ -96,6 +144,12 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Compaction (also what ctx-mod's window switch uses) and /clear end the conversation view these records rest on.
+  on('session.compact', async ($, e, next) => {
+    dedupRuns.clear()
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', { tool: NAME }, async ($, e) => {
     const input = e as unknown as { code: string; timeoutMs?: number; maxChars?: number; root?: string }
     const cwd = await $.session.cwd()
@@ -125,6 +179,39 @@ export const register: Register = on => {
     } catch {
       // keep the default scope
     }
+    // Read dedup: one record per session AND agent, so the main loop, every subagent and every delegate job (its own
+    // session id) keep separate ones. dedupReset wipes the record when the earlier results are gone from the context.
+    const dedupOn = ((await $.env.get('PTC_RUN_READ_DEDUP')) || '').trim() !== '0'
+    const dedupTag = agentId ? 'agent-' + String(agentId).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 48) : 'main'
+    const dedupKey = scope + '|' + dedupTag
+    let dedupLive = false
+    if (dedupOn) {
+      const prev = dedupRuns.get(dedupKey)
+      if (prev && prev.ids.length > 0 && !prev.cut) {
+        try {
+          const messages = agentId === undefined
+            ? await $.session.messages({ as: 'api' })
+            : await $.session.messages({ as: 'api', agentId } as never)
+          dedupLive = dedupStillLive(messages, prev.ids)
+        } catch {
+          dedupLive = false
+        }
+      }
+    }
+    /** Records this call's own result as the newest thing the model has seen (its content backs the next dedup). */
+    const noteDedup = (text: string) => {
+      if (!dedupOn) return
+      const id = (e as unknown as { tool_use_id?: string }).tool_use_id
+      if (typeof id !== 'string' || id === '') {
+        dedupRuns.delete(dedupKey) // no id: nothing to check the next call against -> start over
+        return
+      }
+      const cur = dedupRuns.get(dedupKey)
+      const ids = cur && !cur.cut ? cur.ids : []
+      const next = [...ids, { id, probe: dedupProbe(text) }]
+      // Dropping the oldest ids would make the next liveness check blind to them: cut the record and start over.
+      dedupRuns.set(dedupKey, next.length > DEDUP_MAX_IDS ? { ids: [], cut: true } : { ids: next, cut: false })
+    }
     const timeoutMs = Math.min(Math.max(Math.trunc(input.timeoutMs ?? 300000), 1000), 1800000)
     const readLimitRaw = ((await $.env.get('PTC_RUN_DSH_READ_LIMIT')) || '').trim()
     const dshReadLimit = /^\d+$/.test(readLimitRaw) && Number(readLimitRaw) > 0 ? Number(readLimitRaw) : undefined
@@ -149,7 +236,7 @@ export const register: Register = on => {
         (ro ? '\n（只读模式：不会修改项目文件）' : '') + '\n' + ops + '\n' + (parsed.out || '（无输出）')
     }
     try {
-      const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
+      const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, dedup: dedupOn, dedupTag, dedupReset: !dedupLive, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
       const r = await $.process.run(['node', '-e', BOOT], {
         cwd,
         stdin: ro
@@ -160,9 +247,12 @@ export const register: Register = on => {
       if (r.exitCode === 124 || r.exitCode === 137) {
         const partial = await readPartial()
         const extra = r.stdout ? '\n' + r.stdout.slice(0, 2000) : ''
-        return { result: [{ type: 'text', text: partialText(partial) + extra }], isError: true } as never
+        const partialTextOut = partialText(partial) + extra
+        noteDedup(partialTextOut)
+        return { result: [{ type: 'text', text: partialTextOut }], isError: true } as never
       }
       const text = (r.stdout || '') + (r.stderr ? '\n[stderr] ' + r.stderr.slice(0, 2000) : '')
+      noteDedup(text)
       return { result: [{ type: 'text', text }], isError: r.exitCode !== 0 } as never
     } catch (err) {
       const msg = String((err as Error)?.message ?? err)

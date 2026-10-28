@@ -101,3 +101,87 @@ describe('read-only extra read roots (PTC_RUN_READ_ROOTS)', () => {
     expect(desc).not.toContain('Extra readable directories')
   })
 })
+// Read dedup is decided in the hook: it tells the runner whether the earlier run_code results are still in the
+// conversation (dedupReset otherwise), with one record per session and agent. The runner side is covered for real by
+// readdedup.test.mjs.
+const wireDedup = (
+  $: never,
+  on: never,
+  opts: { env?: Record<string, string>; sid?: string; messages?: unknown[]; stdout?: string } = {},
+) => {
+  const o = on as (name: string, fn: (a: never, b: never) => unknown) => void
+  const payloads: Record<string, unknown>[] = []
+  const state = { messages: opts.messages ?? [] as unknown[], calls: 0 }
+  o('session.start', () => ({}))
+  o('session.id', () => ({ value: opts.sid ?? 'sid-dedup' }))
+  o('session.cwd', () => ({ value: 'C:/work/proj' }))
+  o('env.get', (_$, e: { name?: string }) => ({ value: (opts.env ?? {})[String(e.name)] }))
+  o('tool.register', () => ({ value: { tool: 'mcp__ptc-run__run_code' } }))
+  o('session.messages', () => ({ value: state.messages }))
+  o('process.run', (_$, e: { init?: { stdin?: string } }) => {
+    const raw = String(e.init?.stdin ?? '')
+    const first = raw.slice(0, raw.indexOf('\n') === -1 ? raw.length : raw.indexOf('\n'))
+    try { payloads.push(JSON.parse(first)) } catch { payloads.push({ unparsed: true }) }
+    state.calls++
+    return { value: { exitCode: 0, stdout: opts.stdout ?? 'ok', stderr: '' } }
+  })
+  const engine = $ as unknown as { tool: { call: (v: never) => Promise<unknown> } }
+  const call = (extra: Record<string, unknown> = {}) =>
+    engine.tool.call({ tool: 'mcp__ptc-run__run_code', code: 'return 1', description: 'x', ...extra } as never)
+  return { call, payloads, state }
+}
+
+describe('read dedup handshake (PTC_RUN_READ_DEDUP)', () => {
+  test('on by default, one record per session and agent', { timeoutMs: 20_000 }, async ($, on) => {
+    const t = wireDedup($ as never, on as never, { sid: 'sid-a' })
+    await t.call({ tool_use_id: 'toolu_1' })
+    expect(t.payloads[0]?.dedup).toBe(true)
+    expect(t.payloads[0]?.dedupTag).toBe('main')
+    expect(t.payloads[0]?.dedupReset).toBe(true) // nothing recorded yet: never assume the model has seen anything
+    await t.call({ tool_use_id: 'toolu_2', agentId: 'ag-1' })
+    expect(t.payloads[1]?.dedupTag).toBe('agent-ag-1')
+    expect(t.payloads[1]?.dedupReset).toBe(true) // a subagent has its own record
+  })
+
+  test('a live earlier result keeps the record, a cleared one resets it', { timeoutMs: 20_000 }, async ($, on) => {
+    const t = wireDedup($ as never, on as never, { sid: 'sid-b', stdout: 'line one of the output' })
+    await t.call({ tool_use_id: 'toolu_1' })
+    // the host now holds that result
+    t.state.messages = [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: [{ type: 'text', text: 'line one of the output' }] }] }]
+    await t.call({ tool_use_id: 'toolu_2' })
+    expect(t.payloads[1]?.dedupReset).toBe(false)
+    // compaction / /clear: the result is gone
+    t.state.messages = []
+    await t.call({ tool_use_id: 'toolu_3' })
+    expect(t.payloads[2]?.dedupReset).toBe(true)
+    // micro-compaction cleared the text in place
+    t.state.messages = [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_4', content: '[Old tool result content cleared]' }] }]
+    await t.call({ tool_use_id: 'toolu_4' })
+    await t.call({ tool_use_id: 'toolu_5' })
+    expect(t.payloads[4]?.dedupReset).toBe(true)
+  })
+
+  test('PTC_RUN_READ_DEDUP=0 turns it off', { timeoutMs: 20_000 }, async ($, on) => {
+    const t = wireDedup($ as never, on as never, { sid: 'sid-c', env: { PTC_RUN_READ_DEDUP: '0' } })
+    await t.call({ tool_use_id: 'toolu_1' })
+    expect(t.payloads[0]?.dedup).toBe(false)
+  })
+
+  test('without a tool_use_id the next call starts over instead of guessing', { timeoutMs: 20_000 }, async ($, on) => {
+    const t = wireDedup($ as never, on as never, { sid: 'sid-d' })
+    await t.call({ tool_use_id: 'toolu_1' })
+    await t.call({}) // no id: nothing to check against later
+    t.state.messages = [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] }]
+    await t.call({ tool_use_id: 'toolu_3' })
+    expect(t.payloads[2]?.dedupReset).toBe(true)
+  })
+
+  test('readonly payloads carry the same dedup fields (broker path)', { timeoutMs: 20_000 }, async ($, on) => {
+    const t = wireDedup($ as never, on as never, { sid: 'sid-e', env: { PTC_RUN_READONLY: '1' } })
+    await t.call({ tool_use_id: 'toolu_1' })
+    expect(t.payloads[0]?.dedup).toBe(true)
+    expect(t.payloads[0]?.dedupTag).toBe('main')
+    expect(t.payloads[0]?.dedupReset).toBe(true)
+  })
+})
+

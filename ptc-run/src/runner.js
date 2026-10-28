@@ -242,6 +242,316 @@ const checkRevision = (expected, f, label) => {
   if (cur !== expected) throw E("STALE", "revision mismatch for " + label + ": expected " + expected + ", current " + cur + " (nothing was written)", "Re-read the file with tools.read and get the current revision with tools.revision.");
 };
 
+// ---------- read dedup, at the output layer ----------
+// tools.read always returns the real file text: the program may parse it, filter it, count lines or pass it to edit.
+// Dedup touches only what finally comes back to the model - the text console.log printed plus the serialised return
+// value. A read result that the program prints back unchanged (anchored at its first line, contiguous) and whose
+// lines this session/agent already emitted, with the file unchanged, is replaced in that output by one line; if the
+// file changed it becomes a diff. Anything the program transformed (filtered, sliced, JSON-escaped, joined per line)
+// does not match and stays as it is: fewer hits, never a wrong one. The record lives in the scope dir, one file per
+// session and agent (input.dedupTag), so it survives the fresh runner process of every run_code call; the hook
+// decides whether the earlier results are still in the model's context (compaction, /clear, a ctx-mod window switch)
+// and sends dedupReset:true when they are not. PTC_RUN_READ_DEDUP=0 -> input.dedup:false -> no dedup at all.
+const DEDUP_ON = input.dedup !== false;
+const DEDUP_MIN = 300;        // a printed run shorter than this is never replaced
+const DEDUP_DIFF_MAX = 0.5;   // a diff at least this long (share of the run) is not worth it: keep the text
+const DD_CONTEXT = 3, DD_WINDOW = 400, DD_MAX_CELLS = 8000000;
+const DD_FILES_MAX = 60, DD_LINES_MAX = 20000, DD_BYTES_MAX = 8 << 20;
+const DEDUP_TAG = (String(input.dedupTag || "main").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 48)) || "main";
+const dedupFile = path.join(dir, "read-dedup-" + DEDUP_TAG + ".json");
+const ddStats = { runs: 0, hits: 0, savedChars: 0, reads: 0 };
+const ddBase = { hits: 0, savedChars: 0 };
+const ddFiles = new Map(); // key -> { total, hash, used, runs: {tag: ts}, lines: Map<n, {t, s}> }
+const ddReads = [];        // this run: every read, a candidate segment for the output scan
+const ddKept = [];         // this run: segments that went into the output (for the truncation prune)
+let ddRun = null, ddSeq = 0, ddDirty = false, ddFresh = false;
+const ddKey = (f) => (WIN ? f.toLowerCase() : f);
+// Content hash of the file text already in hand: "changed" is decided on content, never on mtime.
+const ddHash = (t) => crypto.createHash("sha256").update(t).digest("hex").slice(0, 16);
+const ddStrip = (s) => (s.endsWith("\r") ? s.slice(0, -1) : s);
+if (DEDUP_ON) {
+  try {
+    if (input.dedupReset === true) fs.unlinkSync(dedupFile);
+  } catch {}
+  if (input.dedupReset !== true) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(dedupFile, "utf8"));
+      if (raw && raw.v === 1) {
+        for (const k of Object.keys(ddStats)) if (typeof (raw.stats || {})[k] === "number") ddStats[k] = raw.stats[k];
+        for (const k of Object.keys(raw.files || {})) {
+          const f = raw.files[k];
+          if (!f || typeof f !== "object") continue;
+          const m = new Map();
+          for (const n of Object.keys(f.lines || {})) {
+            const x = f.lines[n];
+            if (Array.isArray(x) && typeof x[0] === "string") m.set(Number(n), { t: x[0], s: String(x[1] || "") });
+          }
+          ddFiles.set(k, { total: Number(f.total) || m.size, hash: String(f.hash || ""), used: Number(f.used) || 0, runs: f.runs && typeof f.runs === "object" ? f.runs : {}, lines: m });
+        }
+      }
+    } catch {}
+  }
+}
+ddBase.hits = ddStats.hits;
+ddBase.savedChars = ddStats.savedChars;
+// Aligns the freshly read lines (numbered from a) with the cached ones. Undefined when too large to align.
+const ddAlign = (old, a, nt, total) => {
+  const n = nt.length, b = a + n - 1, ops = [];
+  let p = 0;
+  while (p < n) { const l = old.get(a + p); if (!l || l.t !== nt[p]) break; p++; }
+  for (let i = 0; i < p; i++) ops.push({ k: "eq", o: a + i, n: a + i });
+  const reachesEnd = b >= total;
+  if (p < n || reachesEnd) {
+    const from = p === 0 ? Math.max(1, a - DD_WINDOW) : a + p;
+    let to = b + DD_WINDOW;
+    if (reachesEnd) for (const k of old.keys()) if (k > to) to = k;
+    const oNums = [], oTxt = [];
+    for (let k = from; k <= to; k++) { const l = old.get(k); if (l !== undefined) { oNums.push(k); oTxt.push(l.t); } }
+    const nn = n - p, m = oNums.length;
+    if ((nn + 1) * (m + 1) > DD_MAX_CELLS) return undefined;
+    const ids = new Map();
+    const intern = (s) => { let v = ids.get(s); if (v === undefined) { v = ids.size; ids.set(s, v); } return v; };
+    const X = new Int32Array(nn), Y = new Int32Array(m);
+    for (let i = 0; i < nn; i++) X[i] = intern(nt[p + i]);
+    for (let j = 0; j < m; j++) Y[j] = intern(oTxt[j]);
+    const W = m + 1, L = new Int32Array((nn + 1) * W);
+    for (let i = nn - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i * W + j] = X[i] === Y[j] ? L[(i + 1) * W + j + 1] + 1 : Math.max(L[(i + 1) * W + j], L[i * W + j + 1]);
+    const mid = [];
+    let i = 0, j = 0;
+    while (i < nn && j < m) {
+      if (X[i] === Y[j]) { mid.push({ k: "eq", o: oNums[j], n: a + p + i }); i++; j++; }
+      else if (L[i * W + j + 1] >= L[(i + 1) * W + j]) { mid.push({ k: "del", o: oNums[j] }); j++; }
+      else { mid.push({ k: "add", n: a + p + i }); i++; }
+    }
+    while (i < nn) mid.push({ k: "add", n: a + p + i++ });
+    while (j < m) mid.push({ k: "del", o: oNums[j++] });
+    for (const op of mid) ops.push(op);
+  }
+  // Drop deletions that only reflect the alignment window reaching beyond the requested range.
+  let fe = -1, le = -1;
+  for (let i = 0; i < ops.length; i++) if (ops[i].k === "eq") { if (fe < 0) fe = i; le = i; }
+  const out = [];
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    if (op.k !== "del") { out.push(op); continue; }
+    const o = op.o;
+    if (fe < 0) { if (o >= a && (o <= b || reachesEnd)) out.push(op); }
+    else if (i < fe) { if (a === 1 || o - (ops[fe].o - ops[fe].n) >= a) out.push(op); }
+    else if (i > le) { if (reachesEnd || o - (ops[le].o - ops[le].n) <= b) out.push(op); }
+    else out.push(op);
+  }
+  return out;
+};
+const ddRange = (a, b) => (a === b ? String(a) : a + "–" + b);
+const ddFreshHint = (label) => "要强制拿全文：在那次读取上写 fresh:true（tools.read({path:" + JSON.stringify(label) + ", fresh:true})，带 fresh 的程序的输出不做去重）。";
+// The one-line message (same/shifted) or the diff text; kind "full" means: keep the text.
+const ddPlan = (old, a, nt, total, label, fullLen) => {
+  const n = nt.length, b = a + n - 1;
+  const ops = ddAlign(old, a, nt, total);
+  if (!ops) return { kind: "full", reason: "too-large" };
+  let fe = -1, le = -1;
+  for (let i = 0; i < ops.length; i++) if (ops[i].k === "eq") { if (fe < 0) fe = i; le = i; }
+  if (fe < 0) return { kind: "full", reason: "no-overlap", ops };
+  const srcs = [];
+  const unseen = new Array(ops.length).fill(false);
+  for (let i = fe - 1; i >= 0; i--) { const op = ops[i]; if (op.k === "del") continue; if (old.has(op.n + (ops[fe].o - ops[fe].n))) break; unseen[i] = true; }
+  for (let i = le + 1; i < ops.length; i++) { const op = ops[i]; if (op.k === "del") continue; if (old.has(op.n + (ops[le].o - ops[le].n))) break; unseen[i] = true; }
+  let adds = 0, dels = 0, unseenCount = 0;
+  const deltas = new Set();
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    if (unseen[i]) unseenCount++;
+    else if (op.k === "add") adds++;
+    else if (op.k === "del") dels++;
+    else { deltas.add(op.n - op.o); srcs.push(old.get(op.o).s); }
+  }
+  const changes = adds + dels, seenN = n - unseenCount;
+  if (changes === 0 && unseenCount === 0) {
+    const shifted = [...deltas].some((d) => d !== 0);
+    const head = shifted
+      ? "[read-dedup] " + label + " 第 " + ddRange(a, b) + " 行的文本{{where}}已输出过，文件别处有增删（行号偏移 " + ([...deltas].length === 1 ? ((deltas.values().next().value >= 0 ? "+" : "-") + Math.abs(deltas.values().next().value)) : "不一") + "），这段输出已省略。"
+      : "[read-dedup] " + label + " 第 " + ddRange(a, b) + " 行的内容{{where}}已在本上下文中输出过，文件未改动，这段输出已省略。";
+    return { kind: shifted ? "shifted" : "same", ops, text: head + ddFreshHint(label), srcs };
+  }
+  if (changes > 0.3 * seenN) return { kind: "full", reason: "changed " + changes + "/" + seenN + " > 30%", ops };
+  const keep = new Array(ops.length).fill(false);
+  for (let c = 0; c < ops.length; c++) {
+    if (ops[c].k === "eq" || unseen[c]) continue;
+    keep[c] = true;
+    for (const dir of [-1, 1]) {
+      let cnt = 0;
+      for (let t = c + dir; t >= 0 && t < ops.length && !unseen[t] && cnt < DD_CONTEXT; t += dir) { keep[t] = true; if (ops[t].k === "eq") cnt++; }
+    }
+  }
+  const displayed = new Set(), body = [];
+  let i = 0;
+  while (i < ops.length) {
+    if (unseen[i]) {
+      const block = [];
+      let first = 0, last = 0;
+      for (; i < ops.length && unseen[i]; i++) {
+        const op = ops[i];
+        if (op.k === "del") continue;
+        const num = op.n;
+        if (block.length === 0) first = num;
+        last = num; displayed.add(num);
+        block.push(num + "\t" + nt[num - a]);
+      }
+      body.push("@@ 此前未见 第 " + ddRange(first, last) + " 行（原文） @@", ...block);
+      continue;
+    }
+    if (!keep[i]) { i++; continue; }
+    const hunk = [];
+    let first, last;
+    for (; i < ops.length && keep[i]; i++) {
+      const op = ops[i];
+      if (op.k === "del") { hunk.push("-" + op.o + "\t" + old.get(op.o).t); continue; }
+      const num = op.n;
+      if (first === undefined) first = num;
+      last = num; displayed.add(num);
+      hunk.push((op.k === "add" ? "+" : " ") + num + "\t" + nt[num - a]);
+    }
+    body.push(first === undefined ? "@@ @@" : "@@ 新第 " + ddRange(first, last) + " 行 @@", ...hunk);
+  }
+  const head = "[read-dedup] " + label + " 第 " + ddRange(a, b) + " 行的内容{{where}}已输出过，这里只显示变动和此前未见的行（\" \"上下文，\"-\"已删除（旧行号），\"+\"新增/改动（新行号）；\"此前未见\"块为原文；未列出的行与之前相同，行号以新行号为准）。" + ddFreshHint(label);
+  const text = [head, ...body].join(NL);
+  if (text.length >= fullLen * DEDUP_DIFF_MAX) return { kind: "full", reason: "diff-not-smaller", ops };
+  return { kind: "diff", ops, text, displayed, srcs };
+};
+// Folds a printed run into the cached lines. displayed = new line numbers the output shows ("all" for the whole run).
+const ddCommit = (old, a, nt, tag, ops, displayed) => {
+  const n = nt.length, b = a + n - 1;
+  const oldOf = new Map();
+  let shifted = ops === undefined;
+  for (const op of ops || []) if (op.k === "eq") { oldOf.set(op.n, op.o); if (op.n !== op.o) shifted = true; }
+  const fresh = [];
+  for (let i = 0; i < n; i++) {
+    const num = a + i, o = oldOf.get(num);
+    const keepOld = displayed !== "all" && !displayed.has(num) && o !== undefined && old.has(o);
+    fresh.push([num, { t: nt[i], s: keepOld ? old.get(o).s : tag }]);
+  }
+  for (const op of ops || []) if (op.k === "del") old.delete(op.o);
+  if (shifted) for (const k of [...old.keys()]) if (k < a || k > b) old.delete(k);
+  for (let k = a; k <= b; k++) old.delete(k);
+  for (const [k, l] of fresh) old.set(k, l);
+};
+const ddEnsureRun = () => (ddRun === null ? (ddRun = "r" + (++ddStats.runs)) : ddRun);
+// Remembers one read so the output scan can recognise its text later. Nothing is stored here: only what the program
+// actually prints (or returns) becomes part of the record, so the model is never told it saw something it did not.
+// numbered:true records the "N: text" form the DSH read's .text getter produces (the raw form is recorded too).
+const ddNoteRead = (f, a, lines, total, hash, fresh, numbered) => {
+  if (!DEDUP_ON) return;
+  if (fresh === true) { ddFresh = true; return; }
+  if (lines.length === 0) return;
+  ddReads.push({ key: ddKey(f), label: rel(f), a: a, total: total, lines: lines, hash: hash, numbered: numbered === true });
+};
+// Decides one printed run: undefined = keep the text, a string = the replacement (hint or diff).
+const ddCandidate = (r, nt, segLen, tag) => {
+  const label = r.label;
+  let entry = ddFiles.get(r.key);
+  const keepAll = (e) => {
+    ddCommit(e.lines, r.a, nt, tag, ddAlign(e.lines, r.a, nt, r.total), "all");
+    e.hash = r.hash; e.used = Date.now(); e.runs[ddRun] = e.runs[ddRun] || Date.now();
+    ddFiles.set(r.key, e); ddDirty = true; ddStats.reads++;
+    return undefined;
+  };
+  if (!entry) return keepAll({ total: r.total, hash: r.hash, used: 0, runs: {}, lines: new Map() });
+  const plan = ddPlan(entry.lines, r.a, nt, r.total, label, segLen);
+  if (plan.kind === "full") return keepAll(entry);
+  if (plan.kind === "diff" && plan.text.length >= segLen * DEDUP_DIFF_MAX) return keepAll(entry);
+  const srcs = [...new Set(plan.srcs || [])].filter((s) => typeof s === "string" && s);
+  let where = "此前";
+  if (srcs.length > 0) {
+    const run = srcs[0].split(".")[0];
+    const ts = Number(entry.runs[run]);
+    where = ts ? "在第 " + String(run).slice(1) + " 次 run_code 读取（" + new Date(ts).toTimeString().slice(0, 5) + "）时" : "此前";
+  }
+  const text = plan.text.split("{{where}}").join(where);
+  ddCommit(entry.lines, r.a, nt, tag, plan.ops, plan.displayed || new Set());
+  entry.hash = r.hash; entry.used = Date.now(); entry.runs[ddRun] = entry.runs[ddRun] || Date.now();
+  ddFiles.set(r.key, entry); ddDirty = true;
+  ddStats.hits++; ddStats.savedChars += Math.max(0, segLen - text.length);
+  return text;
+};
+// Replaces, in the program's own output, every read result the program printed back unchanged (and contiguous).
+const ddApply = (text) => {
+  if (!DEDUP_ON || ddFresh || ddReads.length === 0 || !text) return text;
+  const cands = [], seen = new Set();
+  for (const r of ddReads) {
+    // The text as the program would have printed it (DSH .text adds the line numbers).
+    const cmp = r.numbered ? r.lines.map((l, i) => (r.a + i) + ": " + l) : r.lines;
+    const l0 = cmp[0];
+    if (!l0 || l0.trim() === "") continue;
+    let pos = text.indexOf(l0), guard = 0;
+    while (pos >= 0 && guard++ < 20) {
+      let end = pos + l0.length, i = 1;
+      while (i < cmp.length) {
+        let p = end;
+        while (p < text.length && text.charCodeAt(p) === 13) p++;
+        if (text.charCodeAt(p) !== 10) break;
+        p++;
+        const ln = cmp[i];
+        if (!text.startsWith(ln, p)) break;
+        end = p + ln.length; i++;
+      }
+      // Only the whole read counts: a prefix, a slice or a filtered version is a transformation - keep it as it is.
+      if (i === cmp.length && !seen.has(pos)) { seen.add(pos); cands.push({ r: r, pos: pos, end: end, n: i }); }
+      pos = text.indexOf(l0, pos + 1);
+    }
+  }
+  if (cands.length === 0) return text;
+  cands.sort((x, y) => x.pos - y.pos || y.end - x.end);
+  let out = "", cur = 0, changed = false;
+  for (const c of cands) {
+    if (c.pos < cur) continue;
+    const seg = text.slice(c.pos, c.end);
+    if (seg.length < DEDUP_MIN) continue;
+    const tag = ddEnsureRun() + "." + (++ddSeq);
+    const rep = ddCandidate(c.r, c.r.lines.slice(0, c.n), seg.length, tag);
+    if (rep === undefined) {
+      const start = out.length + (c.pos - cur);
+      ddKept.push({ tag: tag, start: start, end: start + seg.length });
+      continue;
+    }
+    out += text.slice(cur, c.pos) + rep;
+    cur = c.end; changed = true;
+  }
+  if (!changed) return text;
+  return out + text.slice(cur);
+};
+// When the output gets truncated, the lines that fell into the dropped middle never reached the model: forget them.
+const ddPrune = (from, to) => {
+  if (ddKept.length === 0 || to <= from) return;
+  const dropped = new Set(ddKept.filter((k) => k.start >= from && k.end <= to).map((k) => k.tag));
+  if (dropped.size === 0) return;
+  for (const e of ddFiles.values()) for (const [num, l] of [...e.lines]) if (dropped.has(l.s)) e.lines.delete(num);
+  ddDirty = true;
+};
+// Persists the record: everything in ddFiles is text the model has actually been shown.
+const ddSave = () => {
+  if (!DEDUP_ON || !ddDirty) return;
+  const rows = [];
+  for (const [k, e] of ddFiles) {
+    if (e.lines.size === 0 || e.lines.size > DD_LINES_MAX) continue;
+    const lines = {};
+    for (const [num, l] of e.lines) lines[num] = [l.t, l.s];
+    rows.push([k, { total: e.total, hash: e.hash, used: e.used, runs: e.runs, lines: lines }]);
+  }
+  rows.sort((x, y) => (y[1].used || 0) - (x[1].used || 0));
+  const files = {};
+  let bytes = 0, kept = 0;
+  for (const [k, v] of rows) {
+    const s = JSON.stringify(v);
+    if (kept >= DD_FILES_MAX || bytes + s.length > DD_BYTES_MAX) continue;
+    files[k] = v; bytes += s.length; kept++;
+  }
+  try {
+    const t = tmpName(dedupFile);
+    fs.writeFileSync(t, JSON.stringify({ v: 1, stats: ddStats, files: files }));
+    renameRetry(t, dedupFile);
+  } catch {}
+};
+
 // ---------- atomic write ----------
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const renameRetry = (a, b) => {
@@ -405,15 +715,21 @@ const BG_WRAP2 = 'const fs=require("fs"),cp=require("child_process");const [id,d
 
 // ---------- tools: read / write / edit / bash ----------
 const tools = {};
-tools.read = ({ path: p, offset = 0, limit, numbered = false } = {}) => {
+tools.read = ({ path: p, offset = 0, limit, numbered = false, fresh = false } = {}) => {
   reqStr(p, "path"); credGuard(p);
   const f = abs(p), t = fs.readFileSync(f, "utf8");
+  // Always the real text: the program may parse it, filter it or pass it to edit. Dedup only happens to what the
+  // program then prints (see ddApply); the mtime below keeps edit's STALE check working either way.
   readState[f] = fs.statSync(f).mtimeMs;
-  if (!offset && limit === undefined && !numbered) return t;
   const ls = t.split(NL);
   if (ls.length > 1 && ls[ls.length - 1] === "") ls.pop(); // a trailing newline terminates the last line, it does not start another
+  if (!offset && limit === undefined && !numbered) {
+    ddNoteRead(f, 1, ls.map(ddStrip), ls.length, ddHash(t), fresh);
+    return t;
+  }
   const part = ls.slice(offset, limit === undefined ? undefined : offset + limit);
-  // numbered: "N: text" with the file's real 1-based line numbers (CR stripped)
+  // numbered: "N: text" with the file's real 1-based line numbers (CR stripped); the numbers stop it from matching
+  if (!numbered && part.length > 0) ddNoteRead(f, offset + 1, part.map(ddStrip), ls.length, ddHash(t), fresh);
   return numbered ? part.map((x, i) => (offset + i + 1) + ": " + x.replace(/\r$/, "")).join(NL) : part.join(NL);
 };
 tools.revision = (a) => {
@@ -1328,6 +1644,7 @@ dsh.read = dshWrap("read", (a) => {
   if (all.length > 1 && all[all.length - 1] === "") all.pop();
   const lines = all.slice(off - 1, off - 1 + lim).map((s, i) => ({ number: off + i, text: s.length > DSH_LINE_CAP ? s.slice(0, DSH_LINE_CAP) + "...[line truncated]" : s }));
   const r = { path: rel(f), offset: off, lines, totalLines: all.length };
+  const range = all.slice(off - 1, off - 1 + lim).map(ddStrip);
   const end = off - 1 + lines.length;
   if (explicit === undefined && DSH_READ_LIMITED && end < all.length) {
     r.more = "lines " + off + "-" + end + " of " + all.length + " shown; read with offset=" + (end + 1) + " for more";
@@ -1340,6 +1657,12 @@ dsh.read = dshWrap("read", (a) => {
   Object.defineProperty(r, "text", { get() { return lines.map((l) => (l.kind ? l.text : l.number + ": " + l.text)).join(NL); }, enumerable: false });
   // content: only the file's real lines, joined with \n (no notice, no line numbers), so it can be parsed or edited.
   Object.defineProperty(r, "content", { get() { return lines.filter((l) => !l.kind).map((l) => l.text).join(NL); }, enumerable: false });
+  // The result is always the real one; if the program prints r.text back unchanged, the output scan may elide it.
+  if (range.length > 0) {
+    const h = ddHash(t);
+    ddNoteRead(f, off, range, all.length, h, a.fresh === true, false);
+    ddNoteRead(f, off, range, all.length, h, a.fresh === true, true); // r.text prints "N: text"
+  }
   return r;
 });
 dsh.write = dshWrap("write", (a) => {
@@ -1703,6 +2026,8 @@ const AF = Object.getPrototypeOf(async function () {}).constructor;
   }
   let body = lines.join(NL);
   if (out !== undefined) body += (body ? NL : "") + fmt(out);
+  // Output-layer dedup: only the program's own output (console.log + returned value) is touched, never a tool result.
+  body = ddApply(body);
   let text = body;
   if (!err) { const w = multiText(); if (w) text = w + (body ? NL + NL + body : ""); }
   if (err) {
@@ -1717,6 +2042,8 @@ const AF = Object.getPrototypeOf(async function () {}).constructor;
     const et = errText(err);
     text = et ? et + NL + NL + m + (body ? NL + NL + body : "") : opsText() + NL + NL + m + (body ? NL + NL + body : "");
   }
+  const ddHits = ddStats.hits - ddBase.hits, ddSaved = ddStats.savedChars - ddBase.savedChars;
+  if (DEDUP_ON && ddHits > 0) text += (text ? NL + NL : "") + "[read-dedup] 本次 " + ddHits + " 段输出以提示/差异代替，省 " + ddSaved + " 字符；会话累计 " + ddStats.hits + " 次 / " + ddStats.savedChars + " 字符（记录：cc-ptc/" + scope + "/read-dedup-" + DEDUP_TAG + ".json；关闭：PTC_RUN_READ_DEDUP=0）";
   if (text.length > MAX) {
     const id = ref.put(text);
     // Cut on line boundaries and say which output lines / chars were dropped, so the model re-reads only that part.
@@ -1725,11 +2052,14 @@ const AF = Object.getPrototypeOf(async function () {}).constructor;
     if (headEnd <= 0) headEnd = Math.max(0, MAX - tailLen);
     let tailStart = text.indexOf(NL, text.length - tailLen);
     if (tailStart < 0 || tailStart <= headEnd) tailStart = text.length - tailLen;
+    // Lines that fall into the dropped middle never reach the model: forget them instead of claiming they did.
+    ddPrune(headEnd - (text.length - body.length), tailStart - (text.length - body.length));
     const lineAt = (i) => text.slice(0, i).split(NL).length;
     const totalLines = text.split(NL).length;
     const fromLine = lineAt(headEnd) + 1, toLine = lineAt(tailStart);
     text = text.slice(0, headEnd) + NL + "…[省略输出第 " + fromLine + "–" + toLine + " 行（共 " + totalLines + " 行，" + (tailStart - headEnd) + " 字），完整内容 ref " + id + "]…" + text.slice(tailStart) + NL +
       "输出被截断（上限 " + MAX + " 字）：只补读缺的部分，ref.text(\"" + id + "\", {from: " + headEnd + ", to: " + tailStart + "}) 取回被省略的中段；或缩小打印范围；确需一次看全再传 maxChars:N（最大 50000）";
   }
+  ddSave();
   process.stdout.write(text || "(run_code completed with no output)", () => { closeLog(); process.exit(err ? 2 : 0); });
 })();
