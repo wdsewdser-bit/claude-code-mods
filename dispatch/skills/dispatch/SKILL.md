@@ -24,12 +24,13 @@ description: 根代理需要派发时加载：分包、模型与档位、精简�
 
 | subagent_type | 默认模型 / 档位 | 工具与用途 |
 |---|---|---|
-| worker-ptc | Haiku 5.5 / low | 只有 run_code（程序内 read/grep/edit/bash）；Claude 端代码、脚本、配置执行包的默认选择 |
-| worker | Haiku 5.5 / low | Read、Grep、Glob、Edit、Write、Bash、LSP；需要 LSP、交互式逐步排查，或 worker-ptc 做过一次仍不稳时用 |
+| worker-ptc | Haiku 5.5 / low | run_code（程序内 read/grep/edit/bash）+ 只看图片/PDF 的 Read；Claude 端代码、脚本、配置执行包的默认选择，要看图也用它 |
+| worker | Haiku 5.5 / low | run_code + LSP + 看图用的 Read；只在需要 LSP 语义信息（定义、引用、类型）时用 |
 | researcher | Haiku 5.5 / low | Read、Grep、Glob、WebFetch、WebSearch；文件定位和公开资料核查 |
-| browser-worker | Haiku 5.5 / high | 文件工具、Bash、Claude_Browser MCP；浏览器交互和视觉验收 |
-| artifact-worker | Haiku 5.5 / high | 文件工具、Bash、Artifact；文档、幻灯片、表格和媒体产物 |
+| browser-worker | Haiku 5.5 / high | run_code + 看图用的 Read + Claude_Browser MCP；浏览器交互和视觉验收 |
+| artifact-worker | Haiku 5.5 / high | run_code + 看图用的 Read + Artifact；文档、幻灯片、表格和媒体产物 |
 
+- 执行类代理（worker-ptc、worker、browser-worker、artifact-worker）的文件和命令一律走 run_code，另配的 Read 只用来看图片和 PDF（2026-10-29 用户决定，不按文件类型硬拦截，靠提示词约束）；不要为了看图或某个专用工具改派全工具类型。
 - 用同一责任域需要的稳定配置，不给每个小任务生成新类型。worker-ptc / worker 可单次覆盖为 Opus，无需复制一套角色文件。需要 Claude 端执行时默认派 worker-ptc（用户 2026-10-18 决定，仍在适配期，发现问题记下并改提示）。
 - 这些配置使用 omitClaudeMd: true。派发包必须传入本任务有关的项目规则、允许路径、权限边界和验收要求；不得用省提示词为理由省掉安全约束。
 - 工具池在启动时确定；续用不能靠一条消息获得未授予的浏览器、Artifact 或 Skill 工具。工具范围改变时用对应配置新建并传短交接。
