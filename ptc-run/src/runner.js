@@ -1224,6 +1224,13 @@ const checkId = (id) => { if (typeof id !== "string" || !ID_RE.test(id)) throw E
 const refFile = (id) => path.join(dir, id + ".json");
 const jobFile = (id) => path.join(jobsDir, id + ".json");
 const newId = (p) => p + Date.now().toString(36) + crypto.randomBytes(3).toString("hex");
+// Named JSON values (ref.store / ref.load): one file per key in the same scope dir as refs, prefixed "kv-" so it
+// never looks like a generated ref id (those start with "r"/"j"). The startup sweep matches *.json, so a stored value
+// lives 24h like a ref.
+const KV_KEY_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const KV_MAX_BYTES = 8 * 1024 * 1024;
+const kvFile = (key) => path.join(dir, "kv-" + key + ".json");
+const checkKey = (key) => { if (typeof key !== "string" || !KV_KEY_RE.test(key)) throw E("INVALID_ARGUMENT", "invalid ref.store/ref.load key", "Use 1-64 characters from A-Za-z0-9_.- as the key."); return key; };
 const ENVELOPE = 96;
 const pageRows = (rows, offset, limit, maxBytes, extra) => {
   const total = rows.length, items = [];
@@ -1290,6 +1297,26 @@ const ref = {
     checkId(id);
     if (!fs.existsSync(refFile(id)) && fs.existsSync(jobFile(id))) throw E("POLICY_DENIED", "job logs are read-only", "Job logs are kept for recovery; just stop using the id.");
     try { fs.unlinkSync(refFile(id)); return true; } catch { return false; }
+  }),
+  // Named values a later run_code needs again. Same dir and lifetime as refs; atomic overwrite, so a concurrent reader
+  // never sees a half-written value. Read-only mode keeps ref.load and refuses ref.store (store writes a file).
+  store: guard((key, value) => {
+    if (RO) throw E("POLICY_DENIED", "ref.store is disabled in read-only mode", "This run_code is read-only: use read, glob, grep and ref.*; report the change or command instead of making it.");
+    checkKey(key);
+    let s;
+    try { s = JSON.stringify(value); } catch (e) { throw E("INVALID_ARGUMENT", "value is not JSON-serializable: " + String((e && e.message) || e), "Pass plain JSON data (no cycles, BigInt or functions)."); }
+    if (s === undefined) throw E("INVALID_ARGUMENT", "value is not JSON-serializable", "Pass JSON data.");
+    const bytes = Buffer.byteLength(s);
+    if (bytes > KV_MAX_BYTES) throw E("OUTPUT_LIMIT", "value is " + bytes + " bytes, over the " + (KV_MAX_BYTES / 1048576) + " MiB ref.store limit (" + KV_MAX_BYTES + " bytes); nothing was written", "Store a ref id instead (ref.put) and keep that, or store less data.");
+    atomicWrite(kvFile(key), s);
+    return { key, bytes };
+  }),
+  // Missing or expired (24h sweep) -> undefined, never an error: a later run_code just stores it again.
+  load: guard((key) => {
+    checkKey(key);
+    let raw;
+    try { raw = fs.readFileSync(kvFile(key), "utf8"); } catch (e) { if (e.code === "ENOENT") return undefined; throw e; }
+    try { return JSON.parse(raw); } catch { return undefined; }
   }),
 };
 ref.del = ref.release;

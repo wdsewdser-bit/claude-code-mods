@@ -13,6 +13,7 @@
 - `tools.bash`：同步执行一条命令，默认超时 120000 ms；`background:true` 转后台任务（上限 2 小时）。
 - `tools.parallel([{command,cwd?,timeoutMs?}], {concurrency})`：并发执行多条命令，默认并发 4（最大 16），单次最多 64 条；按输入顺序返回；单项超时不影响其他项，结束时清理子进程。
 - `ref.put / page / text / release`：输出超过 8000 字符（可用 `maxChars` 调整，最大 50000）时保留前约 70% 和后 30%，中段落盘成 ref，按需分页读取（`ref.page` 默认每页 50 条、单条上限 16384 字节）。ref 存在系统临时目录 `cc-ptc/` 下，保留 24 小时。
+- `ref.store(key,value)` / `ref.load(key)`：按名字存一个 JSON 值，供后面的 `run_code` 直接取用，不用重复打印或重跑。key 限 1–64 位 `[A-Za-z0-9_.-]`，值上限 8 MB；存在同一会话目录下的 `kv-<key>.json`，和 ref 一样保留 24 小时，同名覆盖（原子写）。`ref.store` 返回 `{key,bytes}`；`ref.load` 在不存在或已过期时返回 `undefined`，不抛错。只读模式下只有 `ref.load` 可用。
 - `run_code` 整程序默认超时 300000 ms（最大 1800000 ms）；`root:"D:/abs/dir"` 可把相对路径、glob/grep 和 bash 的基准目录切到该目录。
 
 错误带 `[CODE]` 前缀和 `nextAction` 提示。
