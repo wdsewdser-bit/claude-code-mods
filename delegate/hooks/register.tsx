@@ -761,6 +761,40 @@ const cwdProblem = async (
   return undefined
 }
 
+// GPT 的提示缓存闲置久了就会被清掉（官方说法一般 5–10 分钟，最长 1 小时），续用一个闲置太久的大上下文代理，
+// 第一轮整段上下文按未命中重读，吃订阅额度。这种续用先拦一次并说明代价；原样再发一次、或 10 分钟内再发就放行。
+// DS 的缓存能留几小时，也不占 Claude 额度，不拦。
+// 和 CC 的缓存保活周期一致（1h TTL 提前 5 分钟）；实测 TTL 出来前先用这个。
+const GPT_COLD_MINUTES = 55
+const GPT_COLD_MIN_TOKENS = 60_000
+const RESEND_MINUTES = 10
+const heldResumes = new Map<string, { at: number; task: string }>()
+
+const coldResumeNotice = async (
+  $: EngineInterface,
+  target: Agent,
+  old: JobRecord | undefined,
+  task: string,
+): Promise<string | undefined> => {
+  if (target !== 'gpt' || old === undefined || old.status === 'running' || old.endedAt === undefined) return undefined
+  const id = old.sessionId ?? old.jobId
+  const now = Date.now()
+  const held = heldResumes.get(id)
+  if (held !== undefined) {
+    heldResumes.delete(id)
+    if (held.task === task || now - held.at < RESEND_MINUTES * 60_000) return undefined
+  }
+  const idle = now - old.endedAt
+  if (idle <= GPT_COLD_MINUTES * 60_000) return undefined
+  const root = await rootOf($)
+  if (root === undefined) return undefined
+  const { context } = usageOf(await readEventLines($, jobDir(root, old.jobId)))
+  if (context <= GPT_COLD_MIN_TOKENS) return undefined
+  heldResumes.set(id, { at: now, task })
+
+  return `delegate: GPT 代理 ${id} 已闲置 ${spanOf(idle)}，提示缓存很可能已经过期，续用第一轮要按未命中重读约 ${tokensOf(context)} token 的上下文，计入 GPT 订阅额度。建议新建一个 GPT 代理，用它最后的报告加文件路径写个短交接；若仍要续用，原样再发一次。`
+}
+
 const callTool = async (
   $: EngineInterface,
   target: Agent,
@@ -776,6 +810,8 @@ const callTool = async (
       isError: true,
     }
   }
+  const coldNotice = await coldResumeNotice($, target, old, task)
+  if (coldNotice !== undefined) return { result: coldNotice, isError: true }
   const given = typeof input.cwd === 'string' && input.cwd !== '' ? input.cwd : undefined
   let cwd = given ?? old?.cwd
   let cwdNote = ''

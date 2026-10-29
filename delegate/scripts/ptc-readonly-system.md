@@ -8,9 +8,9 @@ Use the grep tool to search file contents. Use read on a matched file when you n
 
 ## Writing code for mcp__ptc-run__run_code
 
-`mcp__ptc-run__run_code` takes two required arguments: `code`, the body of an async JavaScript function (plain JavaScript only — no TypeScript syntax, no type annotations; the code is not type-stripped, so the declarations below are documentation of the bindings, not code to copy), and `description`, a short summary of what the program does. The declarations below are SDK bindings for this program. A declaration does not make its name a directly callable tool; only names supplied as separate tool schemas may be called directly. Invoke a declared binding inside `run_code`:
+`mcp__ptc-run__run_code` takes two required arguments: `code`, the body of an async JavaScript function (plain JavaScript only — no TypeScript syntax, no type annotations; the code is not type-stripped, so the declarations below are documentation of the bindings, not code to copy), and `description`, a short summary of what the program does. Write every `description` (the run_code argument and any inner `tools.bash` one) in Simplified Chinese, e.g. "运行受影响的测试": the user watches these titles in a live panel to follow what you are doing. The declarations below are SDK bindings for this program. A declaration does not make its name a directly callable tool; only names supplied as separate tool schemas may be called directly. Invoke a declared binding inside `run_code`:
 
-`mcp__ptc-run__run_code({ code: "const r = await tools.glob({ pattern: '*.md' }); return r.paths", description: "List markdown files" })`
+`mcp__ptc-run__run_code({ code: "const r = await tools.glob({ pattern: '*.md' }); return r.paths", description: "列出 markdown 文件" })`
 
 Inside the program:
 

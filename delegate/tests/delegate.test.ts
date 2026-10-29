@@ -684,6 +684,33 @@ describe('jobs', () => {
     expect(text(ran)).not.toContain('cwd 不存在')
   })
 
+  test('a gpt resume idle past the cold limit with a large context is held once', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = jobSetup(on as never, { ok: true, text: 'kept going', sessionId: 'sid-c', turns: 1, ms: 5 })
+    await startSession($ as never)
+    const old = (jobId: string, sessionId: string, tier: string) => {
+      t.store.set(`job:${jobId}`, {
+        jobId, sessionId, tier, model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
+        background: false, status: 'done', at: 1, endedAt: Date.now() - 2 * 3_600_000, summary: 'old',
+      })
+      t.store.set(`agent:${sessionId}`, jobId)
+      const usage = { type: 'assistant', message: { id: 'm1', usage: { input_tokens: 120_000, output_tokens: 10 } } }
+      t.files.set(normPath(`${HOME}/.claude/delegate/jobs/${jobId}/events.jsonl`), `${JSON.stringify(usage)}\n`)
+    }
+    // GPT 结束时查额度也走 process.run，只数真正的派活。
+    const dispatched = () => t.runs.filter(r => r.task !== undefined)
+    old('fg-c', 'sid-c', 'gpt')
+    const held = text(await jobCall($ as never, 'mcp__delegate__delegate_gpt', { task: 'continue', resume: 'sid-c' }))
+    expect(held).toContain('提示缓存很可能已经过期')
+    expect(dispatched()).toHaveLength(0)
+    const again = text(await jobCall($ as never, 'mcp__delegate__delegate_gpt', { task: 'continue', resume: 'sid-c' }))
+    expect(again).toContain('kept going')
+    expect(dispatched()).toHaveLength(1)
+    old('fg-d', 'sid-d', 'flash')
+    const ds = text(await jobCall($ as never, 'mcp__delegate__delegate_flash', { task: 'continue', resume: 'sid-d' }))
+    expect(ds).not.toContain('提示缓存')
+    expect(dispatched()).toHaveLength(2)
+  })
+
   test('delegate_list shows id, agent, tier, status, cwd and summary; filters by status', { timeoutMs: 10_000 }, async ($, on) => {
     const t = jobSetup(on as never, { ok: true, text: 'x', sessionId: 'sid-3', turns: 1, ms: 5 })
     await startSession($ as never)

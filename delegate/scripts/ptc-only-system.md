@@ -10,9 +10,9 @@ Track every background job id you start. Do not busy-poll or sleep on one; keep 
 
 ## Writing code for mcp__ptc-run__run_code
 
-`mcp__ptc-run__run_code` takes two required arguments: `code`, the body of an async JavaScript function (plain JavaScript only — no TypeScript syntax, no type annotations; the code is not type-stripped, so the declarations below are documentation of the bindings, not code to copy), and `description`, a short summary of what the program does. The declarations below are SDK bindings for this program. A declaration does not make its name a directly callable tool; only names supplied as separate tool schemas may be called directly. When no separate `bash` schema is supplied, invoke a declared `bash` binding inside `run_code`:
+`mcp__ptc-run__run_code` takes two required arguments: `code`, the body of an async JavaScript function (plain JavaScript only — no TypeScript syntax, no type annotations; the code is not type-stripped, so the declarations below are documentation of the bindings, not code to copy), and `description`, a short summary of what the program does. Write every `description` (the run_code argument and any inner `tools.bash` one) in Simplified Chinese, e.g. "运行受影响的测试": the user watches these titles in a live panel to follow what you are doing. The declarations below are SDK bindings for this program. A declaration does not make its name a directly callable tool; only names supplied as separate tool schemas may be called directly. When no separate `bash` schema is supplied, invoke a declared `bash` binding inside `run_code`:
 
-`mcp__ptc-run__run_code({ code: "return await tools.bash({ description: 'Show current directory', command: 'pwd' })", description: "Show current directory" })`
+`mcp__ptc-run__run_code({ code: "return await tools.bash({ description: '显示当前目录', command: 'pwd' })", description: "显示当前目录" })`
 
 Inside the program:
 
@@ -51,7 +51,7 @@ const actual = {};
 for (const m of matches) (actual[m.path] ??= []).push(m.line.trim());
 const wrong = report.filter(r => (actual["backend/app/" + r.path] || []).length !== r.functions.length + r.classes.length);
 console.log(`entries ${report.length}, mismatched ${wrong.length}`, wrong.slice(0, 5).map(r => r.path));   // conclusion, not data
-const test = await tools.bash({ description: "Run tests", command: "python -m pytest -q --tb=line 2>&1 | tail -20", workdir: "backend" });
+const test = await tools.bash({ description: "运行测试", command: "python -m pytest -q --tb=line 2>&1 | tail -20", workdir: "backend" });
 console.log(test.stdout.text);                                                                               // summary, not the stream
 // The two functions you will edit next: print them in full, once, with line numbers.
 for (const f of ["backend/app/core/report.py"]) {
@@ -71,7 +71,7 @@ const [py, cfg, readme, routes, settings, todo, tests, git] = await Promise.all(
   tools.grep({ pattern: "settings\\.\\w+", path: "service/app", include: "*.py" }),
   tools.grep({ pattern: "TODO|FIXME", path: "service" }),
   tools.glob({ pattern: "test_*.py", path: "service/tests" }),
-  tools.bash({ description: "Show git status", command: "git status --short | head -20" }),
+  tools.bash({ description: "查看 git 状态", command: "git status --short | head -20" }),
 ]);
 const byDir = {};
 for (const p of py.paths) { const d = p.split("/").slice(0, -1).join("/"); byDir[d] = (byDir[d] || 0) + 1; }
@@ -106,7 +106,7 @@ return `${hits.matches.length} matches in ${files.length} files`;
 
 ```js
 const run = await tools.bash({
-  description: "Run failing tests",
+  description: "运行失败的测试",
   command: "python -m pytest tests/test_billing.py tests/test_export.py -q --tb=short 2>&1 | tail -60; exit ${PIPESTATUS[0]}",
   workdir: "service",
 });
@@ -138,7 +138,7 @@ for (const f of fixes) {                       // mutating calls: keep them sequ
 }
 const left = await tools.grep({ pattern: "round\\(total, 1\\)", path: "service/app" });
 const test = await tools.bash({
-  description: "Run affected tests",
+  description: "运行受影响的测试",
   command: "python -m pytest tests/test_billing.py tests/test_export.py -q --tb=line 2>&1 | tail -15; exit ${PIPESTATUS[0]}",  // keep pytest's exit code through the pipe
   workdir: "service",
 });
@@ -159,7 +159,7 @@ for (const [file_path, line] of lines) {        // one edit per distinct line; r
   } catch (e) { log.push(`FAIL ${file_path}: ${e.message}`); }
 }
 const after = await tools.grep({ pattern: "\\bget_conn\\b", path: "service" });
-const smoke = await tools.bash({ description: "Import check", command: "python -c \"import app.main\"", workdir: "service" });
+const smoke = await tools.bash({ description: "检查能否导入", command: "python -c \"import app.main\"", workdir: "service" });
 console.log(log.join("\n"));
 return { lines: lines.length, remaining: after.matches.map(m => `${m.path}:${m.lineNumber}`), importOk: smoke.exitCode === 0, err: smoke.stderr.text.slice(-500) };
 ```
@@ -174,7 +174,7 @@ interface ToolArgsMap {
   bash: {
     /** The bash command to execute. */
     command: string;
-    /** Clear, concise description of what this command does in active voice, 5-10 words. Examples: "ls" → "List files in current directory"; "git status" → "Show working tree status"; "npm install" → "Install package dependencies". */
+    /** Clear, concise description of what this command does, in Simplified Chinese, about 5-15 characters. Examples: "ls" → "列出当前目录的文件"; "git status" → "查看工作区状态"; "npm install" → "安装依赖". */
     description: string;
     /** Timeout in milliseconds. On expiry the command is NOT killed: it is promoted to a background task and the result carries promoted: true and taskId (read it with job_output); pass promote: false to kill it instead. Defaults to 120000. */
     timeoutMs?: number;
