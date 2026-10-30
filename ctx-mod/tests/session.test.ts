@@ -247,9 +247,9 @@ describe('reminder', () => {
     const box = makeIo()
     const session = createSession(DIR, box.io, DEFAULTS)
 
-    // Below 250k nothing is said, however close: the window is meant to be used.
-    expect(session.reminder(at(249_999))).toBeNull()
-    expect(session.reminder(at(250_000))).toContain('上下文已用 250k/400k。如果当前任务刚告一段落')
+    // Below 200k nothing is said, however close: the window is meant to be used.
+    expect(session.reminder(at(199_999))).toBeNull()
+    expect(session.reminder(at(200_000))).toContain('上下文已用 200k/400k。如果当前任务刚告一段落')
     expect(session.reminder(at(250_000))).toBeNull()
     expect(session.reminder(at(299_999))).toBeNull()
     expect(session.reminder(at(300_000))).toContain('上下文已用 300k/400k，再过一段就该换窗口了')
@@ -282,15 +282,55 @@ describe('reminder', () => {
   test('no fill sits closer than 30k to the limit', async () => {
     const box = makeIo()
     // At a 300k limit soft and urgent both cap at 270k, so 270k is already urgent.
-    const capped = createSession('/cap', box.io, DEFAULTS)
+    const capped = createSession('/cap', box.io, { ...DEFAULTS, boundaryTokens: 250_000 })
     expect(capped.reminder(at(249_999, 300_000))).toBeNull()
     expect(capped.reminder(at(250_000, 300_000))).toContain('上下文已用 250k/300k。如果当前任务刚告一段落')
     expect(capped.reminder(at(270_000, 300_000))).toContain('上下文已用 270k/300k，离上限只剩约 30k')
 
     // At a 280k limit every fill caps at 250k: the first thing said is already urgent.
-    const small = createSession('/small', box.io, DEFAULTS)
+    const small = createSession('/small', box.io, { ...DEFAULTS, boundaryTokens: 250_000 })
     expect(small.reminder(at(249_999, 280_000))).toBeNull()
     expect(small.reminder(at(250_000, 280_000))).toContain('上下文已用 250k/280k，离上限只剩约 30k')
+  })
+})
+
+describe('ledger nudge', () => {
+  const at = (tokens: number) => env(tokens, 400_000)
+  const open = { task_id: 'login-btn', title: '登录页按钮改蓝', status: 'in_progress' as const, text: '在做', next_step: '接着做' }
+
+  test('growth to the threshold is said once, and an entry starts a new stretch', async () => {
+    const box = makeIo()
+    const session = await freshSession(box, { ...DEFAULTS, ledgerNudgeTokens: 80_000 })
+
+    // The first fill seen only starts the clock: nothing is claimed about growth it never saw.
+    expect(session.reminder(at(20_000))).toBeNull()
+    expect(session.reminder(at(99_999))).toBeNull()
+    expect(session.reminder(at(100_000))).toContain('距上次记账已增长约 80k token')
+    // The same stretch is not said twice, however much it grows.
+    expect(session.reminder(at(180_000))).toBeNull()
+
+    await session.ledgerAppend(open, at(100_000))
+    expect(session.reminder(at(170_000))).toBeNull()
+    expect(session.reminder(at(180_000))).toContain('距上次记账已增长约 80k token')
+  })
+
+  test('a threshold of 0 turns it off', async () => {
+    const box = makeIo()
+    const session = await freshSession(box, { ...DEFAULTS, ledgerNudgeTokens: 0 })
+
+    expect(session.reminder(at(20_000))).toBeNull()
+    expect(session.reminder(at(190_000))).toBeNull()
+  })
+
+  test('no nudge while one of the three fills is talking', async () => {
+    const box = makeIo()
+    const session = await freshSession(box, DEFAULTS)
+
+    expect(session.reminder(at(20_000))).toBeNull()
+    expect(session.reminder(at(250_000))).toContain('上下文已用 250k/400k')
+    // The boundary sentence already asked for the ledger; growth adds nothing, then or after.
+    expect(session.reminder(at(260_000))).toBeNull()
+    expect(session.reminder(at(49_999))).toBeNull()
   })
 })
 
@@ -407,14 +447,14 @@ describe('ledgerAppend', () => {
     expect(early.result).toBe('已记录 #L1。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
     expect(early.result).not.toContain('上下文已用')
 
-    // The suggestion waits for 250k: a finished task alone is no reason to switch.
-    const middle = await session.ledgerAppend({ ...done, task_id: 'login-btn-2' }, env(249_999, 400_000))
+    // The suggestion waits for 200k: a finished task alone is no reason to switch.
+    const middle = await session.ledgerAppend({ ...done, task_id: 'login-btn-2' }, env(199_999, 400_000))
     expect(middle.result).toBe('已记录 #L2。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
 
-    const late = await session.ledgerAppend({ ...done, task_id: 'login-btn-3' }, env(250_000, 400_000))
-    expect(late.result).toContain('上下文已用 250k/400k。如果当前任务刚告一段落')
+    const late = await session.ledgerAppend({ ...done, task_id: 'login-btn-3' }, env(200_000, 400_000))
+    expect(late.result).toContain('上下文已用 200k/400k。如果当前任务刚告一段落')
     // The same sentence is never repeated by the reminder that follows the tool call.
-    expect(session.reminder(env(250_000, 400_000))).toBeNull()
+    expect(session.reminder(env(200_000, 400_000))).toBeNull()
   })
 })
 
@@ -2335,6 +2375,22 @@ describe('historyTool search range', () => {
     return session
   }
 
+  /** The same word in each window of `where`, and one ordinary row in every window. */
+  const spread = async (where: readonly number[]): Promise<Session> => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    for (let window = 1; window <= 5; window += 1) {
+      await session.record({ uuid: `p${window}`, role: 'user', isPerson: true, text: `第${window}窗口的请求` })
+      if (where.includes(window)) {
+        await session.record({ uuid: `r${window}`, role: 'tool', tool: 'Bash', text: `RAREWORD in window ${window}` })
+      }
+      if (window < 5) await session.commitSwitch({ trigger: 'manual', tokensBefore: 90_000, handoffText: '交接' })
+    }
+    await session.flush()
+
+    return session
+  }
+
   test('a word only in an older window is found by walking back, and the range is stated', async () => {
     const session = await windows(2)
     expect(session.window()).toBe(5)
@@ -2368,6 +2424,50 @@ describe('historyTool search range', () => {
     const miss = (await session.historyTool({ action: 'search', query: 'RAREWORD', window: 3 })).result
     expect(miss).toBe('第 3 个窗口里没有匹配（只搜了这个窗口）。')
     expect((await session.historyTool({ action: 'search', query: 'RAREWORD', window: 1 })).result).toContain('w1 tool [Bash]')
+  })
+
+  test("scope:'all' reaches the first window where the default search never walks", async () => {
+    const session = await spread([1, 5])
+    const recent = (await session.historyTool({ action: 'search', query: 'RAREWORD' })).result
+    expect(recent).toContain('w5 tool [Bash]')
+    expect(recent).not.toContain('w1 tool [Bash]')
+
+    const all = (await session.historyTool({ action: 'search', query: 'RAREWORD', scope: 'all' })).result
+    expect(all).toContain('w1 tool [Bash]')
+    expect(all).toContain('（搜了第 1–5 个窗口的全部窗口，按时间新→旧；共 2 条，没有更多）')
+  })
+
+  test("scope:'all' shows an earlier hit that a nearer one had hidden, newest first", async () => {
+    const session = await spread([1, 4])
+    const recent = (await session.historyTool({ action: 'search', query: 'RAREWORD' })).result
+    expect(recent).toContain('w4 tool [Bash]')
+    expect(recent).not.toContain('w1 tool [Bash]')
+
+    const all = (await session.historyTool({ action: 'search', query: 'RAREWORD', scope: 'all' })).result
+    expect(all).toContain('w4 tool [Bash]')
+    expect(all).toContain('w1 tool [Bash]')
+    expect(all.indexOf('w4 tool [Bash]')).toBeLessThan(all.indexOf('w1 tool [Bash]'))
+    expect(all).toContain('共 2 条，没有更多')
+  })
+
+  test("scope:'all' still obeys limit and says more remain; a named window ignores scope", async () => {
+    const session = await spread([1, 2, 4])
+    const all = (await session.historyTool({ action: 'search', query: 'RAREWORD', scope: 'all', limit: 1 })).result
+    expect(all).toContain('w4 tool [Bash]')
+    expect(all).not.toContain('w1 tool [Bash]')
+    expect(all).toContain('还有更多命中，只列前 1 条')
+
+    // window wins over scope, even one scope would call invalid.
+    const named = (await session.historyTool({ action: 'search', query: 'RAREWORD', window: 1, scope: 'all' })).result
+    expect(named).toContain('w1 tool [Bash]')
+    expect(named).not.toContain('w4')
+    const ignored = await session.historyTool({ action: 'search', query: 'RAREWORD', window: 4, scope: 'everything' })
+    expect(ignored.isError).toBeUndefined()
+    expect(ignored.result).toContain('w4 tool [Bash]')
+
+    const bad = await session.historyTool({ action: 'search', query: 'RAREWORD', scope: 'everything' })
+    expect(bad.isError).toBe(true)
+    expect(bad.result).toContain('scope 只能是')
   })
 })
 

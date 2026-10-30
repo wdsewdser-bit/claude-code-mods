@@ -10,6 +10,12 @@ export type Config = {
   boundaryTokens: number
   softTokens: number
   urgentTokens: number
+  /**
+   * Context growth, in tokens, since the latest ledger_append that earns one short
+   * nudge to record progress. Never fires while one of the three fills above is
+   * talking, and one stretch of growth is nudged once. 0 turns it off.
+   */
+  ledgerNudgeTokens: number
   /** A cold cache switches the window only above this fill. */
   coldMinTokens: number
   /** Cache lifetime to assume when cache-keeper's state cannot be read. */
@@ -66,9 +72,12 @@ export const DEFAULTS: Config = {
   // engine reports. Late on purpose: a switch loses working detail, so the window is
   // used nearly to its end. No fill sits closer than 30k to the limit (usage.ts caps
   // it there), which leaves urgent room for the ledger entries it asks for.
-  boundaryTokens: 250_000,
+  boundaryTokens: 200_000,
   softTokens: 300_000,
   urgentTokens: 350_000,
+  // A quarter of the way from a fresh window to the first fill reminder: often
+  // enough to notice a stage ending, far enough that ordinary work is not nagged.
+  ledgerNudgeTokens: 80_000,
   coldMinTokens: 80_000,
   cacheTtlSec: 3_600,
   noContinueAtPercent: 90,
