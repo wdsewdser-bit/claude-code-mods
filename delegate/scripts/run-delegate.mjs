@@ -12,6 +12,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRootsEnv, readRootsOf, readRootsPromptArg } from './read-roots.mjs'
 import { createOutputTracker } from './stream-usage.mjs'
+import { startKeepaliveProxy } from './keepalive-proxy.mjs'
+import { spawnDaemon as spawnKeepaliveDaemon } from './keepalive.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const home = os.homedir()
@@ -325,8 +327,15 @@ const main = async () => {
   }
   // A tracked job records itself before anything can fail, so a restart still sees it.
   const control = job.jobId ? createControl(String(job.jobId), job) : null
+  // 缓存保活的本地转发（自定义来源的 gpt 作业才有）：作业结束时关掉它，并把守护拉起来续缓存。
+  let keepalive = null
   // Persist the terminal state before exiting.
   const done = (value, code = 0) => {
+    if (keepalive !== null) {
+      try { keepalive.close() } catch {}
+      // 有会话要保活才有人接：守护自己会判断，没有文件就启动不了。
+      try { spawnKeepaliveDaemon() } catch {}
+    }
     try { control?.finish(value) } catch {}
     try { control?.stop() } catch {}
     finish(value, code)
@@ -358,6 +367,15 @@ const main = async () => {
   const ensured = cpaEnv()
   if (ensured.error !== undefined) return done({ ok: false, error: ensured.error })
   const cpa = ensured.env
+  // 只有含 '/' 的 gpt model 才是走自定义供应商（'<供应商id>/<模型>'）：中转站的提示缓存几分钟到
+  // 几十分钟就失效，作业结束后需要独立的保活，所以先架一个本地转发，把最后一次 /v1/messages 的
+  // 请求体记下来。转发起不来就直连 CPA，作业不能因此失败。
+  if (gpt && model.includes('/') && job.jobId) {
+    keepalive = await startKeepaliveProxy({
+      target: cpa.ANTHROPIC_BASE_URL,
+      jobId: String(job.jobId),
+    }).catch(() => null)
+  }
   const cliEffort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(job.effort) ? ['--effort', job.effort] : []
   const routedModel = !gpt && job.effort === 'off' ? model + '(none)' : model
   {
@@ -369,7 +387,8 @@ const main = async () => {
       // CPA routes by the model in the request, so the real GPT id has to travel in every model variable;
       // Claude Code warns [claude-code:unrecognized_model] on stderr and runs anyway.
       Object.assign(env, {
-        ANTHROPIC_BASE_URL: cpa.ANTHROPIC_BASE_URL,
+        // keepalive: 子进程打到本地转发，由它原样转给 CPA（并记下最后一次请求）。
+        ANTHROPIC_BASE_URL: keepalive?.url ?? cpa.ANTHROPIC_BASE_URL,
         ANTHROPIC_AUTH_TOKEN: cpa.ANTHROPIC_AUTH_TOKEN,
         ANTHROPIC_MODEL: routedModel,
         ANTHROPIC_SMALL_FAST_MODEL: routedModel,

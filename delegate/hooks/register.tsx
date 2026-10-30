@@ -831,6 +831,8 @@ const cwdProblem = async (
 // DS 的缓存能留几小时，也不占 Claude 额度，不拦。
 // 2026-10-29 实测：GPT 经 CPA 闲置 130 分钟仍命中约 98%，更久的没测；先按 3 小时拦。
 const GPT_COLD_MINUTES = 180
+// 2026-10-30 实测自定义来源（中转站）：闲置 20 分钟命中、30 分钟全丢，按 20 分钟拦；有保活文件（keepalive 在续）时不拦。
+const GPT_CUSTOM_COLD_MINUTES = 20
 const GPT_COLD_MIN_TOKENS = 60_000
 const RESEND_MINUTES = 10
 const heldResumes = new Map<string, { at: number; task: string }>()
@@ -850,14 +852,21 @@ const coldResumeNotice = async (
     if (held.task === task || now - held.at < RESEND_MINUTES * 60_000) return undefined
   }
   const idle = now - old.endedAt
-  if (idle <= GPT_COLD_MINUTES * 60_000) return undefined
+  const custom = (await loadConfig($)).gptSource ? true : false
+  if (idle <= (custom ? GPT_CUSTOM_COLD_MINUTES : GPT_COLD_MINUTES) * 60_000) return undefined
   const root = await rootOf($)
   if (root === undefined) return undefined
+  if (custom) {
+    try {
+      await $.fs.read(`${root}/../keepalive/${old.jobId}.json`)
+      return undefined
+    } catch { /* 没在保活：按冷续处理 */ }
+  }
   const { context } = usageOf(await readEventLines($, jobDir(root, old.jobId)))
   if (context <= GPT_COLD_MIN_TOKENS) return undefined
   heldResumes.set(id, { at: now, task })
 
-  return `delegate: GPT 代理 ${id} 已闲置 ${spanOf(idle)}，提示缓存很可能已经过期，续用第一轮要按未命中重读约 ${tokensOf(context)} token 的上下文，计入 GPT 订阅额度。建议新建一个 GPT 代理，用它最后的报告加文件路径写个短交接；若仍要续用，原样再发一次。`
+  return `delegate: GPT 代理 ${id} 已闲置 ${spanOf(idle)}，提示缓存很可能已经过期，续用第一轮要按未命中重读约 ${tokensOf(context)} token 的上下文，${custom ? "按输入原价计费" : "计入 GPT 订阅额度"}。建议新建一个 GPT 代理，用它最后的报告加文件路径写个短交接；若仍要续用，原样再发一次。`
 }
 
 const callTool = async (
@@ -1391,6 +1400,39 @@ const refreshGptUsage = async ($: EngineInterface): Promise<void> => {
   } catch {
     gptUsedCents = undefined // 上游不支持就不显示，不打扰
   }
+}
+
+// 缓存保活：自定义来源的 GPT 作业结束后，守护会定时把最后一次请求重放一次，保住中转站的提示缓存。
+// 面板只显示守护自己记的数（会话数、今日重放、花费）和一个开关，读不到就整块不显示。
+type KeepaliveStatus = {
+  ok: boolean
+  enabled: boolean
+  sessions: number
+  replaysToday: number
+  costToday: number
+  intervalMinutes: number
+  minTokens: number
+  maxHours: number
+}
+let keepaliveInfo: KeepaliveStatus | undefined
+let keepalivePending = false
+const refreshKeepalive = async ($: EngineInterface): Promise<void> => {
+  if (keepalivePending) return
+  keepalivePending = true
+  try {
+    const ran = await $.process.run(['node', `${$.plugin.root}/scripts/keepalive.mjs`, '--status'], { timeoutMs: 20_000 })
+    const line = ran.stdout.trim().split('\n').at(-1) ?? ''
+    const parsed = JSON.parse(line) as KeepaliveStatus
+    keepaliveInfo = parsed?.ok === true ? parsed : undefined
+  } catch {
+    keepaliveInfo = undefined
+  } finally {
+    keepalivePending = false
+  }
+}
+const setKeepaliveEnabled = async ($: EngineInterface, on: boolean): Promise<void> => {
+  await $.process.run(['node', `${$.plugin.root}/scripts/keepalive.mjs`, '--set-enabled', on ? 'on' : 'off'], { timeoutMs: 20_000 })
+  await refreshKeepalive($)
 }
 
 const refreshQuota = async ($: EngineInterface, force = false): Promise<void> => {
@@ -2131,7 +2173,7 @@ export const register: Register = on => {
     }
     const draft = await read($, draftAtom)
     const note = await read($, flashAtom)
-    const card = (key: string, title: string, body: unknown) => <Box key={key} flexDirection="column" overflow="hidden" borderStyle="round" borderDimColor paddingX={2} gap={1}><Button key={'section-' + key} plain onPress={() => paneAction($, async () => { paneTab = key; if (key === 'gpt') { await refreshQuota($); await refreshGptUsage($) } })}>{title + (paneTab === key ? ' ▾' : ' ▸')}</Button>{paneTab === key ? [body] : []}</Box>
+    const card = (key: string, title: string, body: unknown) => <Box key={key} flexDirection="column" overflow="hidden" borderStyle="round" borderDimColor paddingX={2} gap={1}><Button key={'section-' + key} plain onPress={() => paneAction($, async () => { paneTab = key; if (key === 'gpt') { await refreshQuota($); await refreshGptUsage($); await refreshKeepalive($) } })}>{title + (paneTab === key ? ' ▾' : ' ▸')}</Button>{paneTab === key ? [body] : []}</Box>
     const button = (key: string, label: string, fn: () => Promise<void>) => <Button key={key} plain onPress={() => paneAction($, fn)}>{label}</Button>
     const modelOptions = cpaProviders.flatMap(p => p.models.map(m => ({ label: (config.providers.find(x => x.id === p.id)?.name || p.name) + ' / ' + m, value: JSON.stringify([p.id, m]) })))
     const slots = TIERS.map(tier => {
@@ -2215,6 +2257,24 @@ export const register: Register = on => {
     const gptFallback = gptPickModel(gptProvider, undefined)
     const gptModels = gptProvider === undefined ? [] : gptProvider.models.map(m => gptShownModel(config, m, gptSource))
     const subscriptionRows = <Box flexDirection="column" overflow="hidden">{quotaRows}<Box gap={1}>{gptControls}</Box><Text wrap="truncate-middle">{loginUrl}</Text>{gptRows}</Box>
+    // 缓存保活：只有自定义来源才显示（订阅的额度按次算，没有冷续费这一说）。
+    const keepaliveCost = keepaliveInfo === undefined ? '' : keepaliveInfo.costToday < 0.01 ? keepaliveInfo.costToday.toFixed(4) : keepaliveInfo.costToday.toFixed(2)
+    const keepaliveRow = <Box flexDirection="column" overflow="hidden">
+      <Text wrap="truncate-end">{keepaliveInfo === undefined ? '缓存保活：读取中…' : `缓存保活：${keepaliveInfo.sessions} 个会话 · 今日重放 ${keepaliveInfo.replaysToday} 次 · 约 $${keepaliveCost}`}</Text>
+      <Select
+        key="gpt-keepalive"
+        label="缓存保活"
+        options={[
+          { label: `开 · 每 ${keepaliveInfo?.intervalMinutes ?? 8} 分钟续一次`, value: 'on' },
+          { label: '关 · 不再续缓存', value: 'off' },
+        ]}
+        value={keepaliveInfo?.enabled === false ? 'off' : 'on'}
+        onSelect={(v: string) => paneAction($, async () => {
+          await setKeepaliveEnabled($, v === 'on')
+          await setFlash($, v === 'on' ? '缓存保活已开启' : '缓存保活已关闭')
+        })}
+      />
+    </Box>
     const sourceRows = gptSource === ''
       ? subscriptionRows
       : <Box flexDirection="column" overflow="hidden">
@@ -2236,8 +2296,10 @@ export const register: Register = on => {
           )
           await refreshGptUsage($)
           await refreshQuota($, true)
+          await refreshKeepalive($)
         })} />
         {sourceRows}
+        {gptSource === '' ? undefined : keepaliveRow}
         <Select key="gpt-prefix" label="隐藏供应商前缀" options={[{ label: '开 · 只显示 gpt-6.1-sol', value: 'on' }, { label: '关 · 显示 mypool-resp/gpt-6.1-sol', value: 'off' }]} value={config.gptHidePrefix === false ? 'off' : 'on'} onSelect={(v: string) => changeAction($, c => setGptHidePrefix(c, v === 'on'), v === 'on' ? 'GPT 模型名只显示裸名' : 'GPT 模型名显示完整前缀')} />
       </Box>)}
       <Text dimColor>供应商密钥仅保存在本机 CPA 配置中。</Text>
