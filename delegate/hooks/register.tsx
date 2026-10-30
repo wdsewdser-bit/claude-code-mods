@@ -764,8 +764,8 @@ const cwdProblem = async (
 // GPT 的提示缓存闲置久了就会被清掉（官方说法一般 5–10 分钟，最长 1 小时），续用一个闲置太久的大上下文代理，
 // 第一轮整段上下文按未命中重读，吃订阅额度。这种续用先拦一次并说明代价；原样再发一次、或 10 分钟内再发就放行。
 // DS 的缓存能留几小时，也不占 Claude 额度，不拦。
-// 和 CC 的缓存保活周期一致（1h TTL 提前 5 分钟）；实测 TTL 出来前先用这个。
-const GPT_COLD_MINUTES = 55
+// 2026-10-29 实测：GPT 经 CPA 闲置 130 分钟仍命中约 98%，更久的没测；先按 3 小时拦。
+const GPT_COLD_MINUTES = 180
 const GPT_COLD_MIN_TOKENS = 60_000
 const RESEND_MINUTES = 10
 const heldResumes = new Map<string, { at: number; task: string }>()
