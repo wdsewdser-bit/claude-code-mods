@@ -5,6 +5,10 @@ export type Slot = { providerId: string; modelId: string; effort?: Effort }
 export type Config = {
   providers: Provider[]
   slots: Record<Tier, Slot | null>
+  /** delegate_gpt 的来源：'' 或缺省 = ChatGPT 订阅；否则是 CPA 供应商 id（按 'id/model' 路由）。 */
+  gptSource?: string
+  /** GPT 模型名的显示：true（默认）只显示裸模型名，false 显示 '供应商id/模型'。发给 CPA 的 model 一直带前缀。 */
+  gptHidePrefix?: boolean
 }
 
 export const TIERS: readonly Tier[] = ['flash', 'pro']
@@ -20,6 +24,8 @@ export const SEED: Config = {
     flash: { providerId: 'command', modelId: 'deepseek/deepseek-v4.1-flash' },
     pro: { providerId: 'command', modelId: 'deepseek/deepseek-v4-pro' },
   },
+  gptSource: '',
+  gptHidePrefix: true,
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -49,10 +55,15 @@ export const normalize = (raw: unknown): Config => {
     providers.push({ id, name: text(one.name) || id })
   }
   const slots = isRecord(raw.slots) ? raw.slots : {}
+  // A gpt source that pointed at a removed provider falls back to the subscription, like a slot.
+  const wanted = text(raw.gptSource)
 
   return {
     providers,
     slots: { flash: slotOf(slots.flash, providers), pro: slotOf(slots.pro, providers) },
+    gptSource: wanted !== '' && providers.some(p => p.id === wanted) ? wanted : '',
+    // 只有明确写了 false 才显示前缀；旧配置没有这个字段，按默认（隐藏）处理。
+    gptHidePrefix: raw.gptHidePrefix !== false,
   }
 }
 
@@ -148,6 +159,19 @@ export const setSlot = (
 
 export const clearSlot = (config: Config, tier: Tier): Result => ({
   config: { ...config, slots: { ...config.slots, [tier]: null } },
+})
+
+/** '' puts delegate_gpt back on the ChatGPT subscription; anything else must name a known provider. */
+export const setGptSource = (config: Config, providerId: string): Result => {
+  const id = providerId.trim()
+  if (id === '') return { config: normalize({ ...config, gptSource: '' }) }
+  if (!config.providers.some(p => p.id === id)) return { config, error: `没有叫「${id}」的供应商，先添加供应商` }
+
+  return { config: normalize({ ...config, gptSource: id }) }
+}
+
+export const setGptHidePrefix = (config: Config, hide: boolean): Result => ({
+  config: { ...config, gptHidePrefix: hide },
 })
 
 export const maskKey = (key: string): string =>
