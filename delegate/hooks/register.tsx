@@ -11,13 +11,24 @@ import {
   parseTier,
   removeProvider,
   resolveTier,
+  setGptHidePrefix,
+  setGptSource,
   setSlot,
   TIERS,
   callLabel,
   toolDescription,
 } from './lib/config.ts'
 import type { Config, Result, Tier } from './lib/config.ts'
-import { GPT_DEFAULT_MODEL, GPT_MODELS, gptLabel, gptModelOf, gptToolDescription } from './lib/gpt.ts'
+import {
+  GPT_DEFAULT_MODEL,
+  GPT_MODELS,
+  gptDisplayModel,
+  gptLabel,
+  gptModelOf,
+  gptSourceModelOf,
+  gptToolDescription,
+  gptWireModel,
+} from './lib/gpt.ts'
 import {
   eventLine,
   formatList,
@@ -84,7 +95,7 @@ const messageOf = (error: unknown): string =>
 
 type CpaProvider = { id: string; name: string; prefix: string; protocol: string; baseUrl: string; keyMask: string; models: string[] }
 type CpaAccount = { name: string; email?: string; disabled?: boolean; status?: string }
-type AdminReply = { ok: boolean; error?: string; providers?: CpaProvider[]; models?: string[]; accounts?: CpaAccount[]; url?: string; state?: string; status?: string }
+type AdminReply = { ok: boolean; error?: string; providers?: CpaProvider[]; models?: string[]; accounts?: CpaAccount[]; url?: string; state?: string; status?: string; usedCents?: number }
 const admin = async ($: EngineInterface, command: string, input: Record<string, unknown> = {}): Promise<AdminReply> => {
   const ran = await $.process.run(['node', `${$.plugin.root}/scripts/cpa-admin.mjs`, command], { stdin: JSON.stringify(input), timeoutMs: 120_000 })
   const result = JSON.parse(ran.stdout.trim().split('\n').at(-1) || '{}') as AdminReply
@@ -171,10 +182,10 @@ const describeGpt = async ($: EngineInterface): Promise<void> => {
         type: 'object',
         properties: {
           task: { type: 'string', description: '自包含的任务说明' },
+          // 不设 enum：来源可能是任意 CPA 供应商，可用模型随它变（见 gptSourceModelOf）。
           model: {
             type: 'string',
-            enum: [...GPT_MODELS],
-            description: "默认 gpt-6.1-sol，日常都用它；只有真正高难的问题才传 'gpt-6-astra'（更慢，别当默认）；gpt-6.1-terra 只在 DS 不可用时当下位替代，固定按 max 跑（传别的 effort 也按 max）",
+            description: `默认 ${GPT_DEFAULT_MODEL}，日常都用它。走 ChatGPT 订阅时可用：${GPT_MODELS.join('、')}；只有真正高难的问题才传 'gpt-6-astra'（更慢，别当默认）。走自定义供应商（/delegate 面板『GPT』卡的来源）时，可用该供应商模型列表里的任意模型，传别的会被拒绝并列出可用项`,
           },
           mode: {
             type: 'string',
@@ -215,6 +226,42 @@ const describeGpt = async ($: EngineInterface): Promise<void> => {
   }
 }
 
+// ── GPT 来源：'' = ChatGPT 订阅；否则是 CPA 里一个供应商的 id，发给 CPA 的 model 是 '<id>/<model>'。 ──
+const gptSourceOf = (config: Config): string => (config.gptSource ?? '').trim()
+
+/** All knowledge of GPT model names into one place: the provider's list for a custom source, GPT_MODELS for the subscription. */
+const gptPickModel = (
+  provider: CpaProvider | undefined,
+  wanted: unknown,
+): string | { error: string } => (provider === undefined ? gptModelOf(wanted) : gptSourceModelOf(wanted, provider.models))
+
+const cpaProviderById = async ($: EngineInterface, id: string): Promise<CpaProvider | undefined> => {
+  const known = cpaProviders.find(p => p.id === id)
+  if (known !== undefined) return known
+  try {
+    cpaProviders = (await admin($, 'providers')).providers || []
+  } catch {
+    return undefined
+  }
+
+  return cpaProviders.find(p => p.id === id)
+}
+
+/** The name people see for the source: the subscription, or the provider's own name. */
+const gptSourceName = (config: Config, id: string): string =>
+  id === '' ? '' : config.providers.find(p => p.id === id)?.name || id
+
+/** A model name for people; the wire model keeps the prefix either way. */
+const gptShownModel = (config: Config, model: string, source = gptSourceOf(config)): string =>
+  gptDisplayModel(model, source, config.gptHidePrefix)
+
+/** The prefix to hide in names that come from elsewhere (the runner's actual-model list); '' when showing it. */
+const gptPrefixToStrip = (config: Config): string => {
+  const source = gptSourceOf(config)
+
+  return source === '' || config.gptHidePrefix === false ? '' : `${source}/`
+}
+
 const saveConfig = async ($: EngineInterface, config: Config): Promise<void> => {
   await $.store.set(STORE_KEY, config)
   await describeTool($, config)
@@ -235,9 +282,12 @@ type JobReply = {
 }
 
 // 进程成功（ok）不等于任务完成：把任务终态和实际模型单独说一行，附在返回文本末尾。
-const runnerNote = (reply: JobReply): string => {
+// stripPrefix：给人看的 GPT 模型名默认不带供应商前缀（config.gptHidePrefix），runner 报的是 CPA 里的全名。
+const runnerNote = (reply: JobReply, stripPrefix = ''): string => {
   const models = Array.isArray(reply.models)
-    ? reply.models.filter(m => typeof m === 'string' && m !== '')
+    ? reply.models
+        .filter(m => typeof m === 'string' && m !== '')
+        .map(m => (stripPrefix !== '' && m.startsWith(stripPrefix) ? m.slice(stripPrefix.length) : m))
     : []
   const terminal = typeof reply.terminal === 'string' && reply.terminal !== '' ? reply.terminal : null
   // 完成且只有一个模型：只说实际模型，不用再报终态
@@ -434,7 +484,22 @@ const testAction = async ($: EngineInterface, target: Agent): Promise<void> => {
     timeoutMs: 90_000,
   }
   if (target === 'gpt') {
-    Object.assign(job, { gpt: true, model: GPT_DEFAULT_MODEL })
+    // 和 delegate_gpt 走同一条路：来源是自定义供应商时用它自己的默认模型和前缀。
+    const config = await loadConfig($)
+    const source = gptSourceOf(config)
+    const provider = source === '' ? undefined : await cpaProviderById($, source)
+    if (source !== '' && provider === undefined) {
+      await setFlash($, `GPT 来源「${source}」已不在 CPA 里，请在面板换一个来源`)
+
+      return
+    }
+    const model = gptPickModel(provider, undefined)
+    if (typeof model !== 'string') {
+      await setFlash($, model.error)
+
+      return
+    }
+    Object.assign(job, { gpt: true, model: gptWireModel(source, model) })
   } else {
     const resolved = resolveTier(await loadConfig($), target)
     if ('error' in resolved) {
@@ -826,10 +891,26 @@ const callTool = async (
   }
   const config = await loadConfig($)
   // gpt has no slot: this call picks the model (default gpt-6.1-sol) and the runner gets the endpoint from CPA.
-  // resume 没传 model 时沿用原作业的 GPT 模型，免得 Astra 续用时悄悄换成默认的 Sol
-  const inheritedModel =
-    input.model === undefined && old?.tier === 'gpt' && typeof gptModelOf(old.model) === 'string' ? old.model : input.model
-  const gptModel = target === 'gpt' ? gptModelOf(inheritedModel) : undefined
+  // 来源是自定义供应商时，可用的模型由那个供应商的列表决定，wire 里写成 '<供应商id>/<模型>'。
+  const gptSource = target === 'gpt' ? gptSourceOf(config) : ''
+  const gptProvider = gptSource === '' ? undefined : await cpaProviderById($, gptSource)
+  if (gptSource !== '' && gptProvider === undefined) {
+    return {
+      result: `delegate: GPT 来源「${gptSource}」已不在 CPA 里，请在 /delegate 面板的『GPT』卡片换一个来源`,
+      isError: true,
+    }
+  }
+  const keptModel = old?.tier === 'gpt' && typeof old.model === 'string' ? old.model : undefined
+  const resumed = keptModel === undefined ? undefined : gptPickModel(gptProvider, keptModel)
+  // resume 没传 model 时沿用原作业的 GPT 模型（仍有效时），免得 Astra 续用时悄悄换成默认的 Sol
+  const gptModel =
+    target === 'gpt'
+      ? input.model !== undefined
+        ? gptPickModel(gptProvider, input.model) // 显式传的：不认识就报错，不悄悄换一个
+        : typeof resumed === 'string'
+          ? resumed
+          : gptPickModel(gptProvider, undefined)
+      : undefined
   if (gptModel !== undefined && typeof gptModel !== 'string') {
     return { result: `delegate: ${gptModel.error}`, isError: true }
   }
@@ -849,13 +930,15 @@ const callTool = async (
   const background = input.background === true
   const label =
     target === 'gpt'
-      ? gptLabel(gptModel as string, { background, work: mode === 'work' })
+      ? gptLabel(
+          gptShownModel(config, gptModel as string, gptSource),
+          { background, work: mode === 'work' },
+          gptSourceName(config, gptSource),
+        )
       : callLabel(config, target, { background, work: mode === 'work' })
   const effort =
     target === 'gpt'
-      ? gptModel === 'gpt-6.1-terra'
-        ? 'max' // terra 低于 max 几乎不思考（bug hunt：xhigh 11.3 分，max 40.7 分），一律按 max 跑
-        : // GPT 最低 medium：不填或传 low 都按 medium 跑
+      ? // GPT 最低 medium：不填或传 low 都按 medium 跑
         input.effort === 'high' || input.effort === 'xhigh' || input.effort === 'max'
         ? input.effort
         : input.effort === undefined && (old?.effort === 'high' || old?.effort === 'xhigh' || old?.effort === 'max')
@@ -877,9 +960,10 @@ const callTool = async (
     resume: resume === '' ? undefined : resume,
   }
   // gpt carries no url/key: the runner asks ensure_cpa.py for them (and starts CPA if it is down).
+  // The wire model keeps the provider prefix (CPA routes on it); the job record stores the bare one.
   const job =
     resolved === undefined
-      ? { ...common, gpt: true, model: gptModel, effort }
+      ? { ...common, gpt: true, model: gptWireModel(gptSource, gptModel as string), effort }
       : { ...common, model: resolved.modelId, effort: effort ?? resolved.effort }
   const modelId = resolved === undefined ? String(gptModel) : resolved.modelId
   // 开跑前就记下来（status=running），宿主重启后也还能按 agent ID 找回这个代理。
@@ -950,7 +1034,9 @@ const settle = async (
   const id = record.sessionId ?? ''
   const quotaNote = record.tier === 'gpt' ? await gptQuotaLine($) : ''
   const head = `[delegate ${record.tier} · ${record.mode} · agent ${id === '' ? '?' : id} · ${reply.turns ?? '?'} 轮 · ${Math.round((reply.ms ?? 0) / 1000)} 秒 · ${record.jobId}]${quotaNote === '' ? '' : `\n${quotaNote}`}`
-  const note = runnerNote(reply)
+  // GPT 走自定义供应商时默认不显示前缀：runner 报的“实际模型”也照此显示。
+  const config = await loadConfig($).catch(() => undefined)
+  const note = runnerNote(reply, record.tier === 'gpt' && config !== undefined ? gptPrefixToStrip(config) : '')
   const tail = note === '' ? '' : `\n${note}`
   if (!reply.ok) {
     return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${tail}`, isError: true }
@@ -1213,7 +1299,10 @@ const notifyDone = async ($: EngineInterface, rec: JobRecord): Promise<void> => 
   const agent = result?.sessionId ?? rec.sessionId
   const body = text.length > BG_INLINE ? `${text.slice(0, BG_INLINE)}\n…（已截断）` : text
   const state = rec.status === 'done' ? '完成' : rec.status === 'cancelled' ? '已取消' : '失败'
-  const head = `【delegate 后台任务 ${rec.jobId} ${state}（重启后补发）】\n[agent ${agent ?? '?'} · ${rec.turns ?? '?'} 轮 · ${rec.tier} / ${rec.model === '' ? '?' : rec.model} · ${rec.mode}]`
+  // 给人看的模型名：GPT 走自定义供应商时默认不带前缀。
+  const config = await loadConfig($).catch(() => undefined)
+  const model = rec.model === '' ? '' : rec.tier === 'gpt' && config !== undefined ? gptShownModel(config, rec.model) : rec.model
+  const head = `【delegate 后台任务 ${rec.jobId} ${state}（重启后补发）】\n[agent ${agent ?? '?'} · ${rec.turns ?? '?'} 轮 · ${rec.tier} / ${model === '' ? '?' : model} · ${rec.mode}]`
   const next = agent === null || agent === undefined ? '' : `\n要接着做就用 resume ${agent}`
   await $.prompt.submit({ text: `${head}\n${body}${next}` })
 }
@@ -1286,9 +1375,36 @@ const QUOTA_TTL = 60_000
 let quota: GptQuota | undefined
 let quotaAt = 0
 let quotaPending = false
+// 自定义供应商没有订阅额度：改用它的 new-api 用量接口（key 在 cpa-admin 脚本内部读，绝不返回）。
+let gptUsedCents: number | undefined
+const refreshGptUsage = async ($: EngineInterface): Promise<void> => {
+  const config = await loadConfig($).catch(() => undefined)
+  const source = config === undefined ? '' : gptSourceOf(config)
+  if (source === '') {
+    gptUsedCents = undefined
+
+    return
+  }
+  try {
+    const reply = await admin($, 'gpt-usage', { id: source })
+    gptUsedCents = typeof reply.usedCents === 'number' ? reply.usedCents : undefined
+  } catch {
+    gptUsedCents = undefined // 上游不支持就不显示，不打扰
+  }
+}
 
 const refreshQuota = async ($: EngineInterface, force = false): Promise<void> => {
   if (quotaPending || (!force && Date.now() - quotaAt < QUOTA_TTL)) return
+  // 走自定义供应商时不查订阅额度（也不显示旧的读数）。
+  const config = await loadConfig($).catch(() => undefined)
+  if (config !== undefined && gptSourceOf(config) !== '') {
+    const had = quota !== undefined
+    quota = undefined
+    quotaAt = Date.now()
+    if (had) await update($, liveTickAtom, (n: number) => n + 1)
+
+    return
+  }
   quotaPending = true
   try {
     const ran = await $.process.run(['node', `${$.plugin.root}/scripts/gpt-quota.mjs`], { timeoutMs: 30_000 })
@@ -1309,6 +1425,9 @@ const refreshQuota = async ($: EngineInterface, force = false): Promise<void> =>
 
 // GPT 作业结束时附上订阅额度，方便主会话决定还能不能接着派 GPT。15 秒内查过就复用。
 const gptQuotaLine = async ($: EngineInterface): Promise<string> => {
+  // 自定义供应商按自己的账单走，没有订阅窗口可报。
+  const config = await loadConfig($).catch(() => undefined)
+  if (config !== undefined && gptSourceOf(config) !== '') return ''
   if (Date.now() - quotaAt > 15_000) await refreshQuota($, true)
   if (quota === undefined) return ''
   if (!quota.ok) return `[GPT 额度查询失败：${quota.error}]`
@@ -1571,10 +1690,17 @@ export const register: Register = on => {
     const input = (typeof e.input === 'object' && e.input !== null ? e.input : {}) as Record<string, unknown>
     const model =
       typeof input.model === 'string' && input.model.trim() !== '' ? input.model.trim() : GPT_DEFAULT_MODEL
-    const label = gptLabel(model, {
-      background: input.background === true,
-      work: input.mode === 'work',
-    })
+    // 来源和前缀开关都在配置里：拿不到配置就退回订阅 + 裸模型名，绘制不能因此失败。
+    const config = await loadConfig($).catch(() => undefined)
+    const source = config === undefined ? '' : gptSourceOf(config)
+    const label = gptLabel(
+      config === undefined ? model : gptShownModel(config, model, source),
+      {
+        background: input.background === true,
+        work: input.mode === 'work',
+      },
+      config === undefined ? '' : gptSourceName(config, source),
+    )
 
     return (
       <Box>
@@ -1627,12 +1753,15 @@ export const register: Register = on => {
         ? `${statusText(r.status)} · ${r.at > 0 ? `${spanOf(now - r.at)}前开始` : '时间未知'}`
         : `${statusText(r.status)} · 第 ${turnsOf(r)} 轮 · ${spanOf(elapsed(r))}`
     void refreshQuota($).catch(() => undefined)
+    // GPT 走自定义供应商时没有订阅额度，额度区整块不画。
+    const config = await loadConfig($).catch(() => undefined)
+    const showQuota = config === undefined || gptSourceOf(config) === ''
 
     const more = await read($, liveMoreAtom)
     const shown = more ? jobs : jobs.slice(0, 6)
     const nDone = jobs.filter(r => r.status === 'done').length
 
-    const quotaBox = (
+    const quotaBox = !showQuota ? undefined : (
       <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} overflow="hidden">
         <Box justifyContent="space-between">
           <Text>
@@ -1798,7 +1927,14 @@ export const register: Register = on => {
               {clip(titleOf(sel), 80)}
             </Text>
             <Text dimColor wrap="wrap">
-              {[AGENT_TAG[sel.tier].text, sel.model, sel.mode, sel.jobId].filter(x => x !== '').join(' · ')}
+              {[
+                AGENT_TAG[sel.tier].text,
+                sel.tier === 'gpt' && config !== undefined ? gptShownModel(config, sel.model) : sel.model,
+                sel.mode,
+                sel.jobId,
+              ]
+                .filter(x => x !== '')
+                .join(' · ')}
             </Text>
           </Box>
           {sel.status === 'running' && (
@@ -1995,7 +2131,7 @@ export const register: Register = on => {
     }
     const draft = await read($, draftAtom)
     const note = await read($, flashAtom)
-    const card = (key: string, title: string, body: unknown) => <Box key={key} flexDirection="column" overflow="hidden" borderStyle="round" borderDimColor paddingX={2} gap={1}><Button key={'section-' + key} plain onPress={() => paneAction($, async () => { paneTab = key; if (key === 'gpt') await refreshQuota($) })}>{title + (paneTab === key ? ' ▾' : ' ▸')}</Button>{paneTab === key ? [body] : []}</Box>
+    const card = (key: string, title: string, body: unknown) => <Box key={key} flexDirection="column" overflow="hidden" borderStyle="round" borderDimColor paddingX={2} gap={1}><Button key={'section-' + key} plain onPress={() => paneAction($, async () => { paneTab = key; if (key === 'gpt') { await refreshQuota($); await refreshGptUsage($) } })}>{title + (paneTab === key ? ' ▾' : ' ▸')}</Button>{paneTab === key ? [body] : []}</Box>
     const button = (key: string, label: string, fn: () => Promise<void>) => <Button key={key} plain onPress={() => paneAction($, fn)}>{label}</Button>
     const modelOptions = cpaProviders.flatMap(p => p.models.map(m => ({ label: (config.providers.find(x => x.id === p.id)?.name || p.name) + ' / ' + m, value: JSON.stringify([p.id, m]) })))
     const slots = TIERS.map(tier => {
@@ -2058,6 +2194,14 @@ export const register: Register = on => {
         ]}</Box>
       </Box>)
     }
+    // GPT 来源：订阅，或 CPA 里任何一个 chat / responses 协议的供应商（anthropic 的不能用 delegate_gpt 的路径）。
+    const gptSource = gptSourceOf(config)
+    const gptSourceOptions = [
+      { label: 'ChatGPT 订阅', value: '' },
+      ...cpaProviders
+        .filter(p => p.protocol === 'chat' || p.protocol === 'responses')
+        .map(p => ({ label: (config.providers.find(x => x.id === p.id)?.name || p.name) + ' · ' + p.protocol, value: p.id })),
+    ]
     const gptControls = [
       button('quota', '刷新用量', async () => { await refreshQuota($, true) }),
       button('login', '登录新账号', () => startLogin($)),
@@ -2066,11 +2210,36 @@ export const register: Register = on => {
     if (loginState) gptControls.push(button('cancel-login', '取消登录', async () => { await admin($, 'gpt-login-cancel', { state: loginState }); loginState = ''; loginUrl = '' }))
     const gptRows = cpaAccounts.map(a => <Box key={a.name} gap={1}><Text wrap="truncate-middle">{(a.email || a.name) + (a.disabled ? ' · 禁用' : ' · 启用')}</Text>{button('use-' + a.name, '使用', async () => { await admin($, 'gpt-use', { name: a.name }); await refreshAccounts($) })}</Box>)
     const quotaRows = quota?.ok ? quota.windows.map(w => <Text key={w.label}>{w.label + ' 已用 ' + w.used + '% ' + resetIn(w.resetAt, Date.now())}</Text>) : [<Text key="no-quota" dimColor>{quota && !quota.ok ? quota.error : '点击刷新用量查看 GPT 额度'}</Text>]
+    // 自定义供应商：订阅专属的额度、登录、账号都不适用，只留来源本身和（能查到时的）已用金额。
+    const gptProvider = cpaProviders.find(p => p.id === gptSource)
+    const gptFallback = gptPickModel(gptProvider, undefined)
+    const gptModels = gptProvider === undefined ? [] : gptProvider.models.map(m => gptShownModel(config, m, gptSource))
+    const subscriptionRows = <Box flexDirection="column" overflow="hidden">{quotaRows}<Box gap={1}>{gptControls}</Box><Text wrap="truncate-middle">{loginUrl}</Text>{gptRows}</Box>
+    const sourceRows = gptSource === ''
+      ? subscriptionRows
+      : <Box flexDirection="column" overflow="hidden">
+          <Text dimColor>自定义供应商：在『供应商 · CPA』里管理 url/key</Text>
+          <Text wrap="truncate-end">{'模型：' + (gptModels.join('、') || '未添加') + (typeof gptFallback === 'string' ? '（默认 ' + gptShownModel(config, gptFallback, gptSource) + '）' : '')}</Text>
+          {gptUsedCents !== undefined && <Text>{'已用 $' + (gptUsedCents / 100).toFixed(2)}</Text>}
+          <Box gap={1}>{[button('gpt-used', '刷新已用', () => refreshGptUsage($))]}</Box>
+        </Box>
     return <Box flexDirection="column" overflow="hidden" gap={1}>
       <Text wrap="truncate-end">{note}</Text>
       {card('slots', '模型位', <Box flexDirection="column">{slots}</Box>)}
       {card('providers', '供应商 · CPA', <Box flexDirection="column" overflow="hidden">{providerRows}<Box gap={1}>{providerControls}</Box>{editor}</Box>)}
-      {card('gpt', 'GPT · ChatGPT 订阅', <Box flexDirection="column" overflow="hidden">{quotaRows}<Box gap={1}>{gptControls}</Box><Text wrap="truncate-middle">{loginUrl}</Text>{gptRows}</Box>)}
+      {card('gpt', 'GPT', <Box flexDirection="column" overflow="hidden">
+        <Select key="gpt-source" label="来源" options={gptSourceOptions} value={gptSource} onSelect={(v: string) => paneAction($, async () => {
+          await changeAction(
+            $,
+            c => setGptSource(c, v),
+            v === '' ? 'GPT 来源：ChatGPT 订阅' : 'GPT 来源：' + (config.providers.find(x => x.id === v)?.name || v),
+          )
+          await refreshGptUsage($)
+          await refreshQuota($, true)
+        })} />
+        {sourceRows}
+        <Select key="gpt-prefix" label="隐藏供应商前缀" options={[{ label: '开 · 只显示 gpt-6.1-sol', value: 'on' }, { label: '关 · 显示 mypool-resp/gpt-6.1-sol', value: 'off' }]} value={config.gptHidePrefix === false ? 'off' : 'on'} onSelect={(v: string) => changeAction($, c => setGptHidePrefix(c, v === 'on'), v === 'on' ? 'GPT 模型名只显示裸名' : 'GPT 模型名显示完整前缀')} />
+      </Box>)}
       <Text dimColor>供应商密钥仅保存在本机 CPA 配置中。</Text>
     </Box>
   })

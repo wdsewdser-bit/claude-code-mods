@@ -15,7 +15,7 @@ description: 根代理需要派发时加载：分包、模型与档位、精简�
 
 ## 模型与档位
 - 主会话 Opus 5.5 / medium，复杂判断用 high；不把主模型的档位继承当作所有子代理的默认。
-- 额度：套餐所有 Claude 模型共用一个额度池；DS（delegate_flash / delegate_pro）不占 Claude 额度。执行默认交给 DS（见“delegate（DS）派发”），含密钥或敏感数据的活也交给 DS（用户 2026-10-18 决定接受该链路）。不用 Sonnet。
+- 额度：套餐所有 Claude 模型共用一个额度池；DS（delegate_flash / delegate_pro）不占 Claude 额度，但DS 每天上限 8 亿 token（含缓存读），只能用 v4.1 flash，以后出的 v4.1-pro 也用不了（2026-10-29 起，wb 活动结束）。日常派活约每天 1 亿；测评、大批量实验或并发很多 DS 代理前先估总用量（10-25、10-28 曾到 8.5 亿、6.4 亿）。执行默认交给 DS（见“delegate（DS）派发”），含密钥或敏感数据的活也交给 DS（用户 2026-10-18 决定接受该链路）。不用 Sonnet。
 - Haiku 5.5 只用于需要 DS 没有的工具（浏览器、LSP、Artifact 等）的执行：worker、worker-ptc、researcher 默认 low（2026-10-20 实测三组题，含 20 多个文件的遗留代码题，low 与 medium 得分相同，省 15–42%；按步自适应升档从未触发，已放弃）；browser-worker、artifact-worker 暂留 high（未覆盖）；判断明显吃力或做过一次不稳时单次覆盖 medium/high，不能跳过必要验证。
 - Opus 5.5 干活只负责需要前端审美的部分：前端、设计、UI、动画（2026-10-27 用户决定，取代引入 GPT 前的“DS 不稳或深度审查派 Opus”）。Opus 定好样式和视觉方案后，后续实现、接线、修 bug 交给 DS 或 GPT，不再派 Opus。DS 做过一次仍不稳、高风险改动和独立审查，按“delegate_gpt（GPT）派发”升级到 GPT。派 Opus 时 worker-ptc / worker 单次覆盖 model=opus，用 medium。
 - 在 Agent 调用中用实际支持的 model 别名 haiku / opus；档位写在代理定义或单次派发参数里，不设全局 CLAUDE_CODE_EFFORT_LEVEL，也不强制全 Haiku。
@@ -92,17 +92,17 @@ description: 根代理需要派发时加载：分包、模型与档位、精简�
 - 代理持续返回异常时停止派发，由根代理继续，只报告已证实的异常。
 
 ## delegate（DS）派发
-- 两档当前是同一个模型 deepseek-v4.1-flash（能力在 T1 层，可替代 Sonnet），区别只在思考档：flash=low，pro=high；v4.1-pro 出来后 pro 档再换。执行任务默认 delegate_flash；需要更多判断时用 delegate_pro，effort=max 可选。pro 能做实质实现：后端业务、多文件改动、只读诊断都先交给 DS，不是只做杂活。找隐藏 bug 先派只读诊断（mode=read），确认根因后再 mode=work 修改。默认 mode=read，需要修改或命令时用 mode=work 并写明允许路径。
+- 两档当前是同一个模型 deepseek-v4.1-flash（能力在 T1 层，可替代 Sonnet），区别只在思考档：flash=low，pro=high；v4.1-pro 用不了，pro 档固定是 flash 加高思考档。执行任务默认 delegate_flash；需要更多判断时用 delegate_pro，effort=max 可选。pro 能做实质实现：后端业务、多文件改动、只读诊断都先交给 DS，不是只做杂活。找隐藏 bug 先派只读诊断（mode=read），确认根因后再 mode=work 修改。默认 mode=read，需要修改或命令时用 mode=work 并写明允许路径。
 - 调研开源项目或第三方库：派活前根代理先把对应版本的源码浅克隆到本地（`git clone --depth 1 --branch <tag>`），cwd 指向克隆目录，让执行者在本地批量 grep/read；不要让它用 WebFetch 逐页读 GitHub。只读模式（ptc=only）默认只能读 cwd，要读 cwd 外的目录时把它们列进 readPaths，不要为此传 ptc:off。网页资料让它在程序里用 `tools.fetch({urls:[...]})` 批量抓原文。一个包里只放一两个问题，并写明收敛条件（例如 N 轮内出报告，查不到的写“未证实”）。
 - 任务说明自包含，要求精简汇报（结论、改了哪些文件、测试结果）。轮数和时长基本不设限；预计超过几分钟或有独立工作时 background=true，记录 ID，同责任域用 resume。
 - 执行包针对 DS（1017）补四点：写明本任务 1–3 条真正要紧的连锁后果（“改了 X，Y 会失效，要核对”）；“做 N 次 / 统计”类要求让它写脚本循环计数，不靠模型自己数；随时间变化的状态（进程、端口、额度、文件）每次决策前重新读取，不沿用开头的快照；关键范围或完成定义有歧义时回报 `TASK_TERMINAL: blocked` 并写明要澄清什么，不自行补规则。必做验证要写明，减少无效调用不能省掉它。
 - 超时先核对真实文件与运行状态，不重复提交。工具或凭据错误先按原因处理；无新假设不反复派发，不能恢复时由根代理继续。不主动增加订阅或切换供应商。
 
 ## delegate_gpt（GPT）派发
-- 额度走 ChatGPT 订阅（当前 Plus，用量有限），既不占 Claude 额度，也不同于 DS 的近乎无限。分工按难度和风险分，不按领域分（2026-10-26 用户确认，取代 10-23 的按领域分工）：“后端”本身不是派 GPT 的理由。DS（先 flash，判断多用 pro）是默认执行者；GPT 只在三种情况用：① DS pro 做过一次仍不稳；② 改错代价高的改动——数据库/迁移、并发与锁、安全与权限、要同步正式版的关键路径；③ 高风险 diff 需要换模型做独立审查。Opus 主会话负责判断、前端和视觉、验收。例：给接口加字段并补测试、修一个定位清楚的后端 bug → DS；改任务队列的并发锁、迁移数据库结构 → GPT。
+- 额度走 ChatGPT 订阅（当前 Plus，用量有限），既不占 Claude 额度，DS 也有每天 8 亿的上限。分工按难度和风险分，不按领域分（2026-10-26 用户确认，取代 10-23 的按领域分工）：“后端”本身不是派 GPT 的理由。DS（先 flash，判断多用 pro）是默认执行者；GPT 只在三种情况用：① DS pro 做过一次仍不稳；② 改错代价高的改动——数据库/迁移、并发与锁、安全与权限、要同步正式版的关键路径；③ 高风险 diff 需要换模型做独立审查。Opus 主会话负责判断、前端和视觉、验收。例：给接口加字段并补测试、修一个定位清楚的后端 bug → DS；改任务队列的并发锁、迁移数据库结构 → GPT。
 - 默认 model=gpt-6.1-sol。只有高难、高风险的局部问题，例如跨模块疑难故障、关键算法、难以判定的正确性问题，或者 Sol 做过一次仍不稳时，才用 gpt-6-astra，不把它当日常 worker。
-- gpt-6.1-terra（2026-10-26 实测后用户定）：只是 DS 的下位替代，只在 DS 不可用（网关故障、限流等）时用。只用 max（delegate 已对 terra 固定 max）：低档几乎不思考（鹈鹕 SVG 的 xhigh 版没写动画；bug hunt 上 xhigh 11.3 分、比 Haiku low 还低，max 40.7 分、接近 DS max 42.7），long4 上 13 轮就自己报未完成收手，resume 后 64 分和 sol 持平。任务里写明“全部做完再汇报”，准备好 resume。
 - GPT 档位（effort）：最低 medium，不填也按 medium 跑，不用 low。常规后端实现和审查用 medium；判断量较大、跨模块的改动或深度审查用 high；真正高难的问题用 xhigh，一般就够；max 只在 xhigh 做过一次仍不稳时按需使用。没有新假设不加档。
 - 派 GPT 前先自问：DS pro 做过了吗？改错的代价高吗？都不是就交给 DS。做独立审查时用 mode=read，审查只依据 diff、调用关系和测试，不顺手改代码。
 - 执行包要写明：允许修改的路径；禁止的改动（依赖升级、迁移、无关重构或格式化、新增抽象）；验收命令。要求它先围绕验收做最小改动；发现更大的方案只报告权衡，不自行扩大范围。
-- 汇报没有测试命令和输出就打回；它自报 PASS 不算验收，根代理要核对真实文件和测试。用法与 DS 相同（mode / background / resume / effort）；CPA 会自动启动，首次调用多等几秒。连接或认证失败时先看 ~/tools/cliproxyapi/cpa.log，不改派到付费 API。
+- 验证按风险分级并写进执行包：小改动只跑执行包点名的 1–2 条能证明结果的命令；默认不建基线、不做快照或备份副本、不比对哈希、不 dry-run、不补冒烟测试或新测试文件，确有必要时由执行包点名。GPT 有明确执行包时守得住范围，没给验收命令或当主会话时容易把小活做成仪式性验证（2026-10-29 社区普遍吐槽，用户确认）。
+- 汇报没有测试命令和输出就打回；它自报 PASS 不算验收，根代理要核对真实文件和测试。用法与 DS 相同（mode / background / resume / effort）；CPA 会自动启动，首次调用多等几秒。连接或认证失败时先看 C:/Users/yadaz/tools/cliproxyapi/cpa.log，不改派到付费 API。

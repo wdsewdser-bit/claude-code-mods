@@ -6,6 +6,8 @@ import {
   normalize,
   removeProvider,
   resolveTier,
+  setGptHidePrefix,
+  setGptSource,
   SEED,
   migrationPlan,
   isEffort,
@@ -16,9 +18,12 @@ import {
 import {
   GPT_DEFAULT_MODEL,
   GPT_MODELS,
+  gptDisplayModel,
   gptLabel,
   gptModelOf,
+  gptSourceModelOf,
   gptToolDescription,
+  gptWireModel,
 } from '../hooks/lib/gpt.ts'
 import {
   eventLine,
@@ -90,6 +95,36 @@ describe('config', () => {
     const c = removeProvider(normalize(undefined), 'command').config
     expect(c.slots).toEqual({ flash: null, pro: null })
     expect(resolveTier(c, 'flash')).toHaveProperty('error')
+  })
+
+  test('gpt 来源跟着供应商走：保留、被删就清空、垃圾当订阅', () => {
+    const cpa = [
+      { id: 'mypool-chat', name: 'Pool chat' },
+      { id: 'mypool-resp', name: 'Pool resp' },
+    ]
+    const raw = (extra: Record<string, unknown> = {}) => ({ providers: cpa, slots: {}, ...extra })
+    expect(normalize(raw({ gptSource: 'mypool-resp' })).gptSource).toBe('mypool-resp')
+    expect(normalize(raw({ gptSource: ' mypool-chat ' })).gptSource).toBe('mypool-chat')
+    expect(normalize(raw({ providers: [cpa[0]], gptSource: 'mypool-resp' })).gptSource).toBe('')
+    expect(normalize(raw()).gptSource).toBe('')
+    expect(normalize({ providers: cpa, slots: {}, gptSource: 42 }).gptSource).toBe('')
+    expect(normalize(undefined).gptSource).toBe('')
+    // 选来源：只认已有供应商，出错的配置原样返回
+    const base = normalize(raw())
+    expect(setGptSource(base, 'mypool-resp').config.gptSource).toBe('mypool-resp')
+    expect(setGptSource(base, '').config.gptSource).toBe('')
+    expect(setGptSource(base, 'nope').error).toContain('没有叫')
+    expect(setGptSource(base, 'nope').config).toBe(base)
+  })
+
+  test('gptHidePrefix 默认开，只有明确写 false 才关', () => {
+    const raw = (extra: Record<string, unknown>) => ({ providers: [], slots: {}, ...extra })
+    expect(normalize(raw({})).gptHidePrefix).toBe(true)
+    expect(normalize(raw({ gptHidePrefix: true })).gptHidePrefix).toBe(true)
+    expect(normalize(raw({ gptHidePrefix: false })).gptHidePrefix).toBe(false)
+    expect(normalize(raw({ gptHidePrefix: 'no' })).gptHidePrefix).toBe(true)
+    expect(normalize(undefined).gptHidePrefix).toBe(true)
+    expect(setGptHidePrefix(normalize(undefined), false).config.gptHidePrefix).toBe(false)
   })
 
   test('survives garbage in the store', () => {
@@ -184,7 +219,7 @@ describe('gpt', () => {
     expect(gptModelOf(' gpt-6-astra ')).toBe('gpt-6-astra')
     expect(GPT_DEFAULT_MODEL).toBe('gpt-6.1-sol')
     expect(GPT_MODELS).toContain('gpt-6-astra')
-    expect(GPT_MODELS).toContain('gpt-6.1-terra')
+    expect(GPT_MODELS).not.toContain('gpt-6.1-terra')
     const bad = gptModelOf('gpt-9')
     expect(typeof bad === 'object' && 'error' in bad && bad.error.includes('未知的 GPT 模型')).toBe(true)
   })
@@ -204,6 +239,37 @@ describe('gpt', () => {
     expect(d).toContain('gpt-6-astra')
     expect(d).toContain('高难')
     expect(d).not.toContain('deepseek')
+  })
+
+  test('a custom source sends "<provider id>/<model>" to CPA and keeps the subscription bare', () => {
+    expect(gptWireModel('mypool-resp', 'gpt-6.1-sol')).toBe('mypool-resp/gpt-6.1-sol')
+    expect(gptWireModel(' mypool-chat ', 'gpt-6-sol')).toBe('mypool-chat/gpt-6-sol')
+    expect(gptWireModel('', 'gpt-6.1-sol')).toBe('gpt-6.1-sol')
+  })
+
+  test('a custom source accepts any model its provider lists, and lists them when refusing', () => {
+    const models = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-5.6-terra']
+    expect(gptSourceModelOf('', models)).toBe(GPT_DEFAULT_MODEL)
+    expect(gptSourceModelOf(' gpt-5.6-terra ', models)).toBe('gpt-5.6-terra')
+    const bad = gptSourceModelOf('gpt-9', models)
+    expect(typeof bad === 'object' && 'error' in bad && bad.error.includes('未知的 GPT 模型「gpt-9」')).toBe(true)
+    expect(typeof bad === 'object' && 'error' in bad && bad.error.includes('gpt-5.6-terra')).toBe(true)
+    // 列表里没有默认模型时退回第一个
+    expect(gptSourceModelOf('', ['gpt-6-sol'])).toBe('gpt-6-sol')
+  })
+
+  test('displayed model names drop the provider prefix unless the switch is off', () => {
+    expect(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', true)).toBe('gpt-6.1-sol')
+    expect(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', undefined)).toBe('gpt-6.1-sol')
+    expect(gptDisplayModel('mypool-resp/gpt-6.1-sol', 'mypool-resp', true)).toBe('gpt-6.1-sol')
+    expect(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', false)).toBe('mypool-resp/gpt-6.1-sol')
+    expect(gptDisplayModel('gpt-6.1-sol', '', false)).toBe('gpt-6.1-sol')
+  })
+
+  test('the label names the source instead of the subscription', () => {
+    expect(gptLabel('gpt-6.1-sol', { background: false, work: true }, 'Pool resp')).toBe(
+      'gpt · Pool resp / gpt-6.1-sol · 前台 · 可改文件',
+    )
   })
 })
 

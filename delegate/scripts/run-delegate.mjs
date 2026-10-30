@@ -168,8 +168,11 @@ const createControl = (jobId, job) => {
     // 每个思考 token 一行的进度事件对面板没用，只会把文件撑大、提前轮转。
     if (!(o.type === 'system' && o.subtype === 'thinking_tokens')) append(line)
     if (typeof o.session_id === 'string' && o.session_id !== '') state.sessionId = o.session_id
+    // 一条消息的思考、文本、工具块各发一条 assistant 事件（message.id 相同），按 id 计轮。
     if (o.type === 'assistant') {
-      state.turns += 1
+      const mid = o.message?.id
+      if (!mid || mid !== state.lastMessageId) state.turns += 1
+      if (mid) state.lastMessageId = mid
       const blocks = Array.isArray(o.message?.content) ? o.message.content : []
       const tool = blocks.find(c => c && c.type === 'tool_use')
       if (tool) state.lastTool = String(tool.name ?? '')
@@ -329,6 +332,8 @@ const main = async () => {
     finish(value, code)
   }
   // gpt: CPA supplies the url and the key, so the job carries only the model and the task.
+  // 走自定义供应商时 model 已经是 '<供应商id>/<模型>'（CPA 按前缀路由），这里一律原样透传：
+  // 不按 model 名做任何判断（effort 等都在插件里按裸模型名算好了），也不拆前缀。
   const gpt = job.gpt === true
   const { model, task } = job
   if (!task || !model) {
@@ -467,6 +472,7 @@ const main = async () => {
     let sid = control?.state.sessionId ?? null
     let lastText = ''
     let turnCount = 0
+    let lastMid
     const models = []
     let cancelled = false
     let pendingClose = false
@@ -501,7 +507,9 @@ const main = async () => {
       // stream-json: keep the session id and the last assistant text, so a run cut short still reports what it did.
       if (typeof o.session_id === 'string' && o.session_id !== '') sid = o.session_id
       if (o.type === 'assistant') {
-        turnCount += 1
+        const mid = o.message?.id
+        if (!mid || mid !== lastMid) turnCount += 1
+        if (mid) lastMid = mid
         addModel(models, o)
         const text = (o.message?.content ?? []).filter(c => c.type === 'text').map(c => c.text).join('')
         if (text) lastText = text

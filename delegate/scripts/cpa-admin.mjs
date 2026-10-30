@@ -75,6 +75,19 @@ export async function execute(command, input={}, arg='') {
    if(!r.ok) throw new Error('上游模型列表 HTTP '+r.status)
    const data=await r.json();return {ok:true,models:[...new Set((data.data||data.models||[]).map(m=>typeof m==='string'?m:m.id).filter(x=>typeof x==='string'))]}
  }
+ // new-api 风格的用量接口：GET {base-url}/dashboard/billing/usage，Bearer key，{total_usage} 单位是美分。
+ // key 只在脚本内部读取并使用，返回值里只有金额。
+ if(command==='gpt-usage') {
+   const found=(await groups()).find(x=>x.group.name===(input.id||arg)||x.group.prefix===(input.id||arg)); if(!found) throw new Error('没有这个供应商')
+   const key=found.group.keys?.find(k=>k['api-key'])?.['api-key']; if(!key) throw new Error('供应商没有 key')
+   secrets.push(key)
+   const baseUrl=String(found.group['base-url']||'').replace(/\/$/,''); if(!baseUrl) throw new Error('供应商没有 base-url')
+   const r=await fetch(baseUrl+'/dashboard/billing/usage',{headers:{Authorization:'Bearer '+key},signal:AbortSignal.timeout(15000)})
+   if(!r.ok) throw new Error('用量接口 HTTP '+r.status)
+   const data=await r.json();const total=Number(data?.total_usage)
+   if(!Number.isFinite(total)) throw new Error('用量接口没有 total_usage')
+   return {ok:true,usedCents:Math.round(total*100)/100}
+ }
  if(command==='gpt-login-start') return {ok:true,...(await request('/oauth/auth-url?provider=codex')).data}
  if(command==='gpt-login-status') return {ok:true,...(await request('/oauth/status?state='+encodeURIComponent(input.state||arg))).data}
  if(command==='gpt-login-cancel') return {ok:true,...(await request('/oauth/session?state='+encodeURIComponent(input.state||arg),'DELETE')).data}
