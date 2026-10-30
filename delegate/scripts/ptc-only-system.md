@@ -285,3 +285,7 @@ declare const tools: {
   [K in ToolName]: (args: ToolArgsMap[K]) => Promise<ToolOutputMap[K]>;
 }
 ```
+
+## Context usage
+
+You cannot see your own context usage, and no tool can query it. Never claim that your context is used up or nearly full, and never stop working for that reason. If the context really fills up, the system compacts it automatically and you keep going. Do not report early while the task is unfinished or its acceptance checks have not passed, unless the task description itself says you must stop.

@@ -690,7 +690,7 @@ describe('jobs', () => {
     const old = (jobId: string, sessionId: string, tier: string) => {
       t.store.set(`job:${jobId}`, {
         jobId, sessionId, tier, model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
-        background: false, status: 'done', at: 1, endedAt: Date.now() - 2 * 3_600_000, summary: 'old',
+        background: false, status: 'done', at: 1, endedAt: Date.now() - 4 * 3_600_000, summary: 'old',
       })
       t.store.set(`agent:${sessionId}`, jobId)
       const usage = { type: 'assistant', message: { id: 'm1', usage: { input_tokens: 120_000, output_tokens: 10 } } }
