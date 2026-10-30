@@ -65,8 +65,8 @@ describe('usage arithmetic', () => {
     // At a 400k limit none of the fills is capped, so these are the configured numbers.
     const at = (tokens: number): Level => levelOf(tokens, 400_000, DEFAULTS)
     expect(at(0)).toBe('none')
-    expect(at(249_999)).toBe('none')
-    expect(at(250_000)).toBe('boundary')
+    expect(at(199_999)).toBe('none')
+    expect(at(200_000)).toBe('boundary')
     expect(at(299_999)).toBe('boundary')
     expect(at(300_000)).toBe('soft')
     expect(at(349_999)).toBe('soft')
@@ -76,13 +76,13 @@ describe('usage arithmetic', () => {
 
   test('no fill sits closer than 30k to the limit', () => {
     // A 300k limit caps soft and urgent at 270k, so 270k is already urgent.
-    expect(levelOf(249_999, 300_000, DEFAULTS)).toBe('none')
-    expect(levelOf(250_000, 300_000, DEFAULTS)).toBe('boundary')
-    expect(levelOf(269_999, 300_000, DEFAULTS)).toBe('boundary')
-    expect(levelOf(270_000, 300_000, DEFAULTS)).toBe('urgent')
+    expect(levelOf(249_999, 300_000, { ...DEFAULTS, boundaryTokens: 250_000 })).toBe('none')
+    expect(levelOf(250_000, 300_000, { ...DEFAULTS, boundaryTokens: 250_000 })).toBe('boundary')
+    expect(levelOf(269_999, 300_000, { ...DEFAULTS, boundaryTokens: 250_000 })).toBe('boundary')
+    expect(levelOf(270_000, 300_000, { ...DEFAULTS, boundaryTokens: 250_000 })).toBe('urgent')
     // A 280k limit caps every fill at 250k: the first one is urgent.
-    expect(levelOf(249_999, 280_000, DEFAULTS)).toBe('none')
-    expect(levelOf(250_000, 280_000, DEFAULTS)).toBe('urgent')
+    expect(levelOf(249_999, 280_000, { ...DEFAULTS, boundaryTokens: 250_000 })).toBe('none')
+    expect(levelOf(250_000, 280_000, { ...DEFAULTS, boundaryTokens: 250_000 })).toBe('urgent')
   })
 
   test('describeFill names the window even without a token count', () => {

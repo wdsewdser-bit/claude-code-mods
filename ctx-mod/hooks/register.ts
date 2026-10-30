@@ -749,13 +749,19 @@ const TOOLS = [
   {
     name: 'history',
     description:
-      '检索或读取完整历史。action 为 "search" 时按条件查历史编号，为 "read" 时按编号读原文。工具结果末尾形的 [#123] 就是历史编号。读原文时 field 填 "input" 可以看到那次工具调用的完整参数（子代理的任务原文、发出的消息、完整的命令）。搜索默认不显示引擎自己塞进来的背景信息（附件、钩子上下文、备注）；要找它们就用 door 指定，如 "attachment"、"hook-context"、"note"。搜索不指定 window 时默认搜最近 3 个窗口；这几个窗口里没有命中会自动往更早的窗口找，找到有命中的窗口就停，结果末尾会写明实际搜了哪些窗口，没搜的窗口用 window 指定。命中只存在于被截断字段的原文时，结果会标出 [overflow text offset=N]（调用参数则标为 input），用 read 的 offset 从那里读全文。',
+      '检索或读取完整历史。action 为 "search" 时按条件查历史编号，为 "read" 时按编号读原文。工具结果末尾形的 [#123] 就是历史编号。读原文时 field 填 "input" 可以看到那次工具调用的完整参数（子代理的任务原文、发出的消息、完整的命令）。搜索默认不显示引擎自己塞进来的背景信息（附件、钩子上下文、备注）；要找它们就用 door 指定，如 "attachment"、"hook-context"、"note"。搜索不指定 window 时默认（scope:"recent"）搜最近 3 个窗口；这几个窗口里没有命中会自动往更早的窗口找，找到有命中的窗口就停，结果末尾会写明实际搜了哪些窗口，没搜的窗口用 window 指定。近处有同名命中会挡住更早的记录；怀疑近处命中遮挡了更早记录、或要找某个说法最早的出处时，用 scope:"all" 从第 1 个窗口到当前窗口全部搜一遍，结果仍按时间新→旧排列并受 limit 限制，尾注写明搜了哪些窗口、是否还有更多。指定 window 时忽略 scope。命中只存在于被截断字段的原文时，结果会标出 [overflow text offset=N]（调用参数则标为 input），用 read 的 offset 从那里读全文。',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['search', 'read'], description: 'search 或 read。' },
         query: { type: 'string', description: '搜索的词（search）。' },
-        window: { type: 'number', description: '只看某个窗口（search）。' },
+        window: { type: 'number', description: '只看某个窗口（search）；给了它就忽略 scope。' },
+        scope: {
+          type: 'string',
+          enum: ['recent', 'all'],
+          description:
+            "搜索范围（search）。recent（默认）只搜最近几个窗口，近处有命中就停；all 从第 1 个窗口搜到当前窗口，按时间新→旧返回，仍受 limit 限制。怀疑近处命中遮挡了更早记录、或要找最早出处时用 all。指定 window 时忽略。",
+        },
         role: { type: 'string', enum: ['user', 'assistant', 'tool'], description: '只看某种角色（search）。' },
         tool_name: { type: 'string', description: '只看某个工具的结果，填工具名如 Read（search）。' },
         path: { type: 'string', description: '只看某个文件（search）。' },

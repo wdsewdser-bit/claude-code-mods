@@ -30,7 +30,9 @@ import {
   repliesAnswered,
   readRecord,
   recentActions,
+  SEARCH_LIMIT_MAX,
   search,
+  searchLimit,
   groupsWanted,
   isOwnRow,
   manifestName,
@@ -392,6 +394,10 @@ type State = {
   /** Only remembered in memory: a reloaded session has no live turn to measure the cache against. */
   lastRequestAt: number | null
   reminded: { boundary: boolean; soft: boolean; urgent: boolean }
+  /** The context fill when the ledger clock last reset (an entry or a fresh window); null until first seen. */
+  ledgerBase: number | null
+  /** Whether this stretch of growth since `ledgerBase` has already been nudged: one stretch is said once. */
+  ledgerNudged: boolean
   archive: ArchivePage[]
   activities: FileActivity[]
   roster: AgentSeen[]
@@ -508,6 +514,8 @@ const emptyState = (): State => ({
   requestsSinceSwitch: 0,
   lastRequestAt: null,
   reminded: { boundary: false, soft: false, urgent: false },
+  ledgerBase: null,
+  ledgerNudged: false,
   archive: [],
   activities: [],
   roster: [],
@@ -759,6 +767,8 @@ const stateFrom = (raw: Record<string, unknown> | null): State => {
     soft: reminded.soft === true,
     urgent: reminded.urgent === true,
   }
+  state.ledgerBase = typeof raw.ledgerBase === 'number' && Number.isFinite(raw.ledgerBase) ? raw.ledgerBase : null
+  state.ledgerNudged = raw.ledgerNudged === true
 
   return state
 }
@@ -1082,6 +1092,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       switchTimes: state.switchTimes,
       requestsSinceSwitch: state.requestsSinceSwitch,
       reminded: state.reminded,
+      ledgerBase: state.ledgerBase,
+      ledgerNudged: state.ledgerNudged,
       archive: state.archive,
       activities: state.activities,
       roster: state.roster,
@@ -1175,6 +1187,9 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       state.window = next
       state.requestsSinceSwitch = 0
       state.reminded = { boundary: false, soft: false, urgent: false }
+      // A window opened elsewhere starts the ledger clock afresh.
+      state.ledgerBase = null
+      state.ledgerNudged = false
     }
 
     state.part = Math.max(0, (await readWindow(state.window)) - 1)
@@ -1723,9 +1738,37 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return `上下文已用 ${k(env.tokens)}k/${k(env.limit)}k。如果当前任务刚告一段落（刚完成一项、刚交付结果或在等用户回复），现在换窗口最划算：先把进度写进账本，再调用 context 工具换窗口。如果正在任务中间，就继续，不用理会。`
   }
 
+  /**
+   * The ledger nudge: how far the context has grown since the latest entry was
+   * booked, said once per stretch and only while no fill reminder owns the
+   * moment. It asks, never orders, and blocks nothing. The first fill seen after
+   * a fresh window or a lost baseline only starts the clock: the growth before
+   * that was never observed, so it is not counted against the model.
+   */
+  const ledgerNudge = (tokens: number): string | null => {
+    if (config.ledgerNudgeTokens <= 0 || state.ledgerNudged) return null
+    // A fill reminder already told the model what to do; a growth nudge would only repeat it.
+    if (state.reminded.boundary || state.reminded.soft || state.reminded.urgent) return null
+    if (state.ledgerBase === null) {
+      state.ledgerBase = tokens
+      saveMeta()
+
+      return null
+    }
+    const growth = tokens - state.ledgerBase
+    if (growth < config.ledgerNudgeTokens) return null
+    state.ledgerNudged = true
+    saveMeta()
+
+    return `距上次记账已增长约 ${k(growth)}k token，若刚完成一个阶段，用 ledger_append 记一笔（写明下一步和锚点）；正在任务中间可忽略。`
+  }
+
   const reminder = (env: Env): string | null => {
     if (env.tokens === undefined) return null
     const level = levelOf(env.tokens, env.limit, config)
+
+    // Below every fill, growth alone may earn a word — never on top of one of them.
+    if (level === 'none') return ledgerNudge(env.tokens)
 
     if (level === 'boundary') return boundaryReminder(env)
 
@@ -1819,6 +1862,9 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     })
     state.ledgerSeq = seq
     state.page.push(entry)
+    // The entry resets the ledger clock: the next nudge measures from this fill.
+    state.ledgerBase = env.tokens ?? null
+    state.ledgerNudged = false
     const ledgerWrite = queue.push(pathIn('ledger.jsonl'), toJsonl(state.page))
     saveMeta()
     const isWritten = await ledgerWrite
@@ -2056,6 +2102,16 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     ) {
       problems.push('window 必须是大于等于 1 的整数。')
     }
+    // A named window is searched alone, so a scope would have nothing to widen.
+    const scopeField = raw.scope
+    if (
+      windowField === undefined &&
+      scopeField !== undefined &&
+      scopeField !== 'recent' &&
+      scopeField !== 'all'
+    ) {
+      problems.push("scope 只能是 'recent'（默认，最近几个窗口）或 'all'（第 1 个窗口到当前窗口全搜）。")
+    }
     const roleField = raw.role
     if (roleField !== undefined && roleField !== 'user' && roleField !== 'assistant' && roleField !== 'tool') {
       problems.push('role 只能是 user、assistant 或 tool 之一。')
@@ -2089,7 +2145,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       overflowProblems.length === 0 ? text : `${text}\n（${overflowProblems.join('；')}）`
 
     const target = windowField as number | undefined
-    const searchIn = async (windows: readonly number[]): Promise<SearchHit[]> => {
+    /** A scope:'all' search asks for one hit past the cap so it can say whether more exist. */
+    const searchIn = async (windows: readonly number[], limitOverride?: number): Promise<SearchHit[]> => {
       for (const window of windows) await loadWindow(window)
       const wanted = new Set(windows)
       // An overflow part queued a moment ago is not on disk yet. A search reads one only
@@ -2105,7 +2162,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
           tool: typeof raw.tool_name === 'string' ? raw.tool_name : undefined,
           path: typeof raw.path === 'string' ? raw.path : undefined,
           door: typeof raw.door === 'string' ? raw.door : undefined,
-          limit: raw.limit as number | undefined,
+          limit: limitOverride ?? (raw.limit as number | undefined),
         },
         async (seq, field, part) => {
           const path = pathIn(overflowName(seq, field, part))
@@ -2126,6 +2183,32 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       }
     }
 
+    const span = (from: number, to: number): string => (from === to ? `第 ${from} 个窗口` : `第 ${from}–${to} 个窗口`)
+
+    // scope:'all' walks every window from the first to the current one: a hit nearby
+    // must never hide the earlier row a person is actually after.
+    if (raw.scope === 'all') {
+      const every: number[] = []
+      for (let window = 1; window <= state.window; window += 1) every.push(window)
+      const limit = searchLimit(raw.limit)
+      const found = await searchIn(every, limit + 1)
+      const shown = found.slice(0, limit)
+      const searched = span(1, state.window)
+      if (found.length === 0) {
+        return { result: withOverflowNotes(`${searched}里都没有匹配（scope:"all" 搜了全部窗口）。`) }
+      }
+      const tail =
+        found.length > limit
+          ? `还有更多命中，只列前 ${shown.length} 条；可用 limit 提高上限，或用 window 缩小范围`
+          : limit >= SEARCH_LIMIT_MAX && found.length >= SEARCH_LIMIT_MAX
+            ? `已达单次上限 ${SEARCH_LIMIT_MAX} 条，可能还有更多；可用 window 缩小范围`
+            : `共 ${shown.length} 条，没有更多`
+
+      return {
+        result: withOverflowNotes(`${shown.map(renderHit).join('\n')}\n（搜了${searched}的全部窗口，按时间新→旧；${tail}）`),
+      }
+    }
+
     // A miss in the recent windows does not mean it never happened, so older ones are added one at a time until something hits.
     let first = Math.max(1, state.window - SEARCH_WINDOWS + 1)
     const recent: number[] = []
@@ -2136,7 +2219,6 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       hits = await searchIn([first])
     }
 
-    const span = (from: number, to: number): string => (from === to ? `第 ${from} 个窗口` : `第 ${from}–${to} 个窗口`)
     if (hits.length === 0) {
       return { result: withOverflowNotes(state.window === 1 ? '没有匹配。' : `${span(1, state.window)}里都没有匹配。`) }
     }
@@ -2553,6 +2635,9 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     state.part = 0
     state.requestsSinceSwitch = 0
     state.reminded = { boundary: false, soft: false, urgent: false }
+    // A new window starts with a small context, so the old baseline means nothing.
+    state.ledgerBase = null
+    state.ledgerNudged = false
     state.switchTimes = [...state.switchTimes, now].filter(at => at > now - 3_600_000)
     state.lastHandoff = estimateTokens(info.handoffText)
     state.pending = null

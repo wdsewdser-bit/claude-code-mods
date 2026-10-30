@@ -355,8 +355,8 @@ export type SearchHit = {
 
 const EXCERPT_PAD = 80
 const EXCERPT_HEAD = 160
-const SEARCH_LIMIT_DEFAULT = 20
-const SEARCH_LIMIT_MAX = 100
+export const SEARCH_LIMIT_DEFAULT = 20
+export const SEARCH_LIMIT_MAX = 100
 
 /**
  * The cap the caller asked for, or the default. A value that is not a finite
@@ -364,7 +364,7 @@ const SEARCH_LIMIT_MAX = 100
  * read as "no cap" and hand back the whole history, which is exactly what a
  * comparison against NaN does.
  */
-const searchLimit = (limit: unknown): number => {
+export const searchLimit = (limit: unknown): number => {
   if (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 1) return SEARCH_LIMIT_DEFAULT
 
   return Math.min(Math.floor(limit), SEARCH_LIMIT_MAX)
