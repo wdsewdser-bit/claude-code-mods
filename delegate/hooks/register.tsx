@@ -68,6 +68,8 @@ const AGENT_PREFIX = 'agent:'
 const MAX_REPLY = 20_000
 // A finished background job speaks to the model through a prompt: keep it short, the rest is in a file.
 const BG_INLINE = 6_000
+// 后台作业请示主会话时最多等多久；runner 只给后台作业传 askWaitMs，时长可用 DELEGATE_ASK_WAIT_MS 覆盖。
+const ASK_MS = 30 * 60 * 1000
 
 const EMPTY: Draft = {
   pName: '',
@@ -279,6 +281,8 @@ type JobReply = {
   models?: string[] | null
   // 任务自己写的 TASK_TERMINAL（completed / blocked / failed）；没写就是 null
   terminal?: string | null
+  // 作业是因为请示一直没等到回复才结束的（runner 记在 result.json 里）
+  askTimeout?: boolean
 }
 
 // 进程成功（ok）不等于任务完成：把任务终态和实际模型单独说一行，附在返回文本末尾。
@@ -1005,6 +1009,8 @@ const callTool = async (
     tier: target,
     // 流式输入：任务作为第一条 user 消息写进去，stdin 保持打开，才能中途插话。
     stream: true,
+    // 只有后台作业会停下来请示主会话；前台作业要等人，给它等待时长反而会卡住。
+    ...(background ? { askWaitMs: ASK_MS } : {}),
     ...(sessionId === undefined ? {} : { sessionId }),
   }
   if (background) {
@@ -1051,9 +1057,11 @@ const settle = async (
     return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${tail}`, isError: true }
   }
   const text = reply.text ?? ''
+  // 请示没等到回复就结束了：通知里点明，别当成正常完成。
+  const askNote = reply.askTimeout === true ? '请示未获回复，作业已按请示内容结束；要接着做就 resume。\n' : ''
 
   return {
-    result: `${head}\n${text.length > MAX_REPLY ? `${text.slice(0, MAX_REPLY)}\n…（已截断）` : text}${tail}`,
+    result: `${head}\n${askNote}${text.length > MAX_REPLY ? `${text.slice(0, MAX_REPLY)}\n…（已截断）` : text}${tail}`,
   }
 }
 
@@ -1134,7 +1142,7 @@ const jobTools = (): { name: string; description: string; inputSchema: Record<st
   {
     name: 'delegate_send',
     description:
-      '给正在跑的作业追加一条消息：不打断正在跑的工具，当前轮结束后它会把这条当作新一轮接着做。用来补要求、纠偏、让它顺带检查别的东西。已经结束的作业不能插话，改用 resume 把要求写进 task。',
+      '给正在跑的作业追加一条消息：不打断正在跑的工具，当前轮结束后它会把这条当作新一轮接着做。用来补要求、纠偏、让它顺带检查别的东西。后台作业发来请示（【请示】）时也用它回复：消息就是它正等着的那条回复，它会在原进程里接着做。已经结束的作业不能插话，改用 resume 把要求写进 task。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1501,9 +1509,44 @@ const DOT: Record<JobRecord['status'], { glyph: string; color: string }> = {
   orphaned: { glyph: '◌', color: 'warning' },
 }
 
+// 已经通知过主会话的请示：作业 id → 上次通知过的 seq（同一次请示只播报一次）。
+const askNotified = new Map<string, number>()
+
+/** 等回复的时长写成“几分钟”，没记就当 30 分钟。 */
+const askMinutesOf = (st: JobStatusFile | undefined): number => {
+  const ms = st?.askWaitMs
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return 30
+
+  return Math.max(1, Math.round(ms / 60_000))
+}
+
+// 后台作业在请示主会话：phase 是 asking 且 seq 比上次通知过的大，就发一条 prompt。
+// 只读 status.json，不碰 inbox——inbox 只由 runner 的轮询取走，两边同时 drain 会丢消息。
+const notifyAsks = async (
+  $: EngineInterface,
+  running: readonly JobRecord[],
+  statuses: Record<string, JobStatusFile>,
+): Promise<void> => {
+  for (const rec of running) {
+    const st = statuses[rec.jobId]
+    const ask = st?.phase === 'asking' ? st.ask : undefined
+    if (ask === undefined || ask.seq <= (askNotified.get(rec.jobId) ?? 0)) continue
+    const agent = st?.sessionId ?? rec.sessionId ?? '?'
+    const body = ask.text.trim() === '' ? '（请示内容为空，用 delegate_status 看它的进度）' : ask.text.trim()
+    try {
+      await $.prompt.submit({
+        text: `【delegate 后台任务 ${rec.jobId} 请示】（agent ${agent}）\n${body}\n用 delegate_send("${rec.jobId}", "你的决定") 回复，它会在原进程里接着做；${askMinutesOf(st)} 分钟内没有回复，它会结束，之后可以用 resume 续做。`,
+      })
+      askNotified.set(rec.jobId, ask.seq)
+    } catch (error) {
+      $.ui.log(`delegate: ${rec.jobId} 的请示没通知出去：${messageOf(error)}`, { to: 'debug' })
+    }
+  }
+}
+
 // 每 2 秒看一眼：面板开着、有作业在跑、且作业状态确实变了才重绘；作业刚停时再画一次收尾。
 // 不能无条件每秒重绘：宿主里每次读取都要跨进程，一次绘制可能超过 1 秒，会被下一次重绘打断，面板永远画不出来。
-// 只在 session.start 里起一次：那里的 $ 跟会话一样长，派活钩子里的 $ 钩子返回就失效。
+// 只在 session.start 里起一次：那里的 $ 跟会话一样长，派活钩子里的 $ 钩子返回就失效（后台作业的请示也靠它播报）。
 let liveWasRunning = false
 let liveBusy = false
 let liveSig = ''
@@ -1517,15 +1560,29 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         await pollLogin($)
         // 闲着时也按 TTL 刷新 GPT 额度，按钮栏才不会停在旧读数上（refreshQuota 自己会触发重绘）。
         await refreshQuota($)
-        const running = (await listJobs($)).filter(r => r.status === 'running')
+        const all = await listJobs($)
+        const running = all.filter(r => r.status === 'running')
+        // 作业结束了就不再惦记它的请示。
+        for (const r of all) if (r.status !== 'running') askNotified.delete(r.jobId)
         if (running.length === 0 && !liveWasRunning) return
         const stopped = running.length === 0
         liveWasRunning = !stopped
-        if (!stopped && !(await $.ui.panes()).some(p => p.id === LIVE)) return
         const root = await rootOf($)
-        let sig = ''
+        const statuses: Record<string, JobStatusFile> = {}
         for (const r of running) {
           const st = root === undefined ? undefined : await readStatus($, jobDir(root, r.jobId))
+          if (st !== undefined) statuses[r.jobId] = st
+        }
+        // 请示要播报给主会话，和面板开没开无关，所以放在下面的面板判断之前。
+        // 只播报本会话派的作业：别的会话的请示由那边自己的计时器播报。
+        if (!stopped) {
+          const me = await sessionOf($)
+          await notifyAsks($, running.filter(r => r.owner === undefined || r.owner === me), statuses)
+        }
+        if (!stopped && !(await $.ui.panes()).some(p => p.id === LIVE)) return
+        let sig = ''
+        for (const r of running) {
+          const st = statuses[r.jobId]
           sig += `${r.jobId}:${st?.turns ?? 0}:${st?.updatedAt ?? 0};`
         }
         if (!stopped && sig === liveSig) return
