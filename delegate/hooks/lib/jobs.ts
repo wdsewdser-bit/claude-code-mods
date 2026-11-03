@@ -51,6 +51,10 @@ export type JobStatusFile = {
   outputTokens?: number
   /** 最近一次请求的真实输入（runner 从 message_delta 取；事件流里的是 CPA 预估，偏大）。 */
   contextTokens?: number
+  /** 后台作业最近一次请示主会话：seq 递增，主会话靠它去重；正文已由 runner 截到 4000 字。 */
+  ask?: { seq: number; text: string; at: number }
+  /** runner 等回复的时长（毫秒，0 = 这个作业不支持请示）；通知里用它算“几分钟内没有回复”。 */
+  askWaitMs?: number
   startedAt?: number
   updatedAt?: number
   endedAt?: number
@@ -216,8 +220,19 @@ export const recordFromNote = (id: string, raw: unknown): JobRecord | undefined 
   return base
 }
 
+/** status.json 里的请示：没有 seq 就当没这条（写端非原子，可能只写了一半）。 */
+const askOf = (v: unknown): { seq: number; text: string; at: number } | undefined => {
+  if (!isRecord(v)) return undefined
+  const seq = num(v.seq)
+  if (seq === undefined) return undefined
+
+  return { seq, text: str(v.text), at: num(v.at) ?? 0 }
+}
+
 export const normalizeStatus = (raw: unknown): JobStatusFile | undefined => {
   if (!isRecord(raw)) return undefined
+  const ask = askOf(raw.ask)
+  const askWaitMs = num(raw.askWaitMs)
 
   return {
     ...(str(raw.jobId) === '' ? {} : { jobId: str(raw.jobId) }),
@@ -231,6 +246,8 @@ export const normalizeStatus = (raw: unknown): JobStatusFile | undefined => {
     lastText: str(raw.lastText),
     ...(num(raw.outputTokens) === undefined || num(raw.outputTokens)! < 0 ? {} : { outputTokens: num(raw.outputTokens) }),
     ...(num(raw.contextTokens) === undefined || num(raw.contextTokens)! <= 0 ? {} : { contextTokens: num(raw.contextTokens) }),
+    ...(ask === undefined ? {} : { ask }),
+    ...(askWaitMs === undefined || askWaitMs < 0 ? {} : { askWaitMs }),
     startedAt: num(raw.startedAt),
     updatedAt: num(raw.updatedAt),
     endedAt: num(raw.endedAt),

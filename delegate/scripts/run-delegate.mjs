@@ -30,14 +30,15 @@ const PTC_RO_PROMPT = process.env.DELEGATE_PTC_RO_PROMPT || path.join(here, 'ptc
 const PTC_ONLY_SETTINGS = JSON.stringify({
   outputStyle: 'default',
   language: '',
-  enabledPlugins: { 'ctx-mod@skills-dir': false, 'delegate@skills-dir': false },
+  // away-autopilot / effort-auto are main-session only: a child that sees pause/effort uses them instead of 【请示】.
+  enabledPlugins: Object.fromEntries(['ctx-mod', 'delegate', 'away-autopilot', 'effort-auto'].map(n => [`${n}@skills-dir`, false])),
 })
-const BLOCKED_MCP = ['mcp__ctx-mod', 'mcp__delegate']
+const BLOCKED_MCP = ['mcp__ctx-mod', 'mcp__delegate', 'mcp__away-autopilot', 'mcp__effort-auto']
 const CLEAN_SETTINGS = JSON.stringify({
   outputStyle: 'default',
   language: '',
   enabledPlugins: Object.fromEntries(
-    ['away-autopilot', 'cache-keeper', 'ctx-mod', 'delegate', 'dispatch-gate', 'ptc-run', 'read-dedup', 'synced'].map(n => [`${n}@skills-dir`, false])
+    ['away-autopilot', 'cache-keeper', 'ctx-mod', 'delegate', 'dispatch-gate', 'effort-auto', 'ptc-run', 'read-dedup', 'synced'].map(n => [`${n}@skills-dir`, false])
       .concat(['typescript-lsp', 'pyright-lsp', 'rust-analyzer-lsp', 'jdtls-lsp'].map(n => [`${n}@claude-plugins-official`, false])),
   ),
 })
@@ -49,6 +50,10 @@ const STATUS_EVERY_MS = 400 // a status write is at most this often (a result fo
 const HEARTBEAT_MS = 5000 // so a long tool call still looks alive
 const POLL_MS = 500 // cancel file and inbox
 const SEND_GRACE_MS = Math.max(Number(process.env.DELEGATE_SEND_GRACE_MS) || 2000, 200) // a result waits this long for a queued message before stdin closes
+// 请示：后台作业可以停下来等主会话回复，这一轮的宽限改成 ASK 的等待时长（job.askWaitMs）。
+const ASK_MARK = '【请示】'
+const ASK_TEXT_MAX = 4000 // 请示正文在 status.json 里最多留这么多字
+
 const OUT_KEEP = 2_000_000 // the tail of stdout kept for the error message
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -73,6 +78,43 @@ const addModel = (models, o) => {
   const model = typeof o?.message?.model === 'string' ? o.message.model.trim() : ''
   if (model !== '' && !models.includes(model)) models.push(model)
   return models
+}
+
+// 后台作业的系统提示里多这一段：什么时候停下来等主会话决定，以及怎么请示。
+const ASK_PROMPT = [
+  '遇到下面几种情况，先停下来请示主会话，不要自行决定：',
+  '- 改动会超出任务给定的范围或允许的路径；',
+  '- 有几种做法会实质改变结果，而任务没有指定用哪一种；',
+  '- 发现任务的前提不成立；',
+  '- 要做难以撤销的操作（删除、覆盖、发布、推送等）。',
+  '请示的做法：这一轮的最终回复以「【请示】」开头，写清现状、可选方案和你的倾向，然后结束这一轮，等着。',
+  '主会话的回复会作为下一条用户消息送进来，收到后按回复继续。普通细节自己合理判断，不要事事请示。',
+].join('\n')
+
+// --append-system-prompt 给两次时只有最后一条生效：请示那段并进已有的那条（readPaths 那行），没有就新加一对。
+const withAskPrompt = (args, ask) => {
+  if (!ask) return args
+  const i = args.indexOf('--append-system-prompt')
+  if (i < 0) return [...args, '--append-system-prompt', ASK_PROMPT]
+  const out = args.slice()
+  out[i + 1] = `${out[i + 1]}\n\n${ASK_PROMPT}`
+  return out
+}
+
+// 请示只在流式输入的后台作业上启用（插件只给后台作业传 askWaitMs）；DELEGATE_ASK_WAIT_MS 只改这段等待的时长。
+const askWaitMsOf = job => {
+  if (job?.stream !== true) return 0
+  const asked = Number(job.askWaitMs)
+  if (!Number.isFinite(asked) || asked <= 0) return 0
+  const env = Number(process.env.DELEGATE_ASK_WAIT_MS)
+  return Number.isFinite(env) && env > 0 ? env : asked
+}
+
+// result 文本去掉开头空白后以「【请示】」开头就是一次请示；返回要记进 status.json 的正文。
+const askTextOf = result => {
+  if (typeof result !== 'string') return null
+  const text = result.trimStart()
+  return text.startsWith(ASK_MARK) ? text.slice(0, ASK_TEXT_MAX) : null
 }
 
 const readStdin = () =>
@@ -127,6 +169,9 @@ const createControl = (jobId, job) => {
     turns: 0,
     lastTool: null,
     lastText: '',
+    // 请示：ask 是最近一次请示（seq 递增，主会话靠它去重），askWaitMs 是等回复的时长（0 = 不启用）。
+    ask: null,
+    askWaitMs: askWaitMsOf(job),
     // 运行中数出来的输出 token 总数：每条 assistant 行的 usage.output_tokens 是 0，
     // 只有 stream_event 的 message_delta 和最后的 result 行带着真数（见 stream-usage.mjs）。
     outputTokens: 0,
@@ -293,6 +338,18 @@ const redact = (text, secrets) => {
   return s
 }
 
+// 测试用：DELEGATE_CHILD_CMD 加 DELEGATE_CHILD_ARGS（JSON 数组）代替 claude 可执行文件；平时不用。
+const childCommand = () => {
+  const cmd = process.env.DELEGATE_CHILD_CMD
+  if (!cmd) return [findClaude(), []]
+  let extra = []
+  try {
+    const parsed = JSON.parse(process.env.DELEGATE_CHILD_ARGS ?? '[]')
+    if (Array.isArray(parsed)) extra = parsed.map(String)
+  } catch {}
+  return [cmd, extra]
+}
+
 const findClaude = () => {
   if (process.env.DELEGATE_CLAUDE) return process.env.DELEGATE_CLAUDE
   const local = process.env.LOCALAPPDATA
@@ -363,6 +420,8 @@ const main = async () => {
   }
   // work defaults to ptc-only (run_code + the DSH-style prompt); ptc: true keeps the built-ins beside run_code, false drops it.
   if (job.ptc === undefined) job.ptc = 'only' // read defaults to the read-only ptc too; ptc: false gives read the built-ins back
+  // 请示：只有流式输入的后台作业（插件只给它传 askWaitMs）才会停下来等主会话回复。
+  const askWaitMs = askWaitMsOf(job)
   const started = Date.now()
   const ensured = cpaEnv()
   if (ensured.error !== undefined) return done({ ok: false, error: ensured.error })
@@ -472,9 +531,12 @@ const main = async () => {
       '--max-turns',
       String(Math.max(Number(job.maxTurns) || 1000, 1)),
     ]
+    // 请示那段并进系统提示：前台作业没有 askWaitMs，命令行不变。
+    const argv = withAskPrompt(args, askWaitMs > 0)
     // No practical turn/time cap: 2 h only catches a hung child process
     const timeoutMs = Number(job.timeoutMs) || 7_200_000
-    const child = spawn(findClaude(), args, {
+    const [cmd, cmdPrefix] = childCommand()
+    const child = spawn(cmd, [...cmdPrefix, ...argv], {
       cwd: job.cwd || process.cwd(),
       env,
       stdio: [stream ? 'pipe' : 'ignore', 'pipe', 'pipe'],
@@ -496,6 +558,10 @@ const main = async () => {
     let cancelled = false
     let pendingClose = false
     let lastResultAt = 0
+    let graceMs = SEND_GRACE_MS // 普通 result 等 2 秒；请示等 askWaitMs
+    let askSeq = 0
+    let askPending = false // 这一次 pendingClose 是在等请示的回复
+    let askTimedOut = false
     let stdinClosed = false
     const closeStdin = () => {
       if (stdinClosed) return
@@ -537,6 +603,21 @@ const main = async () => {
         parsed = o
         lastResultAt = Date.now()
         if (stream) pendingClose = true
+        // 请示：这一轮是停下来等主会话决定的，宽限改成等回复的时长，并把它记进 status.json。
+        const askText = askWaitMs > 0 ? askTextOf(o.result) : null
+        if (askText !== null) {
+          askSeq += 1
+          askPending = true
+          graceMs = askWaitMs
+          if (control) {
+            control.state.phase = 'asking'
+            control.state.ask = { seq: askSeq, text: askText, at: Date.now() }
+            control.write(true)
+          }
+        } else {
+          askPending = false
+          graceMs = SEND_GRACE_MS
+        }
       }
     }
     child.stdout.on('data', d => {
@@ -563,13 +644,21 @@ const main = async () => {
     const poll = setInterval(() => {
       if (control) {
         const messages = control.drain()
+        let wrote = false
         for (const text of messages) {
           if (writeUser(text)) {
+            wrote = true
             pendingClose = false
             try { control.append(JSON.stringify({ type: 'sent', at: Date.now(), text: text.slice(0, 500) })) } catch {}
           } else {
             try { control.append(JSON.stringify({ type: 'dropped', at: Date.now(), reason: 'job is not in stream mode' })) } catch {}
           }
+        }
+        // 回复送到了：宽限回到 2 秒，阶段回到 working；ask 留着（主会话靠 seq 去重）。
+        if (wrote) {
+          graceMs = SEND_GRACE_MS
+          askPending = false
+          if (control.state.phase === 'asking') control.state.phase = 'working'
         }
         if (messages.length > 0) control.write(true)
         if (!cancelled && control.isCancelled()) {
@@ -579,8 +668,18 @@ const main = async () => {
           killTree(child)
         }
       }
-      if (stream && pendingClose && Date.now() - lastResultAt >= SEND_GRACE_MS) {
+      if (stream && pendingClose && Date.now() - lastResultAt >= graceMs) {
         pendingClose = false
+        // 请示一直没等到回复：照常收尾，结果就是请示内容，并在事件里留一条超时记录。
+        if (askPending) {
+          askPending = false
+          askTimedOut = true
+          try { control?.append(JSON.stringify({ type: 'ask_timeout', at: Date.now(), seq: askSeq })) } catch {}
+          if (control) {
+            control.state.phase = 'finishing'
+            control.write(true)
+          }
+        }
         closeStdin()
       }
     }, POLL_MS)
@@ -613,6 +712,7 @@ const main = async () => {
         turns: parsed.num_turns ?? null,
         ms,
         usage: parsed.usage ?? null,
+        ...(askTimedOut ? { askTimeout: true } : {}),
       })
     }
     const tail = redact((err || out).replace(/\s+/g, ' ').trim().slice(-600), [
