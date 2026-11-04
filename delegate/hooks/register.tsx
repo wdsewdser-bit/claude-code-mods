@@ -596,6 +596,8 @@ const saveJob = async ($: EngineInterface, rec: JobRecord): Promise<void> => {
     await $.store.set(jobKey(rec.jobId), rec)
     // 新派或状态变更要立刻能被 listJobs 看到，不能让缓存拖 1.5 秒。
     invalidateJobs()
+    // 有作业在跑：面板计时器不许早退（面板刷新和后台作业的请示播报都靠它）。
+    if (rec.status === 'running') liveJobsRunning = true
   } catch (error) {
     $.ui.log(`delegate: 作业 ${rec.jobId} 没写进 store：${messageOf(error)}`, { to: 'debug' })
   }
@@ -635,19 +637,34 @@ const readJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
   } catch {
     keys = []
   }
-  for (const key of keys.filter(isJobKey)) {
-    const id = key.slice(JOB_PREFIX.length)
-    try {
-      const rec = normalizeRecord(await $.store.get(key), id)
+  // 快路径：keys() 之后只读一次 store 落盘文件，替掉每条 job: 一次 get（宿主每条 get 都要重读整份文件）。
+  // 找不到文件、宿主正写到一半、键集合对不上都会返回 undefined，那就走下面的老路逐条 get。
+  const file = keys.length === 0 ? undefined : await readStoreFile($, keys)
+  let legacy: Record<string, LegacyNote> = {}
+  if (file !== undefined) {
+    for (const key of keys) {
+      if (!isJobKey(key)) continue
+      const rec = normalizeRecord(file[key], key.slice(JOB_PREFIX.length))
       if (rec !== undefined) found.set(rec.jobId, rec)
-    } catch {}
+    }
+    const raw = file[JOBS_KEY]
+    legacy = typeof raw === 'object' && raw !== null ? (raw as Record<string, LegacyNote>) : {}
+  } else {
+    for (const key of keys.filter(isJobKey)) {
+      const id = key.slice(JOB_PREFIX.length)
+      try {
+        const rec = normalizeRecord(await $.store.get(key), id)
+        if (rec !== undefined) found.set(rec.jobId, rec)
+      } catch {}
+    }
+    legacy = await loadLegacyJobs($)
   }
   const known = new Set<string>()
   for (const rec of found.values()) {
     known.add(rec.jobId)
     if (rec.sessionId !== null) known.add(rec.sessionId)
   }
-  for (const [id, note] of Object.entries(await loadLegacyJobs($))) {
+  for (const [id, note] of Object.entries(legacy)) {
     if (known.has(id)) continue
     // 同一条作业在旧表里可能有两条键（计划里的 id 和跑完后的 agent id），只认一条。
     if (typeof note.jobId === 'string' && known.has(note.jobId)) continue
@@ -658,7 +675,7 @@ const readJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
   return [...found.values()].sort((a, b) => b.at - a.at)
 }
 
-const listJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
+const listJobsCached = async ($: EngineInterface): Promise<JobRecord[]> => {
   const cached = jobsCache
   if (cached !== undefined && Date.now() - cached.at < JOBS_CACHE_TTL_MS) return copyJobs(cached.list)
   // 同一轮里有几个调用方就只读一次：后面到的直接等前一个的 Promise（写过的旧 Promise 不再复用）。
@@ -677,6 +694,14 @@ const listJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
   } finally {
     if (jobsPending === entry) jobsPending = undefined
   }
+}
+
+const listJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
+  const list = await listJobsCached($)
+  // 有作业在跑就记下来，面板计时器靠它决定下一轮要不要读 store（派活时 saveJob 也会先置真）。
+  liveJobsRunning = list.some(r => r.status === 'running')
+
+  return list
 }
 
 /** 按开始时间留最近 KEEP_JOBS 条；多出 10 条以上才动手，免得每次写都扫全表。 */
@@ -715,6 +740,70 @@ const homeOf = async ($: EngineInterface): Promise<string | undefined> => {
 }
 
 const rootOf = async ($: EngineInterface): Promise<string | undefined> => jobsRootOf(await homeOf($))
+
+// ── store 落盘文件的快路径 ──
+// 宿主的 store 落盘成 <配置目录>/plugins/store/<插件 id>.json，内容就是扁平 {key: value}。
+// 逐条 $.store.get 会让宿主每条都重读整份文件（一百多条 × 100KB+），所以 keys() 之后直接读一次文件。
+// 目录里还有同前缀的别的文件（delegate_inline-*.json 之类），选错就会把别人的作业当成自己的，
+// 所以只有「文件里的键集合和 keys() 完全一致」才认；宿主写到一半解析失败也一样不认。
+const STORE_FILE_PREFIX = 'delegate_'
+const STORE_FILE_SUFFIX = '.json'
+// 找不到文件后隔多久再列一次目录：失败时别让每次 listJobs 都付一次列目录的钱。
+const STORE_LIST_TTL_MS = 30_000
+let storeFilePath: string | undefined
+let storeListedAt = 0
+const storeDirOf = (home: string): string =>
+  `${home.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude/plugins/store`
+
+/** 读一次落盘文件；键集合和 keys() 对得上才返回内容，否则 undefined（调用方退回逐条 get）。 */
+const readStoreFile = async (
+  $: EngineInterface,
+  keys: readonly string[],
+): Promise<Record<string, unknown> | undefined> => {
+  let paths: string[]
+  if (storeFilePath !== undefined) {
+    paths = [storeFilePath]
+  } else {
+    if (Date.now() - storeListedAt < STORE_LIST_TTL_MS) return undefined
+    storeListedAt = Date.now()
+    const home = await homeOf($)
+    if (home === undefined) return undefined
+    const dir = storeDirOf(home)
+    let entries: { name: string; kind: string; mtimeMs: number }[] = []
+    try {
+      entries = await $.fs.list(dir)
+    } catch {
+      return undefined
+    }
+    // 新的在前：宿主刚写过的那份最可能是当前的。
+    paths = entries
+      .filter(e => e.kind === 'file' && e.name.startsWith(STORE_FILE_PREFIX) && e.name.endsWith(STORE_FILE_SUFFIX))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .map(e => `${dir}/${e.name}`)
+  }
+  for (const path of paths) {
+    const cached = path === storeFilePath
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(await $.fs.read(path))
+    } catch {
+      // 读不到，或者宿主正写着、读到半个文件：这次不用它，也把缓存的路径清掉。
+      if (cached) storeFilePath = undefined
+      continue
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      if (cached) storeFilePath = undefined
+      continue
+    }
+    const obj = parsed as Record<string, unknown>
+    const got = Object.keys(obj)
+    // 键集合必须一模一样：少一个说明写了一半，多一个说明这是别的插件/旧版本的文件。
+    if (got.length !== keys.length || !keys.every(k => Object.hasOwn(obj, k))) continue
+    storeFilePath = path
+    return obj
+  }
+  return undefined
+}
 
 // 第一条消息之前 $.session.id() 可能迟迟不返回；按钮栏的绘制等它就会整条不出来，所以限时 300ms。
 // 每次都重新问：模块级的 id 缓存会在桌面端多会话共用进程时一直返回上一个会话的 id（owner 全串）。
@@ -1599,6 +1688,19 @@ const notifyAsks = async (
 let liveWasRunning = false
 let liveBusy = false
 let liveSig = ''
+// 计时器早退用的两个廉价信号，全在内存里，不读 store：
+// liveJobsRunning —— store 里有没有作业在跑（派活时 saveJob 置真，listJobs 每次读完按结果置位）；
+// livePaneOpen —— 实时面板开着吗（showLive、绘制 Pane 时置真，轮询问 panes() 时收回）。
+// 两个都是假时，2 秒一次的计时器只做登录/额度这几个便宜刷新，不再调 listJobs（它要读整份 store 文件）。
+let liveJobsRunning = false
+let livePaneOpen = false
+const paneOpen = async ($: EngineInterface): Promise<boolean> => {
+  try {
+    return (await $.ui.panes()).some(p => p.id === LIVE)
+  } catch {
+    return livePaneOpen // 问不出来就沿用上一轮的判断，别把面板刷新停掉
+  }
+}
 const ensureLiveTimer = ($: EngineInterface): void => {
   if (liveTimer !== undefined) return
   try {
@@ -1609,10 +1711,15 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         await pollLogin($)
         // 闲着时也按 TTL 刷新 GPT 额度，按钮栏才不会停在旧读数上（refreshQuota 自己会触发重绘）。
         await refreshQuota($)
+        // 面板没开、本进程也没有作业在跑：这一轮不读 store。新派的作业 saveJob 会置 liveJobsRunning，
+        // 打开面板会置 livePaneOpen，下一轮自动接上，不用重建计时器。
+        if (!liveJobsRunning && !livePaneOpen) return
         const all = await listJobs($)
         const running = all.filter(r => r.status === 'running')
         // 作业结束了就不再惦记它的请示。
         for (const r of all) if (r.status !== 'running') askNotified.delete(r.jobId)
+        // 面板开着就一直刷新；这里同时把上一轮的判断收回（面板关了下一轮开头就早退）。
+        livePaneOpen = await paneOpen($)
         if (running.length === 0 && !liveWasRunning) return
         const stopped = running.length === 0
         liveWasRunning = !stopped
@@ -1628,7 +1735,7 @@ const ensureLiveTimer = ($: EngineInterface): void => {
           const me = await sessionOf($)
           await notifyAsks($, running.filter(r => r.owner === undefined || r.owner === me), statuses)
         }
-        if (!stopped && !(await $.ui.panes()).some(p => p.id === LIVE)) return
+        if (!stopped && !livePaneOpen) return
         let sig = ''
         for (const r of running) {
           const st = statuses[r.jobId]
@@ -1654,6 +1761,7 @@ const ensureLiveTimer = ($: EngineInterface): void => {
 // 会话的界面通道坏掉时 $.ui.open 会一直不返回，派活也跟着卡住：限时 2 秒，到点就不等面板。
 const SHOW_LIVE_WAIT_MS = 2_000
 const showLive = async ($: EngineInterface, jobId?: string): Promise<void> => {
+  livePaneOpen = true // 面板要开了：计时器从下一轮起继续读 store（面板得跟着刷新）
   const open = (async () => {
     try {
       if (jobId !== undefined) await update($, liveSelAtom, () => jobId)
@@ -1888,6 +1996,8 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: LIVE }, async ($, e) => {
     // 绘制出错时把错误画出来，不留空白面板。
     try {
+    // 画到了就说明面板开着：计时器别早退（关掉后由计时器自己问 panes() 收回）。
+    livePaneOpen = true
     const { Box, Button, Input, Text } = $.ui.resolve(e)
     await read($, liveTickAtom)
     const now = Date.now()
