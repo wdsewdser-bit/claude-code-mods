@@ -1583,8 +1583,11 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         let sig = ''
         for (const r of running) {
           const st = statuses[r.jobId]
-          sig += `${r.jobId}:${st?.turns ?? 0}:${st?.updatedAt ?? 0};`
+          sig += `${r.jobId}:${st?.turns ?? 0};`
         }
+        // 不用 updatedAt：流式作业每个事件都改它，会 2 秒重绘一次；绘制慢于 2 秒时次次被打断，面板一直空白。
+        // 轮数变了才重绘，耗时显示最多 10 秒刷新一次。
+        sig += String(Math.floor(Date.now() / 10_000))
         if (!stopped && sig === liveSig) return
         liveSig = sig
         await update($, liveTickAtom, n => n + 1)
@@ -1599,12 +1602,34 @@ const ensureLiveTimer = ($: EngineInterface): void => {
   }
 }
 
+// 会话的界面通道坏掉时 $.ui.open 会一直不返回，派活也跟着卡住：限时 2 秒，到点就不等面板。
+const SHOW_LIVE_WAIT_MS = 2_000
 const showLive = async ($: EngineInterface, jobId?: string): Promise<void> => {
+  const open = (async () => {
+    try {
+      if (jobId !== undefined) await update($, liveSelAtom, () => jobId)
+      await $.ui.open({ id: LIVE, title: '委派任务' })
+    } catch (error) {
+      $.ui.log(`delegate: 实时面板打不开：${messageOf(error)}`, { to: 'debug' })
+    }
+  })()
+  let timer: { cancel: () => void } | undefined
   try {
-    if (jobId !== undefined) await update($, liveSelAtom, () => jobId)
-    await $.ui.open({ id: LIVE, title: '委派任务' })
-  } catch (error) {
-    $.ui.log(`delegate: 实时面板打不开：${messageOf(error)}`, { to: 'debug' })
+    await Promise.race([
+      open,
+      new Promise<void>(resolve => {
+        try {
+          timer = $.clock.after(SHOW_LIVE_WAIT_MS, () => {
+            $.ui.log('delegate: 实时面板 2 秒没打开，先不等它', { to: 'debug' })
+            resolve()
+          })
+        } catch {
+          // 没有时钟（测试环境）就只等 open 本身。
+        }
+      }),
+    ])
+  } finally {
+    timer?.cancel()
   }
 }
 
