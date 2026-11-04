@@ -38,7 +38,6 @@ import {
   jobKey,
   JOB_PREFIX,
   jobsRootOf,
-  MAX_JOBS,
   newJobId,
   normalizeReadPaths,
   normalizeRecord,
@@ -65,6 +64,11 @@ const STORE_KEY = 'cfg'
 const JOBS_KEY = 'jobs'
 // resume 用的是 agent id（= session id），作业 id 是 bg-/fg-；这一条索引把两者连起来。
 const AGENT_PREFIX = 'agent:'
+// 保留最近多少条作业（原来是 lib/jobs.ts 里的 MAX_JOBS = 200）。每条 job: 都要单独 store.get，
+// 而宿主的 store 是整文件 JSON，每次 get 重读一遍，prune 一次就是 N 遍；面板最多显示 30 条、
+// delegate_list 默认 20 条，留 100 条够回看，读盘和常驻条目都砍半。
+// 旧表镜像沿用同一个上限：只收紧 prune 的话，被淘汰的记录会从旧表里合并回来。
+const KEEP_JOBS = 100
 const MAX_REPLY = 20_000
 // A finished background job speaks to the model through a prompt: keep it short, the rest is in a file.
 const BG_INLINE = 6_000
@@ -562,15 +566,36 @@ const mirrorLegacy = async ($: EngineInterface, rec: JobRecord): Promise<void> =
     }
     const kept = Object.entries(table)
       .sort((a, b) => Number(b[1].at ?? 0) - Number(a[1].at ?? 0))
-      .slice(0, MAX_JOBS)
+      .slice(0, KEEP_JOBS)
     await $.store.set(JOBS_KEY, Object.fromEntries(kept))
+    // 旧表也参与 listJobs 的合并，写它同样要清缓存。
+    invalidateJobs()
   } catch {}
 }
+
+// listJobs 一次要 $.store.keys() + 每条 job: 一次 get，而宿主的 store 是整文件 JSON（两百多条、274KB），
+// 一次列作业就要重读几十 MB；计时器（2 秒一次）、面板、按钮栏都会调它，空闲时也一直在读盘。
+// 所以同一进程里正在进行的调用共用一个 Promise，结果缓存 1.5 秒。
+const JOBS_CACHE_TTL_MS = 1_500
+let jobsCache: { at: number; list: JobRecord[] } | undefined
+let jobsPending: { epoch: number; promise: Promise<JobRecord[]> } | undefined
+// 凡是写 job: 键（或旧表 jobs）的地方都要调它：epoch 让「写之前开始、写之后才结束」的那次读不写进缓存。
+let jobsEpoch = 0
+const invalidateJobs = (): void => {
+  jobsCache = undefined
+  jobsEpoch += 1
+}
+// 调用方会就地改记录（recoverJobs 改 status/turns/sessionId、cancelAction 改 status），
+// 所以缓存里存自己的一份，返回时再复制一遍，绝不把缓存里的对象交给调用方。
+const copyJobs = (list: JobRecord[]): JobRecord[] =>
+  list.map(rec => (rec.readPaths === undefined ? { ...rec } : { ...rec, readPaths: [...rec.readPaths] }))
 
 /** 一条作业一个 key：两个会话同时派活也不会互相覆盖。 */
 const saveJob = async ($: EngineInterface, rec: JobRecord): Promise<void> => {
   try {
     await $.store.set(jobKey(rec.jobId), rec)
+    // 新派或状态变更要立刻能被 listJobs 看到，不能让缓存拖 1.5 秒。
+    invalidateJobs()
   } catch (error) {
     $.ui.log(`delegate: 作业 ${rec.jobId} 没写进 store：${messageOf(error)}`, { to: 'debug' })
   }
@@ -601,7 +626,8 @@ const loadJob = async ($: EngineInterface, id: string): Promise<JobRecord | unde
   return note === undefined ? undefined : recordFromNote(id, note)
 }
 
-const listJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
+// 真正读 store 的那一遍（原来 listJobs 的全部内容）：排序、旧表合并都留在这里，语义不变。
+const readJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
   const found = new Map<string, JobRecord>()
   let keys: string[] = []
   try {
@@ -632,7 +658,28 @@ const listJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
   return [...found.values()].sort((a, b) => b.at - a.at)
 }
 
-/** 按开始时间留最近 MAX_JOBS 条；多出 10 条以上才动手，免得每次写都扫全表。 */
+const listJobs = async ($: EngineInterface): Promise<JobRecord[]> => {
+  const cached = jobsCache
+  if (cached !== undefined && Date.now() - cached.at < JOBS_CACHE_TTL_MS) return copyJobs(cached.list)
+  // 同一轮里有几个调用方就只读一次：后面到的直接等前一个的 Promise（写过的旧 Promise 不再复用）。
+  const shared = jobsPending
+  if (shared !== undefined && shared.epoch === jobsEpoch) return copyJobs(await shared.promise)
+  const epoch = jobsEpoch
+  const promise = readJobs($).then(list => {
+    if (epoch === jobsEpoch) jobsCache = { at: Date.now(), list }
+
+    return list
+  })
+  const entry = { epoch, promise }
+  jobsPending = entry
+  try {
+    return copyJobs(await promise)
+  } finally {
+    if (jobsPending === entry) jobsPending = undefined
+  }
+}
+
+/** 按开始时间留最近 KEEP_JOBS 条；多出 10 条以上才动手，免得每次写都扫全表。 */
 const pruneJobs = async ($: EngineInterface): Promise<void> => {
   let keys: string[] = []
   try {
@@ -640,7 +687,7 @@ const pruneJobs = async ($: EngineInterface): Promise<void> => {
   } catch {
     return
   }
-  if (keys.length <= MAX_JOBS + 10) return
+  if (keys.length <= KEEP_JOBS + 10) return
   const records: JobRecord[] = []
   for (const key of keys) {
     try {
@@ -649,11 +696,13 @@ const pruneJobs = async ($: EngineInterface): Promise<void> => {
     } catch {}
   }
   records.sort((a, b) => b.at - a.at)
-  for (const rec of records.slice(MAX_JOBS)) {
+  for (const rec of records.slice(KEEP_JOBS)) {
     try {
       await $.store.delete(jobKey(rec.jobId))
       if (rec.sessionId !== null && rec.sessionId !== '') await $.store.delete(`${AGENT_PREFIX}${rec.sessionId}`)
     } catch {}
+    // 删掉的 job: 键（和它的 agent: 索引）必须让缓存作废，否则面板还会列出已经淘汰的作业。
+    invalidateJobs()
   }
 }
 
