@@ -36,6 +36,13 @@ export type Config = {
    */
   decisionChars: number
   snippetTokens: number
+  /**
+   * An open task whose last real change (a record that was no keepalive snapshot, or one
+   * that differed from the record before) is this many windows old, or this many days old,
+   * is marked on the home page as possibly stale. A hint only: nothing is closed for it.
+   */
+  staleWindows: number
+  staleDays: number
   homeTokens: number
   pageTokens: number
   /** Lines of context on each side of an anchor. */
@@ -86,6 +93,11 @@ export const DEFAULTS: Config = {
   handoffTokens: 15_000,
   decisionChars: 3_000,
   snippetTokens: 6_000,
+  // A task untouched for three windows running, or three days, is where a new window has
+  // read old work as current before: early enough to warn, late enough not to nag a task
+  // that is merely paused.
+  staleWindows: 3,
+  staleDays: 3,
   homeTokens: 1_500,
   pageTokens: 4_000,
   snippetLines: 30,

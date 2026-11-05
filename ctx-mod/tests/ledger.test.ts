@@ -296,6 +296,25 @@ describe('tasksOf', () => {
     expect(tasks[0]?.entries).toHaveLength(2)
     expect(tasks[1]?.first).toBe(entries[1])
   })
+
+  test('the last substantive update stays on the first record while later snapshots only repeat it', () => {
+    const snap = (seq: number, window: number, ts: number, text: string): LedgerEntry =>
+      entry({ task_id: 'adaptive-effort-v2', status: 'blocked', seq, window, ts, text })
+    const repeated = [
+      snap(1, 1, 100, '保活快照：还剩 75 行'),
+      snap(2, 2, 200, '保活快照：还剩 75 行'),
+      snap(3, 3, 300, '保活快照：  还剩 75 行 '),
+    ]
+    expect(tasksOf(repeated)[0]?.lastSubstantive).toEqual({ seq: 1, window: 1, ts: 100 })
+
+    // A snapshot that says something different is a real update, figures included.
+    const changed = [...repeated, snap(4, 4, 400, '保活快照：还剩 7 行')]
+    expect(tasksOf(changed)[0]?.lastSubstantive).toEqual({ seq: 4, window: 4, ts: 400 })
+
+    // So is a record the model wrote itself, snapshot or not.
+    const written = [...repeated, entry({ task_id: 'adaptive-effort-v2', status: 'blocked', seq: 5, window: 4, ts: 500, text: '换了个做法' })]
+    expect(tasksOf(written)[0]?.lastSubstantive).toEqual({ seq: 5, window: 4, ts: 500 })
+  })
 })
 
 describe('hasFreshEntry', () => {
@@ -468,7 +487,8 @@ describe('renderHome', () => {
   test('a single note renders exactly as the latest line', () => {
     const entries = [entry({ task_id: 't1', text: '已在改表单', seq: 1, ts: 100, next_step: '跑一遍测试' })]
     const text = renderHome({ window: 2, entries, requests, archive: [] }, DEFAULTS)
-    expect(text).toContain('- t1：改登录页（进行中）\n  - 最新：已在改表单\n  - 下一步：跑一遍测试')
+    // The title line now says when the task last really changed, so a stale one is seen at once.
+    expect(text).toContain('- t1：改登录页（进行中；最后实质更新：第 1 窗口，0 天前）\n  - 最新：已在改表单\n  - 下一步：跑一遍测试')
     expect(text).not.toContain('记录（')
   })
 
@@ -556,6 +576,49 @@ describe('renderHome', () => {
     expect(text).not.toContain('甲'.repeat(10))
     expect(text).toContain(`  - 最新：${'乙'.repeat(500)}`)
   })
+
+  test('a task only re-snapshotted for window after window keeps its first real update and is marked stale', () => {
+    const snapshot = (window: number, ts: number): LedgerEntry =>
+      entry({ task_id: 'adaptive-effort-v2', status: 'blocked', title: '自适应力度', text: '保活快照：等授权，没有进展', window, ts })
+    const entries = [snapshot(1, 1_000), snapshot(2, 60_000), snapshot(3, 120_000), snapshot(4, 180_000)]
+
+    const stale = renderHome({ window: 5, entries, requests, archive: [], now: 200_000 }, DEFAULTS)
+    expect(stale).toContain('最后实质更新：第 1 窗口，0 天前，可能已过时，提之前先确认')
+    expect(stale).not.toContain('第 4 窗口')
+
+    // Under the thresholds the same page says when, but does not warn.
+    const fresh = renderHome({ window: 3, entries, requests, archive: [], now: 200_000 }, DEFAULTS)
+    expect(fresh).toContain('最后实质更新：第 1 窗口')
+    expect(fresh).not.toContain('提之前先确认')
+  })
+
+  test('a blocked task names the finished sibling that took its place, and that title survives a tight budget', () => {
+    const v2 = entry({ task_id: 'adaptive-effort-v2', status: 'blocked', title: '自适应力度 v2', text: '等授权', seq: 1, ts: 100 })
+    const v3 = entry({ task_id: 'adaptive-effort-v3', status: 'done', title: '自适应力度 v3', text: '做完了', evidence: [10], seq: 2, ts: 200 })
+    const unrelated = (index: number): LedgerEntry =>
+      entry({
+        task_id: `notes-${index}`,
+        status: 'done',
+        title: '无关的完成事项说明'.repeat(6) + index,
+        text: '完了',
+        evidence: [10],
+        seq: 10 + index,
+        ts: 300 + index,
+      })
+
+    const text = renderHome({ window: 2, entries: [v2, v3], requests, archive: [] }, DEFAULTS)
+    expect(text).toContain('  - 同族：adaptive-effort-v3 已完成 #L2')
+    // Under the blocked task, not beside the finished one.
+    expect(text.indexOf('同族：adaptive-effort-v3')).toBeGreaterThan(text.indexOf('- adaptive-effort-v2：'))
+
+    const config = { ...DEFAULTS, homeTokens: estimateTokens(text) + 40 }
+    const tight = renderHome({ window: 2, entries: [v2, v3, unrelated(1), unrelated(2), unrelated(3)], requests, archive: [] }, config)
+    expect(tight).toContain('同族：adaptive-effort-v3 已完成 #L2')
+    expect(tight).toContain('自适应力度 v3')
+    // The finished tasks with nothing to do with the open one go first.
+    expect(tight).not.toContain('无关的完成事项说明')
+    expect(estimateTokens(tight)).toBeLessThanOrEqual(config.homeTokens)
+  })
 })
 
 describe('renderHome with many open tasks', () => {
@@ -580,7 +643,7 @@ describe('renderHome with many open tasks', () => {
     for (const index of [8, 7, 6, 5, 4]) expect(text).toContain(`  - 最新：任务${index}的进展`)
     for (const index of [3, 2, 1]) {
       expect(text).toContain(`  - 最新 #L${index}：任务${index}的进展`)
-      expect(text).toContain(`- k${index}：任务${index}（进行中）\n  - 最新 #L${index}：任务${index}的进展\n  - 下一步：任务${index}的下一步`)
+      expect(text).toContain(`- k${index}：任务${index}（进行中；最后实质更新：第 1 窗口，0 天前）\n  - 最新 #L${index}：任务${index}的进展\n  - 下一步：任务${index}的下一步`)
       expect(text).not.toContain(`  - 最新：任务${index}的进展`)
     }
     const order = [8, 7, 6, 5, 4, 3, 2, 1].map(index => text.indexOf(`- k${index}：`))
