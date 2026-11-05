@@ -510,3 +510,127 @@ export const usageOf = (lines: readonly string[]): { context: number; output: nu
 
   return { context, output: Math.max(output, resultOutput) }
 }
+
+/** events.jsonl 一族的读取接口：只用 $ 的 fs.read 和 fs.stat（stat 给 size / mtimeMs 当缓存键）。 */
+export type EventSource = {
+  fs: {
+    read: (path: string) => Promise<string>
+    stat: (path: string) => Promise<{ size: number; mtimeMs: number }>
+  }
+}
+
+/** 一份事件数据：原始行、面板事件（未截断）和用量。 */
+export type EventView = {
+  key: string
+  lines: string[]
+  events: LiveEvent[]
+  usage: { context: number; output: number }
+}
+
+/** 事件文件：runner 轮转后旧内容在 events.1.jsonl，新内容在 events.jsonl。 */
+const EVENT_FILES = ['events.1.jsonl', 'events.jsonl'] as const
+/** 最多缓存几个作业目录，超出按最近使用淘汰。 */
+const EVENT_CACHE_MAX = 8
+const eventCache = new Map<string, EventView>()
+
+/** 缓存键：目录 + 两个文件的 size/mtime。追加、轮转、清空都会换键，不会读到旧内容。 */
+async function eventKeyOf($: EventSource, dir: string): Promise<string> {
+  const parts: string[] = [dir]
+  for (const name of EVENT_FILES) {
+    try {
+      const st = await $.fs.stat(`${dir}/${name}`)
+      parts.push(`${name}:${st.size}:${st.mtimeMs}`)
+    } catch {
+      parts.push(`${name}:-`) // 文件不存在也要进键：从无到有必须换键
+    }
+  }
+
+  return parts.join('|')
+}
+
+/** 读一个作业目录的事件。同一份数据（size/mtime 没变）只读一次、只解析一次。
+ *  lines / events / usage 都按同一个键缓存，详情重绘不再重复读文件和 JSON.parse。 */
+export async function readEventView($: EventSource, dir: string): Promise<EventView> {
+  const key = await eventKeyOf($, dir)
+  const hit = eventCache.get(key)
+  if (hit !== undefined) {
+    eventCache.delete(key)
+    eventCache.set(key, hit) // 最近使用的排到末尾
+
+    return hit
+  }
+  const lines: string[] = []
+  for (const name of EVENT_FILES) {
+    try {
+      lines.push(...(await $.fs.read(`${dir}/${name}`)).split('\n').filter(l => l.trim() !== ''))
+    } catch {}
+  }
+  // liveEvents 的 max 只是最后 slice(-max)，缓存完整的列表，调用方再按面板上限截取。
+  const view: EventView = { key, lines, events: liveEvents(lines, Number.MAX_SAFE_INTEGER), usage: usageOf(lines) }
+  eventCache.set(key, view)
+  while (eventCache.size > EVENT_CACHE_MAX) {
+    const oldest = eventCache.keys().next().value
+    if (oldest === undefined) break
+    eventCache.delete(oldest)
+  }
+
+  return view
+}
+
+/** 测试用：清空事件缓存。 */
+export const resetEventCache = (): void => {
+  eventCache.clear()
+}
+
+/** 面板绘制的闸门：上一次还没画完时，计时器触发的重绘只记一个待刷新，画完后补画一次。
+ *  用户点击引起的重绘直接 update，不经过这里，不会被吞掉。 */
+export type DrawGate = {
+  begin: () => void
+  end: () => boolean
+  request: () => boolean
+  consume: () => boolean
+  reset: () => void
+}
+
+/** 一次绘制超过这么久还没回来，就当宿主已经把它丢掉了：放行新的绘制，别让面板永远停在旧画面。 */
+export const DRAW_STALE_MS = 15_000
+export const createDrawGate = (now: () => number = () => Date.now()): DrawGate => {
+  let drawing = 0
+  let pending = false
+  let startedAt = 0
+
+  return {
+    begin: () => {
+      drawing += 1
+      if (drawing === 1) startedAt = now()
+    },
+    end: () => {
+      drawing = Math.max(0, drawing - 1)
+
+      return drawing === 0 && pending
+    },
+    request: () => {
+      if (drawing > 0 && now() - startedAt < DRAW_STALE_MS) {
+        pending = true
+
+        return false
+      }
+      // 绘制卡住了（或根本没有绘制）：不再等它，直接画。
+      drawing = 0
+      pending = false
+
+      return true
+    },
+    consume: () => {
+      const was = pending
+      pending = false
+
+      return was
+    },
+    reset: () => {
+      drawing = 0
+      pending = false
+    },
+  }
+}
+

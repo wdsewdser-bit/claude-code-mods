@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderElement } from 'claude-code'
 
 import type { Draft } from '../types'
 import {
@@ -49,7 +49,7 @@ import {
   summarize,
   uuid,
 } from './lib/jobs.ts'
-import { liveEvents, spanOf, tokensOf, usageOf } from './lib/jobs.ts'
+import { createDrawGate, readEventView, spanOf, tokensOf, usageOf } from './lib/jobs.ts'
 import type { Agent, JobRecord, JobStatusFile, LiveEvent, Mode, Ptc } from './lib/jobs.ts'
 import { barOf, normalizeQuota, resetIn, usedColor } from './lib/quota.ts'
 import type { GptQuota } from './lib/quota.ts'
@@ -1532,6 +1532,29 @@ const ROW_PICKED = '#2e2e2e'
 const clip = (t: string, n: number): string => (t.length > n ? `${t.slice(0, n - 1)}…` : t)
 const ROW_HOVER = '#252525'
 let liveTimer: { cancel: () => void } | undefined
+// 绘制闸门：上一次画还没结束时，计时器触发的重绘只记一个待刷新，画完再补画一次（见 Pane 的渲染）。
+const liveGate = createDrawGate()
+let livePendingTimer: { cancel: () => void } | undefined
+// 上一次画成功的树：这次画出错就把它原样画出来，顶部加一行错误，别让面板变成空白。
+let lastLiveTree: RenderElement | undefined
+// 计时器/额度触发的重绘都走这里；用户点击走 update(...)，不经过闸门，不会被合并掉。
+const requestRedraw = async ($: EngineInterface): Promise<void> => {
+  if (!liveGate.request()) return
+  await update($, liveTickAtom, n => n + 1)
+}
+// 画完了：有排队的刷新就补画一次。下一拍再 update——绘制路径里不许 set state。
+const schedulePendingDraw = ($: EngineInterface): void => {
+  if (livePendingTimer !== undefined) return
+  try {
+    livePendingTimer = $.clock.after(0, () => {
+      livePendingTimer = undefined
+      if (!liveGate.consume()) return
+      void requestRedraw($).catch(() => undefined)
+    })
+  } catch {
+    livePendingTimer = undefined // 没有时钟（测试环境）：待刷新标记留着，下个计时器周期顺带画
+  }
+}
 
 // GPT 额度：面板重绘时顺带查，一分钟最多一次；查完 tick 一下让面板重画。
 const QUOTA_TTL = 60_000
@@ -1597,7 +1620,7 @@ const refreshQuota = async ($: EngineInterface, force = false): Promise<void> =>
     const had = quota !== undefined
     quota = undefined
     quotaAt = Date.now()
-    if (had) await update($, liveTickAtom, (n: number) => n + 1)
+    if (had) await requestRedraw($)
 
     return
   }
@@ -1616,7 +1639,7 @@ const refreshQuota = async ($: EngineInterface, force = false): Promise<void> =>
     quotaAt = Date.now()
     quotaPending = false
   }
-  await update($, liveTickAtom, n => n + 1)
+  await requestRedraw($)
 }
 
 // GPT 作业结束时附上订阅额度，方便主会话决定还能不能接着派 GPT。15 秒内查过就复用。
@@ -1754,7 +1777,7 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         sig += String(Math.floor(Date.now() / 10_000))
         if (!stopped && sig === liveSig) return
         liveSig = sig
-        await update($, liveTickAtom, n => n + 1)
+        await requestRedraw($)
       })()
         .catch(error => $.ui.log(`delegate: 面板计时出错：${messageOf(error)}`, { to: 'debug' }))
         .finally(() => {
@@ -1800,13 +1823,9 @@ const showLive = async ($: EngineInterface, jobId?: string): Promise<void> => {
 
 // runner 在 events.jsonl 超过 512KB 时把它轮转成 events.1.jsonl：先读旧的再读新的，列表才不会在轮转时清空。
 const readEventLines = async ($: EngineInterface, dir: string): Promise<string[]> => {
-  const lines: string[] = []
-  for (const name of ['events.1.jsonl', 'events.jsonl']) {
-    try {
-      lines.push(...(await $.fs.read(`${dir}/${name}`)).split('\n').filter(l => l.trim() !== ''))
-    } catch {}
-  }
-  return lines
+  const view = await readEventView($, dir)
+
+  return view.lines
 }
 
 const liveSendAction = async ($: EngineInterface, id: string): Promise<void> => {
@@ -2002,11 +2021,19 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: LIVE }, async ($, e) => {
+    // 记下这次绘制的开始：画完前计时器只排队，不再发起新的重绘（见 liveGate）。
+    liveGate.begin()
     // 绘制出错时把错误画出来，不留空白面板。
     try {
     // 画到了就说明面板开着：计时器别早退（关掉后由计时器自己问 panes() 收回）。
     livePaneOpen = true
     const { Box, Button, Input, Text } = $.ui.resolve(e)
+    // 画成功就记下这棵树：下次出错时拿它兜底，别让面板变空。
+    const ok = (tree: RenderElement): RenderElement => {
+      lastLiveTree = tree
+
+      return tree
+    }
     await read($, liveTickAtom)
     const now = Date.now()
     const me = await sessionOf($)
@@ -2099,7 +2126,7 @@ export const register: Register = on => {
     )
 
     if (jobs.length === 0) {
-      return (
+      return ok(
         <Box flexDirection="column" gap={1}>
           {quotaBox}
           <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1}>
@@ -2114,9 +2141,10 @@ export const register: Register = on => {
     let events: LiveEvent[] = []
     let usage = { context: 0, output: 0 }
     if (sel !== undefined && root !== undefined) {
-      const lines = await readEventLines($, jobDir(root, sel.jobId))
-      events = liveEvents(lines, 400)
-      usage = usageOf(lines)
+      // 同一份事件（size/mtime 没变）只读一次、只解析一次；面板仍只看最近 400 条。
+      const view = await readEventView($, jobDir(root, sel.jobId))
+      events = view.events.slice(-400)
+      usage = view.usage
     }
     const page = await read($, livePageAtom)
     const pages = Math.max(1, Math.ceil(events.length / PAGE))
@@ -2342,7 +2370,7 @@ export const register: Register = on => {
       </Box>
     )
 
-    return (
+    return ok(
       <Box flexDirection="column" gap={1} overflow="hidden">
         {quotaBox}
         <Box flexWrap="wrap" gap={1} alignItems="flex-start" overflow="hidden">
@@ -2353,8 +2381,20 @@ export const register: Register = on => {
     )
     } catch (error) {
       $.ui.log(`delegate live: ${messageOf(error)}`, { to: 'debug' })
-      const { Text } = $.ui.resolve(e)
+      const { Box, Text } = $.ui.resolve(e)
+      // 有上一次画成功的画面就留着它，只在顶部加一行错误；从没画成功过才整块显示错误。
+      if (lastLiveTree !== undefined) {
+        return (
+          <Box flexDirection="column">
+            <Text color="error">{`实时面板更新出错：${messageOf(error)}（显示上一次成功的画面）`}</Text>
+            {lastLiveTree}
+          </Box>
+        )
+      }
       return <Text color="error">{`实时面板出错：${messageOf(error)}`}</Text>
+    } finally {
+      // 画完了：这期间计时器排队的刷新，补画一次。
+      if (liveGate.end()) schedulePendingDraw($)
     }
   })
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
