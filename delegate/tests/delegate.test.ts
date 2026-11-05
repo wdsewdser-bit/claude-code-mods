@@ -39,7 +39,7 @@ import {
   summarize,
   uuid,
 } from '../hooks/lib/jobs.ts'
-import { liveEvents, tokensOf, usageOf } from '../hooks/lib/jobs.ts'
+import { createDrawGate, liveEvents, readEventView, resetEventCache, tokensOf, usageOf } from '../hooks/lib/jobs.ts'
 import type { JobRecord } from '../hooks/lib/jobs.ts'
 import { barOf, normalizeQuota, resetIn, usedColor } from '../hooks/lib/quota.ts'
 import { addModel, terminalOf } from '../hooks/lib/terminal.ts'
@@ -1126,6 +1126,149 @@ describe('live pane helpers', () => {
   })
   test('tokensOf', () => {
     expect([tokensOf(undefined), tokensOf(950), tokensOf(56789), tokensOf(1234567)]).toEqual(['–', '950', '57K', '1.2M'])
+  })
+})
+
+describe('live pane cache', () => {
+  const event = (
+    id: string,
+    text: string,
+    usage: Record<string, number> = { input_tokens: 100, output_tokens: 5 },
+  ) => JSON.stringify({ type: 'assistant', message: { id, content: [{ type: 'text', text }], usage } })
+  // 内存里的假文件系统：read 记下每次真实读取，stat 给出 size / mtimeMs（和 $.fs.stat 同形状）。
+  const fakeFs = () => {
+    const files = new Map<string, { text: string; mtimeMs: number }>()
+    const reads: string[] = []
+    let stamp = 1000
+    const puts = (path: string, text: string): void => {
+      stamp += 1
+      files.set(path, { text, mtimeMs: stamp })
+    }
+
+    return {
+      reads,
+      puts,
+      remove: (path: string): void => {
+        files.delete(path)
+      },
+      fs: {
+        read: async (path: string): Promise<string> => {
+          reads.push(path)
+          const f = files.get(path)
+          if (f === undefined) throw new Error('ENOENT')
+
+          return f.text
+        },
+        stat: async (path: string): Promise<{ size: number; mtimeMs: number }> => {
+          const f = files.get(path)
+          if (f === undefined) throw new Error('ENOENT')
+
+          return { size: f.text.length, mtimeMs: f.mtimeMs }
+        },
+      },
+    }
+  }
+
+  test('unchanged files are reused; an append is read fresh', async () => {
+    resetEventCache()
+    const io = fakeFs()
+    const dir = 'C:/jobs/one'
+    io.puts(`${dir}/events.jsonl`, `${event('m1', 'hello')}\n`)
+    const first = await readEventView(io, dir)
+    const reads = io.reads.length
+    expect(reads).toBeGreaterThan(0)
+    const second = await readEventView(io, dir)
+    // 没变就一次文件都不再读，自然也不会重新解析
+    expect(io.reads.length).toBe(reads)
+    expect(second.lines).toEqual(first.lines)
+    expect(second.events).toEqual(first.events)
+    expect(second.usage).toEqual(first.usage)
+    // 运行中的作业一直在追加：键要跟着变，面板不能停在旧内容上
+    io.puts(`${dir}/events.jsonl`, `${event('m1', 'hello')}\n${event('m2', 'world')}\n`)
+    const third = await readEventView(io, dir)
+    expect(io.reads.length).toBeGreaterThan(reads)
+    expect(third.lines).toHaveLength(2)
+    expect(third.events.map(e => e.detail)).toEqual(['hello', 'world'])
+  })
+
+  test('rotation into events.1.jsonl shows the old lines then the new ones', async () => {
+    resetEventCache()
+    const io = fakeFs()
+    const dir = 'C:/jobs/two'
+    io.puts(`${dir}/events.jsonl`, `${event('m1', 'old')}\n`)
+    expect((await readEventView(io, dir)).events.map(e => e.detail)).toEqual(['old'])
+    // runner 轮转：events.jsonl 改名为 events.1.jsonl，再新建 events.jsonl
+    io.puts(`${dir}/events.1.jsonl`, `${event('m1', 'old')}\n`)
+    io.puts(`${dir}/events.jsonl`, `${event('m2', 'new')}\n`)
+    const rotated = await readEventView(io, dir)
+    expect(rotated.lines).toHaveLength(2)
+    expect(rotated.events.map(e => e.detail)).toEqual(['old', 'new'])
+    // 轮转后新文件还没出现（只剩 events.1.jsonl）也要刷新，不能留着旧键
+    io.remove(`${dir}/events.jsonl`)
+    const onlyOld = await readEventView(io, dir)
+    expect(onlyOld.events.map(e => e.detail)).toEqual(['old'])
+  })
+
+  test('cached events and usage equal liveEvents / usageOf on the same input', async () => {
+    resetEventCache()
+    const io = fakeFs()
+    const dir = 'C:/jobs/three'
+    const src = [
+      event('m1', 'first'),
+      event('m1', 'first again'),
+      JSON.stringify({ type: 'sent', text: '顺便看 config.py' }),
+      event('m2', 'second', { input_tokens: 5, cache_read_input_tokens: 1995, output_tokens: 30 }),
+      JSON.stringify({ type: 'result', is_error: false, result: '改好了', usage: { output_tokens: 186_521 } }),
+      'not json',
+    ]
+    io.puts(`${dir}/events.jsonl`, `${src.join('\n')}\n`)
+    const view = await readEventView(io, dir)
+    expect(view.lines).toEqual(src)
+    expect(view.events).toEqual(liveEvents(src, src.length))
+    expect(view.events.slice(-2)).toEqual(liveEvents(src, 2))
+    expect(view.usage).toEqual(usageOf(src))
+    expect(view.usage).toEqual({ context: 2000, output: 186_521 })
+  })
+
+  test('the cache keeps at most 8 job directories, oldest used out first', async () => {
+    resetEventCache()
+    const io = fakeFs()
+    for (let i = 0; i < 9; i += 1) {
+      io.puts(`C:/jobs/lru${i}/events.jsonl`, `${event(`m${i}`, `job ${i}`)}\n`)
+      await readEventView(io, `C:/jobs/lru${i}`)
+    }
+    const reads = io.reads.length
+    await readEventView(io, 'C:/jobs/lru8') // 最近用过的：命中
+    expect(io.reads.length).toBe(reads)
+    await readEventView(io, 'C:/jobs/lru0') // 第 9 个进来时被淘汰
+    expect(io.reads.length).toBeGreaterThan(reads)
+  })
+
+  test('a redraw requested while a draw is in flight queues once and catches up once', () => {
+    const gate = createDrawGate()
+    gate.begin() // 上一次绘制开始
+    expect(gate.request()).toBe(false) // 计时器：不发起新的绘制
+    expect(gate.request()).toBe(false) // 再来一次也只排一个
+    expect(gate.end()).toBe(true) // 画完：有待刷新
+    expect(gate.consume()).toBe(true) // 补画一次
+    expect(gate.consume()).toBe(false) // 不会补第二次
+    // 绘制重叠（慢绘制期间用户点击又发起一次）：最后一次画完才补
+    gate.begin()
+    gate.begin()
+    expect(gate.request()).toBe(false)
+    expect(gate.end()).toBe(false)
+    expect(gate.end()).toBe(true)
+    expect(gate.consume()).toBe(true)
+    // 没有绘制时直接画；用户点击走 update(...)，根本不经过闸门，不会被合并掉
+    expect(gate.request()).toBe(true)
+    // 绘制卡住超过 15 秒：放行一次，别让面板永远停在旧画面上
+    let clock = 0
+    const stuck = createDrawGate(() => clock)
+    stuck.begin()
+    expect(stuck.request()).toBe(false)
+    clock = 20_000
+    expect(stuck.request()).toBe(true)
+    expect(stuck.end()).toBe(false)
   })
 })
 
