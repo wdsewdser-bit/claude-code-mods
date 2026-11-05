@@ -196,6 +196,9 @@ export const decide = (session, settings, now = Date.now(), options = {}) => {
   if (age > s.maxHours * 3_600_000) return { action: 'drop', reason: 'expired' }
   if (Number(session?.lowHits || 0) >= MAX_LOW_HITS) return { action: 'drop', reason: 'low-hit' }
   if (age < s.intervalMinutes * 60_000 && options?.force !== true) return { action: 'skip', reason: 'running' }
+  // 上次重放到现在也要隔满 intervalMinutes，否则每个 tick 都会重放一次
+  const replayed = Number(session?.lastReplayAt)
+  if (Number.isFinite(replayed) && now - replayed < s.intervalMinutes * 60_000 && options?.force !== true) return { action: 'skip', reason: 'fresh' }
   if (tokensOf(session) < s.minTokens) return { action: 'skip', reason: 'small' }
 
   return { action: 'replay', reason: 'ok' }

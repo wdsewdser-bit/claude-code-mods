@@ -162,8 +162,26 @@ const scan = async ({ force = false, quiet = false } = {}) => {
   const out = { ok: true, enabled: settings.enabled, scanned: files.length, replayed: 0, dropped: 0, pending: 0, results: [] }
   if (!settings.enabled) return out
   const due = []
+  // 同一对话续派会产生多个作业文件；只保活最新的那个，旧的前缀（可能是别的档位）直接删掉
+  const newest = new Map()
+  const keyOf = s => s?.model + '|' + JSON.stringify(s?.body?.system ?? '').length + '|' + JSON.stringify(s?.body?.messages?.[0] ?? '')
+  for (const file of files) {
+    const s = readSessionFile(file)
+    if (s === undefined) continue
+    const k = keyOf(s)
+    const cur = newest.get(k)
+    if (cur === undefined || Number(s.lastRequestAt) > cur.at) newest.set(k, { at: Number(s.lastRequestAt), file })
+  }
   for (const file of files) {
     const session = readSessionFile(file)
+    if (session !== undefined && newest.get(keyOf(session))?.file !== file) {
+      try {
+        fs.unlinkSync(file)
+      } catch {}
+      out.dropped += 1
+      if (!quiet) appendLog(root, { at: now, jobId: session.jobId, model: session.model, ok: false, status: 0, drop: 'superseded', input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0, hitRate: null, usd: 0 })
+      continue
+    }
     if (session === undefined) {
       try {
         fs.unlinkSync(file)
