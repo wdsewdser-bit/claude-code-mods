@@ -134,6 +134,182 @@ const killTree = child => {
   }
 }
 
+// 作业结束后还活着的子进程：CC 的 Bash 工具超时后，Git Bash 被结束了，它起的 grep.exe 却成了孤儿（父进程已退出、
+// 脱离了进程树），作业结束时再从 child.pid 往下找是找不到的。所以运行中每 20 秒用 python + psutil 记一次见过的
+// 后代进程，结束时按 pid + create_time 复查一遍：只提醒，不替人杀。拿不到 python 或 psutil、调用出错时一律静默
+// 跳过——这件事绝不能影响作业本身。
+const PSUTIL_SCRIPT = [
+  'import json, sys',
+  'try:',
+  '    import psutil',
+  'except Exception:',
+  '    sys.exit(3)',
+  "mode = sys.argv[1] if len(sys.argv) > 1 else 'tree'",
+  'out = []',
+  "if mode == 'tree':",
+  '    try:',
+  '        kids = psutil.Process(int(sys.argv[2])).children(recursive=True)',
+  '    except Exception:',
+  '        kids = []',
+  '    for p in kids:',
+  '        try:',
+  "            out.append({'pid': p.pid, 'create_time': p.create_time(), 'name': p.name() or '', 'cmdline': ' '.join(p.cmdline() or '')[:200]})",
+  '        except Exception:',
+  '            pass',
+  'else:',
+  '    try:',
+  "        want = json.loads(sys.stdin.read() or '[]')",
+  '    except Exception:',
+  '        want = []',
+  '    for item in want:',
+  '        try:',
+  '            p = psutil.Process(int(item[0]))',
+  '            ct = p.create_time()',
+  '            if abs(ct - float(item[1])) > 0.001:',
+  '                continue',
+  "            out.append({'pid': p.pid, 'create_time': ct, 'name': p.name() or '', 'cmdline': ' '.join(p.cmdline() or '')[:200]})",
+  '        except Exception:',
+  '            pass',
+  "print(json.dumps(out))",
+].join('\n')
+const PY_CANDIDATES = [process.env.DELEGATE_PYTHON, 'python', 'python3', 'py'].filter(Boolean)
+
+// 跑一次 python 取进程清单；拿不到（没 python、没 psutil、出错、超时）就返回 null。
+const runPsutil = (py, args, input, timeoutMs) =>
+  new Promise(resolve => {
+    let child
+    try {
+      child = spawn(py, ['-I', '-c', PSUTIL_SCRIPT, ...args], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
+    } catch {
+      return resolve(null)
+    }
+    let text = ''
+    let ended = false
+    const end = value => {
+      if (ended) return
+      ended = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch {}
+      end(null)
+    }, timeoutMs)
+    timer.unref?.()
+    child.stdout.on('data', d => (text += d))
+    child.on('error', () => end(null))
+    child.on('close', code => {
+      if (code !== 0) return end(null)
+      try {
+        const list = JSON.parse(text)
+        end(Array.isArray(list) ? list : null)
+      } catch {
+        end(null)
+      }
+    })
+    try { child.stdin.end(input ?? '') } catch {}
+  })
+
+// 运行中记下的后代进程；结束时按 pid + create_time 复查哪些还活着。
+const createProcWatch = () => {
+  const seen = new Map() // 'pid:create_time' -> {pid, create_time, name, cmdline}
+  let py = null // 可用的 python 命令；null = 还没找到（或根本没有）
+  let timer = null
+  let rootPid = null
+  let running = false
+  let stopped = false
+  const wait = ms => new Promise(r => setTimeout(r, ms))
+  const found = () => {
+    if (stopped) return
+    stopped = true
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+  const pickPython = async () => {
+    for (const cand of PY_CANDIDATES) {
+      const ok = await new Promise(resolve => {
+        let child
+        try {
+          child = spawn(cand, ['-I', '-c', 'import psutil'], { stdio: 'ignore', windowsHide: true })
+        } catch {
+          return resolve(false)
+        }
+        const t = setTimeout(() => {
+          try { child.kill() } catch {}
+          resolve(false)
+        }, 10_000)
+        t.unref?.()
+        child.on('error', () => {
+          clearTimeout(t)
+          resolve(false)
+        })
+        child.on('close', code => {
+          clearTimeout(t)
+          resolve(code === 0)
+        })
+      })
+      if (ok) return cand
+    }
+    return null
+  }
+  const sample = async () => {
+    if (stopped || running || rootPid === null) return
+    running = true
+    try {
+      if (py === null) py = await pickPython()
+      if (py === null) return found() // 没有可用的 python：以后也不再试
+      const list = await runPsutil(py, ['tree', String(rootPid)], '', 15_000)
+      for (const p of list ?? []) {
+        if (!p || p.pid === rootPid) continue // CC 自己的主进程不算
+        if (String(p.name).toLowerCase() === 'conhost.exe') continue // 控制台宿主，不是任务自己起的
+        seen.set(p.pid + ':' + p.create_time, p)
+      }
+    } catch {
+    } finally {
+      running = false
+    }
+  }
+  const loop = async () => {
+    timer = null
+    await sample()
+    if (stopped || rootPid === null) return
+    timer = setTimeout(loop, 20_000) // 跑完一次再隔 20 秒跑下一次，同一时刻只有一个
+    timer.unref?.()
+  }
+  return {
+    start: pid => {
+      if (pid === undefined || pid === null || rootPid !== null) return
+      rootPid = pid
+      timer = setTimeout(loop, 5_000) // child 起来后先等 5 秒再采第一次
+      timer.unref?.()
+    },
+    // 结束时（killTree 之后）：等约 1 秒再查一次，见过的进程里还活着、create_time 对得上的就是遗留。最多等 3 秒。
+    // 返回 [{pid,name,cmd}]；出了任何岔子都是 []。
+    leftover: async () => {
+      if (seen.size === 0) {
+        found()
+        return []
+      }
+      found()
+      const begin = Date.now()
+      try {
+        await wait(1_000)
+        // 正在跑的那次采样先让它结束（同一时刻只允许一个），最多等到第 2 秒。
+        while (running && Date.now() - begin < 2_000) await wait(50)
+        if (py === null) return []
+        const want = [...seen.values()].map(p => [p.pid, p.create_time])
+        const alive = await runPsutil(py, ['alive'], JSON.stringify(want), Math.max(300, 3_000 - (Date.now() - begin)))
+        return (alive ?? []).map(p => ({ pid: p.pid, name: p.name, cmd: p.cmdline }))
+      } catch {
+        return []
+      }
+    },
+  }
+}
+
+
 // A job the plugin tracks: status.json / events.jsonl / result.json out, cancel and inbox in.
 // Every write is best effort: losing a status line must never fail the job itself.
 const createControl = (jobId, job) => {
@@ -386,16 +562,30 @@ const main = async () => {
   const control = job.jobId ? createControl(String(job.jobId), job) : null
   // 缓存保活的本地转发（自定义来源的 gpt 作业才有）：作业结束时关掉它，并把守护拉起来续缓存。
   let keepalive = null
+  // 运行中记下见过的后代进程，作业结束（哪条分支都一样）时复查遗留。
+  const watch = createProcWatch()
   // Persist the terminal state before exiting.
-  const done = (value, code = 0) => {
+  // 收尾要等遗留进程那次检查（最多 3 秒），所以是 async：调用处一律 return done(...)。
+  const done = async (value, code = 0) => {
     if (keepalive !== null) {
       try { keepalive.close() } catch {}
       // 有会话要保活才有人接：守护自己会判断，没有文件就启动不了。
       try { spawnKeepaliveDaemon() } catch {}
     }
-    try { control?.finish(value) } catch {}
+    // 取消、超时也走这里：killTree 之后约 1 秒，再看一眼见过的后代进程还在不在。
+    let out = value
+    try {
+      const left = await watch.leftover()
+      if (left.length > 0) {
+        const brief = left.map(p => `${p.pid} ${p.name} ${p.cmd}`.trim()).join('，')
+        const line = `⚠ 有 ${left.length} 个子进程在作业结束后还在运行：${brief}，确认没用了就 taskkill //PID <pid> //F`
+        const text = typeof value.text === 'string' && value.text !== '' ? `${value.text}\n${line}` : line
+        out = { ...value, leftover: left, text }
+      }
+    } catch {}
+    try { control?.finish(out) } catch {}
     try { control?.stop() } catch {}
-    finish(value, code)
+    finish(out, code)
   }
   // gpt: CPA supplies the url and the key, so the job carries only the model and the task.
   // 走自定义供应商时 model 已经是 '<供应商id>/<模型>'（CPA 按前缀路由），这里一律原样透传：
@@ -546,6 +736,7 @@ const main = async () => {
       control.state.childPid = child.pid ?? null
       control.write(true)
     }
+    watch.start(child.pid) // 5 秒后采第一次，之后每 20 秒一次
     let out = ''
     let err = ''
     let buf = ''
