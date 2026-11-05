@@ -287,6 +287,8 @@ type JobReply = {
   terminal?: string | null
   // 作业是因为请示一直没等到回复才结束的（runner 记在 result.json 里）
   askTimeout?: boolean
+  // 作业结束后还在跑的子进程（runner 在运行中记下的后代，只提醒、不替你杀）
+  leftover?: { pid: number; name: string; cmd: string }[]
 }
 
 // 进程成功（ok）不等于任务完成：把任务终态和实际模型单独说一行，附在返回文本末尾。
@@ -1191,8 +1193,14 @@ const settle = async (
   const config = await loadConfig($).catch(() => undefined)
   const note = runnerNote(reply, record.tier === 'gpt' && config !== undefined ? gptPrefixToStrip(config) : '')
   const tail = note === '' ? '' : `\n${note}`
+  // 作业结束后还在跑的子进程：成功分支 runner 已经把它写进 text，失败分支的 text 不显示，这里补一句。
+  const left = Array.isArray(reply.leftover) ? reply.leftover : []
+  const leftoverNote =
+    left.length === 0
+      ? ''
+      : `\n⚠ 有 ${left.length} 个子进程在作业结束后还在运行：${left.map(p => `${p.pid} ${p.name} ${p.cmd}`.trim()).join('，')}，确认没用了就 taskkill //PID <pid> //F`
   if (!reply.ok) {
-    return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${tail}`, isError: true }
+    return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${tail}${leftoverNote}`, isError: true }
   }
   const text = reply.text ?? ''
   // 请示没等到回复就结束了：通知里点明，别当成正常完成。
