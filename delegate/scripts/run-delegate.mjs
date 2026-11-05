@@ -894,11 +894,13 @@ const main = async () => {
       })
     }
     if (parsed && typeof parsed.result === 'string') {
+      // CC 会把最后一条只含 thinking 的消息当成 result，这时 result 为空，退回最后一个 text 块
+      const resultText = parsed.result.trim() === '' && lastText ? lastText : parsed.result
       return done({
         ok: parsed.is_error !== true,
-        text: parsed.result,
+        text: resultText,
         models: models.length > 0 ? models : null,
-        terminal: terminalOf(parsed.result),
+        terminal: terminalOf(resultText),
         sessionId: parsed.session_id ?? sid ?? null,
         turns: parsed.num_turns ?? null,
         ms,
