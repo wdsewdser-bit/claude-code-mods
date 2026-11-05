@@ -530,12 +530,21 @@ const findClaude = () => {
   if (process.env.DELEGATE_CLAUDE) return process.env.DELEGATE_CLAUDE
   const local = process.env.LOCALAPPDATA
   if (local) {
-    const packages = path.join(local, 'Packages')
+    // 桌面端自带的 Claude Code：旧版在 Packages\Claude_*\LocalCache\Roaming\Claude\claude-code，
+    // 2026-11 起在 Claude-Data\claude_*\claude-code
+    const bases = []
+    const scan = (root, prefix, rest) => {
+      try {
+        for (const pkg of fs.readdirSync(root)) {
+          if (pkg.toLowerCase().startsWith(prefix)) bases.push(path.join(root, pkg, ...rest))
+        }
+      } catch {}
+    }
+    scan(path.join(local, 'Packages'), 'claude_', ['LocalCache', 'Roaming', 'Claude', 'claude-code'])
+    scan(path.join(local, 'Claude-Data'), 'claude_', ['claude-code'])
     const found = []
-    try {
-      for (const pkg of fs.readdirSync(packages)) {
-        if (!pkg.startsWith('Claude_')) continue
-        const base = path.join(packages, pkg, 'LocalCache', 'Roaming', 'Claude', 'claude-code')
+    for (const base of bases) {
+      try {
         if (!fs.existsSync(base)) continue
         for (const ver of fs.readdirSync(base)) {
           for (const hash of fs.readdirSync(path.join(base, ver))) {
@@ -543,8 +552,8 @@ const findClaude = () => {
             if (fs.existsSync(exe)) found.push({ ver, exe })
           }
         }
-      }
-    } catch {}
+      } catch {}
+    }
     found.sort((a, b) => a.ver.localeCompare(b.ver, undefined, { numeric: true }))
     if (found.length > 0) return found.at(-1).exe
   }
