@@ -53,12 +53,16 @@ import type { LoadedTool, OverflowFailure, SearchHit, Shard } from './history.ts
 import {
   archiveName,
   hasFreshEntry,
+  isFamily,
+  MAX_FAMILY_SHOWN,
   pageOf,
   QUERY_DEFAULT_LIMIT,
   QUERY_MAX_LIMIT,
+  recordKey,
   renderEntries,
   renderHome,
   renderQueryResult,
+  SNAPSHOT_PREFIX,
   stamp,
   tasksOf,
   turnPage,
@@ -1851,6 +1855,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     }
 
     // An omitted next_step or anchors is stored as omitted: tasksOf reads it as "unchanged" and says which entry it came from.
+    const isNewTask = !state.page.some(previous => previous.task_id === candidate.task_id)
     const seq = state.ledgerSeq + 1
     const entry = stamp(candidate, {
       seq,
@@ -1878,6 +1883,22 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       bound === undefined
         ? '没有可对应的请求（request_ref 记为 0）。'
         : `对应请求 #${bound.seq}（${boundKind}${isDefault ? '，省略 request_ref 时取最近一条' : ''}）。`
+    // A new id beside an unfinished relative is how one task quietly replaces another: said
+    // once here so the model can close the old one, never decided by the code itself.
+    if (isNewTask) {
+      const relatives = tasksOf(state.page)
+        .filter(
+          task =>
+            task.taskId !== entry.task_id &&
+            (task.status === 'in_progress' || task.status === 'blocked') &&
+            isFamily(task.taskId, entry.task_id),
+        )
+        .sort((left, right) => right.latest.ts - left.latest.ts || right.latest.seq - left.latest.seq)
+        .slice(0, MAX_FAMILY_SHOWN)
+      for (const relative of relatives) {
+        result += `\n同族旧任务 ${relative.taskId} 仍是${STATUS_LABEL[relative.status]}，若已被取代请把它标成 superseded。`
+      }
+    }
     // Not an error: the entry is in memory, and an error would make the model record it twice.
     if (!isWritten) {
       result += '\n注意：账本这次没能写进磁盘（内存里有，本会话内仍然有效）；下次记账会重写整个文件。'
@@ -1899,8 +1920,6 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
 
   /** The longest a snapshot's own text may run, so the entry passes the ledger's length check. */
   const SNAPSHOT_TEXT_CHARS = 600
-  /** Every entry a keepalive's answer books says where it came from. */
-  const SNAPSHOT_PREFIX = '保活快照：'
 
   /** The ledger's own check on one snapshot entry, before it is booked. */
   const checkSnapshotEntry = (input: unknown): string[] =>
@@ -1953,6 +1972,15 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       // An in_progress entry without a next step fails the whole check; blocked takes none.
       if (nextStep !== '') input.next_step = nextStep
       else if (item.status === 'in_progress') continue
+      // A keepalive that only repeats the task's latest record books nothing: the same state
+      // reaching a new window adds no news, and repeating it crowds out what did change. An
+      // omitted next step and one written empty are different records, so both kinds book.
+      let previous: LedgerEntry | undefined
+      for (let at = state.page.length - 1; previous === undefined && at >= 0; at -= 1) {
+        const entry = state.page[at]
+        if (entry !== undefined && entry.task_id === taskId) previous = entry
+      }
+      if (previous !== undefined && recordKey(previous) === recordKey(input)) continue
       if (checkSnapshotEntry(input).length > 0) continue
       const result = await ledgerAppend(input, env)
       if (result.isError !== true) booked += 1
@@ -2046,6 +2074,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       const relay = await relayForHome()
       const rows = allRows()
       const requests = personRequests(rows, config.recentRequests)
+      const archived = await archivedForHome()
 
       return {
         result: renderHome(
@@ -2056,6 +2085,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
             ...(relay === undefined ? {} : { relay }),
             answered: repliesAnswered(rows, requests),
             archive: state.archive,
+            ...(archived.length === 0 ? {} : { archived }),
+            now: io.now(),
           },
           config,
         ),
@@ -2492,6 +2523,24 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     state.pending = null
   }
 
+  /**
+   * The archived records, read only when something is still open: a closed task that left
+   * the page may be the sibling that took an open task's place, and the home page names it.
+   */
+  const archivedForHome = async (): Promise<LedgerEntry[]> => {
+    const hasOpen = tasksOf(state.page).some(
+      task => task.status === 'in_progress' || task.status === 'blocked',
+    )
+    if (!hasOpen) return []
+    const entries: LedgerEntry[] = []
+    for (let page = 1; page <= state.archive.length; page += 1) {
+      const rows = await loadArchive(page)
+      if (rows !== null) entries.push(...rows)
+    }
+
+    return entries
+  }
+
   const buildHandoff = async (opts: { isMidTurn: boolean; agents?: readonly AgentNote[] }): Promise<string> => {
     await ensureLoaded()
     await ensureRequests()
@@ -2511,8 +2560,18 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     const answered = repliesAnswered(rows, requests)
     const window = state.window + 1
     const agents = renderAgents(agentsForHandoff(opts.agents ?? [], state.roster, io.now(), config))
+    const archived = await archivedForHome()
     const home = renderHome(
-      { window, entries: state.page, requests, ...(relay === undefined ? {} : { relay }), answered, archive: state.archive },
+      {
+        window,
+        entries: state.page,
+        requests,
+        ...(relay === undefined ? {} : { relay }),
+        answered,
+        archive: state.archive,
+        ...(archived.length === 0 ? {} : { archived }),
+        now: io.now(),
+      },
       config,
     )
     // A running task is already spelled out in the home page: repeating the last

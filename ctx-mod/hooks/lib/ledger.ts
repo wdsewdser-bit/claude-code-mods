@@ -46,6 +46,58 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
   blocked: '受阻',
 }
 
+/** Every record a keepalive's answer books says where it came from (see `ledgerSnapshot` in session.ts). */
+export const SNAPSHOT_PREFIX = '保活快照：'
+/** How many family members one open task names, so a long line of siblings cannot flood the home page. */
+export const MAX_FAMILY_SHOWN = 3
+
+/** A text without the keepalive prefix and with its spacing flattened, so two records can be compared word for word. */
+const flatText = (text: string): string =>
+  (text.startsWith(SNAPSHOT_PREFIX) ? text.slice(SNAPSHOT_PREFIX.length) : text).replace(/\s+/g, ' ').trim()
+
+/**
+ * What makes two records of one task say the same thing: the status, the text and the
+ * next step, compared exactly once spacing is set aside. No similarity is guessed at,
+ * so a figure that changed (75 to 7) is always a different record. An omitted next step
+ * and one written empty differ too: the first carries a step over, the second clears it.
+ */
+export const recordKey = (entry: {
+  status?: unknown
+  text?: unknown
+  next_step?: unknown
+}): string =>
+  JSON.stringify([
+    entry.status ?? null,
+    flatText(typeof entry.text === 'string' ? entry.text : ''),
+    typeof entry.next_step === 'string' ? flatText(entry.next_step) : null,
+  ])
+
+/** A task id without its trailing version or number suffix: `x-v2`, `x-3` and `x-1.2` are all `x`. */
+const FAMILY_SUFFIX = /(?:-v?\d+(?:\.\d+)*)+$/i
+export const familyKey = (taskId: string): string => taskId.replace(FAMILY_SUFFIX, '')
+
+/**
+ * Whether two task ids name the same line of work: one key once the suffix is off, or a
+ * shared hyphen prefix of two or more segments. A hint only: nothing here decides that
+ * one task took another's place.
+ */
+export const isFamily = (left: string, right: string): boolean => {
+  if (left === right) return false
+  if (familyKey(left) === familyKey(right)) return true
+  const leftParts = left.split('-').filter(part => part !== '')
+  const rightParts = right.split('-').filter(part => part !== '')
+  let shared = 0
+  while (
+    shared < leftParts.length &&
+    shared < rightParts.length &&
+    leftParts[shared] === rightParts[shared]
+  ) {
+    shared += 1
+  }
+
+  return shared >= 2
+}
+
 /** The only thing a tool input safely can be: a plain JSON object. */
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -389,6 +441,12 @@ export type TaskState = {
   nextStep?: Resolved<string>
   /** The anchors in force, resolved the same way as the next step. */
   anchors?: Resolved<Anchor[]>
+  /**
+   * The last record that really changed the task: its first one, or a later one that was
+   * no keepalive snapshot or that differed from the record before it. Repeats of a
+   * snapshot leave this where it was, so how stale the task is shows through.
+   */
+  lastSubstantive: { seq: number; window: number; ts: number }
 }
 
 const isClosedStatus = (status: LedgerEntry['status']): boolean =>
@@ -418,6 +476,26 @@ const resolveField = <T>(
   return undefined
 }
 
+/**
+ * The task's last real change, read oldest first: a record that is no snapshot always
+ * counts, and one that is counts only when it differs from the record before it.
+ */
+const substantiveOf = (entries: readonly LedgerEntry[]): { seq: number; window: number; ts: number } => {
+  const first = entries[0]
+  let at = first === undefined ? { seq: 0, window: 1, ts: 0 } : { seq: first.seq, window: first.window, ts: first.ts }
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]
+    if (entry === undefined) continue
+    const previous = entries[index - 1]
+    if (entry.text.startsWith(SNAPSHOT_PREFIX) && previous !== undefined && recordKey(entry) === recordKey(previous)) {
+      continue
+    }
+    at = { seq: entry.seq, window: entry.window, ts: entry.ts }
+  }
+
+  return at
+}
+
 /** Groups entries by task in first-seen order; later entries win as the latest. */
 export const tasksOf = (entries: readonly LedgerEntry[]): TaskState[] => {
   const byId = new Map<string, TaskState>()
@@ -431,6 +509,7 @@ export const tasksOf = (entries: readonly LedgerEntry[]): TaskState[] => {
         first: entry,
         latest: entry,
         entries: [entry],
+        lastSubstantive: { seq: entry.seq, window: entry.window, ts: entry.ts },
       })
       continue
     }
@@ -442,6 +521,7 @@ export const tasksOf = (entries: readonly LedgerEntry[]): TaskState[] => {
 
   const tasks = [...byId.values()]
   for (const task of tasks) {
+    task.lastSubstantive = substantiveOf(task.entries)
     const nextStep = resolveField(
       task.entries,
       entry => (typeof entry.next_step === 'string' ? entry.next_step : undefined),
@@ -551,21 +631,54 @@ export const renderHome = (
     /** The model's reply each request came after, by the request's seq. */
     answered?: ReadonlyMap<number, HistoryRecord>
     archive: readonly ArchivePage[]
+    /** Records of pages already in the archive, searched only for family members: none of them is open work. */
+    archived?: readonly LedgerEntry[]
+    /** The clock "how many days ago" is measured against; the newest entry's time when left out. */
+    now?: number
   },
   config: Config,
 ): string => {
   const tasks = tasksOf(input.entries)
   const active = tasks.filter(task => task.status === 'in_progress' || task.status === 'blocked')
-  const doneLines = newestFirst(tasks.filter(task => task.status === 'done')).map(
-    task => `- ${task.title}`,
-  )
+  // A closed task in the archive can still be the one that took an open task's place, so the family looks there too.
+  const archived = input.archived === undefined ? [] : tasksOf(input.archived)
+  const pool = [...archived.filter(task => !tasks.some(open => open.taskId === task.taskId)), ...tasks]
+  const activeIds = active.map(task => task.taskId)
+  const relatesToOpen = (taskId: string): boolean => activeIds.some(id => isFamily(id, taskId))
+  const now = input.now ?? input.entries.reduce((latest, entry) => Math.max(latest, entry.ts), 0)
+
+  const doneTasks = newestFirst(tasks.filter(task => task.status === 'done'))
+  const doneLines = doneTasks.map(task => `- ${task.title}`)
+  const doneKept = doneTasks.map(task => relatesToOpen(task.taskId))
   const archiveLines = input.archive.map(
     page =>
       `- 第 ${page.page} 页：${page.titles.join('、')}（#${page.fromSeq}-${page.toSeq}，${dayOf(page.fromTs)} 至 ${dayOf(page.toTs)}）`,
   )
   const superseded = newestFirst(tasks.filter(task => task.status === 'superseded'))
   const pastCap = Math.max(0, superseded.length - MAX_SUPERSEDED_SHOWN)
-  const superLines = superseded.slice(0, MAX_SUPERSEDED_SHOWN).map(anchorLine)
+  const shownSuperseded = superseded.slice(0, MAX_SUPERSEDED_SHOWN)
+  const superLines = shownSuperseded.map(anchorLine)
+  const superKept = shownSuperseded.map(task => relatesToOpen(task.taskId))
+
+  /**
+   * The title line of an open task, with when it last really changed. A task whose latest
+   * records only repeat an old snapshot is what a new window is most likely to misread as
+   * current work, so past the thresholds it is marked — a hint, never a close.
+   */
+  const headerOf = (task: TaskState): string => {
+    const last = task.lastSubstantive
+    const days = Math.max(0, Math.floor((now - last.ts) / 86_400_000))
+    const isStale = input.window - last.window >= config.staleWindows || days >= config.staleDays
+    const when = `最后实质更新：第 ${last.window} 窗口，${days} 天前${isStale ? '，可能已过时，提之前先确认' : ''}`
+
+    return `- ${task.taskId}：${task.title}（${STATUS_LABEL[task.status]}；${when}）`
+  }
+
+  /** The tasks that look like the same line of work, newest first: said, never acted on. */
+  const familyLinesOf = (task: TaskState): string[] =>
+    newestFirst(pool.filter(other => other.taskId !== task.taskId && isFamily(task.taskId, other.taskId)))
+      .slice(0, MAX_FAMILY_SHOWN)
+      .map(other => `  - 同族：${other.taskId} ${STATUS_LABEL[other.status]} #L${other.latest.seq}`)
 
   const head: string[] = []
   head.push(
@@ -597,7 +710,7 @@ export const renderHome = (
     const full = ordered.slice(0, MAX_FULL_ACTIVE)
     const short = ordered.slice(MAX_FULL_ACTIVE)
     for (const task of full) {
-      head.push(`- ${task.taskId}：${task.title}（${STATUS_LABEL[task.status]}）`)
+      head.push(headerOf(task))
       const notes = windowNotesOf(task, input.entries)
       const hasOlderWindow = notes.some(note => note.window !== task.latest.window)
       if (notes.length <= 1) {
@@ -621,9 +734,10 @@ export const renderHome = (
             : `  - 下一步：${next.value}`,
         )
       }
+      head.push(...familyLinesOf(task))
     }
     for (const task of short) {
-      head.push(`- ${task.taskId}：${task.title}（${STATUS_LABEL[task.status]}）`)
+      head.push(headerOf(task))
       head.push(`  - 最新 #L${task.latest.seq}：${clipText(task.latest.text, SHORT_FIELD_CHARS)}`)
       const next = task.nextStep
       if (next !== undefined) {
@@ -634,6 +748,7 @@ export const renderHome = (
             : `  - 下一步：${value}`,
         )
       }
+      head.push(...familyLinesOf(task))
     }
     if (short.length > 0) {
       head.push(`（还有 ${short.length} 个较早更新的任务只显示了摘要，完整记录用 ledger_read 按 task_id 查）`)
@@ -652,14 +767,39 @@ export const renderHome = (
     return lines.join('\n')
   }
 
+  /**
+   * Drops the last title nothing depends on. A done or superseded title that belongs to an
+   * open task's family is what tells the next window the work was finished, so it goes last.
+   */
+  const trimFree = (lines: string[], kept: boolean[]): boolean => {
+    for (let at = lines.length - 1; at >= 0; at -= 1) {
+      if (kept[at] === true) continue
+      lines.splice(at, 1)
+      kept.splice(at, 1)
+
+      return true
+    }
+
+    return false
+  }
+
   let text = build()
   while (
     estimateTokens(text) > config.homeTokens &&
     doneLines.length + archiveLines.length + superLines.length > 0
   ) {
-    if (doneLines.length > 0) doneLines.pop()
-    else if (archiveLines.length > 0) archiveLines.shift()
-    else superLines.pop()
+    if (trimFree(doneLines, doneKept)) {
+      // an unrelated finished task went
+    } else if (archiveLines.length > 0) archiveLines.shift()
+    else if (trimFree(superLines, superKept)) {
+      // an unrelated superseded task went
+    } else if (doneLines.length > 0) {
+      doneLines.pop()
+      doneKept.pop()
+    } else if (superLines.length > 0) {
+      superLines.pop()
+      superKept.pop()
+    } else break
     trimmed += 1
     text = build()
   }

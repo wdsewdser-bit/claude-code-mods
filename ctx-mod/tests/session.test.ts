@@ -5,7 +5,7 @@ import type { Env, Io, Session } from '../hooks/lib/session.ts'
 import { segmentName, shardName } from '../hooks/lib/history.ts'
 import { openingOf } from '../hooks/lib/handoff.ts'
 import { DEFAULTS, estimateTokens, parseJsonl } from '../hooks/lib/types.ts'
-import type { Config, HistoryRecord, LedgerEntry } from '../hooks/lib/types.ts'
+import type { Config, HistoryRecord, LedgerEntry, LedgerSnapshot } from '../hooks/lib/types.ts'
 
 const DIR = '/ctx'
 
@@ -3067,5 +3067,68 @@ describe('the cold-cache hold-back on resuming a subagent', () => {
     box.advance(5 * HOUR)
     const second = createSession(DIR, box.io, DEFAULTS)
     expect(await second.coldResend('a1', 'x')).toBeNull()
+  })
+})
+
+describe('keepalive snapshots and the tasks they replace', () => {
+  const open = { task_id: 'adaptive-effort-v2', title: '自适应力度', status: 'blocked' as const, text: '等授权' }
+  const snapshotOf = (at: number, entries: LedgerSnapshot['entries']): LedgerSnapshot => ({ at, entries })
+
+  test('a snapshot repeating the task’s latest record is not booked a second time', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    expect(await session.ledgerSnapshot(snapshotOf(2_000, [open]), env(10_000))).toBe(1)
+    box.advance(1_000)
+    expect(await session.ledgerSnapshot(snapshotOf(3_000, [open]), env(10_000))).toBe(0)
+    await session.flush()
+    expect(readLedger(box)).toHaveLength(1)
+  })
+
+  test('a snapshot whose figures changed is booked', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    expect(await session.ledgerSnapshot(snapshotOf(2_000, [{ ...open, text: '还剩 75 行' }]), env(10_000))).toBe(1)
+    box.advance(1_000)
+    expect(await session.ledgerSnapshot(snapshotOf(3_000, [{ ...open, text: '还剩 7 行' }]), env(10_000))).toBe(1)
+    await session.flush()
+    expect(readLedger(box).map(one => one.text)).toEqual(['保活快照：还剩 75 行', '保活快照：还剩 7 行'])
+  })
+
+  test('a snapshot with no next step is not the same as one the model cleared', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    await session.ledgerAppend({ ...open, text: '保活快照：等授权', next_step: '' }, env(10_000))
+    expect(await session.ledgerSnapshot(snapshotOf(2_000, [open]), env(10_000))).toBe(1)
+    await session.flush()
+    expect(readLedger(box)).toHaveLength(2)
+  })
+
+  test('a new task whose sibling is still open is told so in the receipt', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    await session.ledgerAppend({ task_id: 'adaptive-effort-v2', title: '自适应力度 v2', status: 'blocked', text: '等授权' }, env(10_000))
+    const next = await session.ledgerAppend(
+      { task_id: 'adaptive-effort-v3', title: '自适应力度 v3', status: 'in_progress', text: '重新做了一版', next_step: '跑测试' },
+      env(10_000),
+    )
+    expect(next.result).toContain('同族旧任务 adaptive-effort-v2 仍是受阻，若已被取代请把它标成 superseded。')
+
+    const unrelated = await session.ledgerAppend(
+      { task_id: 'docs', title: '写文档', status: 'in_progress', text: '写了一节', next_step: '接着写' },
+      env(10_000),
+    )
+    expect(unrelated.result).not.toContain('同族旧任务')
+  })
+
+  test('the handoff puts the finished sibling under the blocked task it replaced', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    await session.ledgerAppend({ task_id: 'adaptive-effort-v2', title: '自适应力度 v2', status: 'blocked', text: '等授权' }, env(10_000))
+    await session.ledgerAppend({ task_id: 'adaptive-effort-v3', title: '自适应力度 v3', status: 'done', text: '做完了', evidence: [2] }, env(10_000))
+
+    const handoff = await session.buildHandoff({ isMidTurn: false })
+    expect(handoff).toContain('同族：adaptive-effort-v3 已完成 #L2')
+    expect(handoff.indexOf('同族：adaptive-effort-v3')).toBeGreaterThan(handoff.indexOf('- adaptive-effort-v2：'))
+    expect(handoff).toContain('自适应力度 v3')
   })
 })
