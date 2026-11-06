@@ -15,7 +15,7 @@ import { DEFAULTS, OWN_TOOL_PREFIX } from './lib/types.ts'
 
 /** The section of the system prompt, the same all session long. */
 const SYSTEM_TEXT =
-  '这个会话可能跨多个上下文窗口。你有一个任务账本（mcp__ctx-mod__ledger_append、mcp__ctx-mod__ledger_read）和完整历史（mcp__ctx-mod__history）。工具结果末尾形如 [#123] 的是历史编号。每完成一个阶段，就追加一条账本记录：用 task_id 标识任务，status 填 in_progress / done / superseded / blocked。标 done 时必须在 evidence 里附上证明它的工具结果的历史编号。用户提出新请求时，如果它取代了旧任务，就把旧任务标为 superseded。用户改主意、或后面的话推翻了先前的决定时，用 decision_revoke 撤销旧条（用户说明了改成什么，就用 by 指向那条新消息）。对还没做完的任务，写明 next_step，并用 anchors 记下接下来要改的位置：文件路径，加一小段能在文件里唯一定位的原文。收到收尾或交接通知时，先更新账本。上下文用量可以用 mcp__ctx-mod__context 查看；它提示可以换窗口时，先记账再调用它的 new。申请换窗口之前，先用 ledger_append 把进行中任务的进度写清楚，text 里写明后面要用到的关键事实（产物路径、已确认的结论、约定的参数），有子代理在跑时写明各自的 id、负责什么、产物放哪。改法已经确定的改动不要留给新窗口：和 new 放在同一条消息里并发做完；只有还需要判断的才写进 anchors。'
+  '这个会话可能跨多个上下文窗口。你有一个任务账本（mcp__ctx-mod__ledger_append、mcp__ctx-mod__ledger_read）和完整历史（mcp__ctx-mod__history）。工具结果末尾形如 [#123] 的是历史编号。每完成一个阶段，就追加一条账本记录：用 task_id 标识任务，status 填 in_progress / done / superseded / blocked。标 done 时必须在 evidence 里附上证明它的工具结果的历史编号。用户提出新请求时，如果它取代了旧任务，就把旧任务标为 superseded。用户改主意、或后面的话推翻了先前的决定时，用 decision_revoke 撤销旧条（用户说明了改成什么，就用 by 指向那条新消息）。对还没做完的任务，写明 next_step，并用 anchors 记下接下来要改的位置：文件路径，加一小段能在文件里唯一定位的原文。试过不行的做法写进 dead_ends，完成条件写进 done_when。收到收尾或交接通知时，先更新账本。上下文用量可以用 mcp__ctx-mod__context 查看；它提示可以换窗口时，先记账再调用它的 new。申请换窗口之前，先用 ledger_append 把进行中任务的进度写清楚，text 里写明后面要用到的关键事实（产物路径、已确认的结论、约定的参数），有子代理在跑时写明各自的 id、负责什么、产物放哪。改法已经确定的改动不要留给新窗口：和 new 放在同一条消息里并发做完；只有还需要判断的才写进 anchors。'
 
 /** Submitted after a switch the model itself asked for, so the new window carries on. */
 const CONTINUE_TEXT = 'ctx-mod：已换到新的上下文窗口。先用一句话复述当前请求和进度，然后继续。'
@@ -672,7 +672,7 @@ const TOOLS = [
   {
     name: 'ledger_append',
     description:
-      '向任务账本追加一条记录。每完成一个阶段就写一条：task_id 标识任务，status 取 in_progress / done / superseded / blocked，text 用一句话说明这一步（不能为空）。标 done 时必须在 evidence 里给出证明它的工具结果历史编号。对 in_progress 的任务必须写 next_step，并用 anchors 记下接下来要改的位置。next_step 和 anchors 省略表示沿用上一条（交接里会标明沿用自哪条），传空字符串或空数组表示清空。',
+      '向任务账本追加一条记录。每完成一个阶段就写一条：task_id 标识任务，status 取 in_progress / done / superseded / blocked，text 用一句话说明这一步（不能为空）。标 done 时必须在 evidence 里给出证明它的工具结果历史编号。对 in_progress 的任务必须写 next_step，并用 anchors 记下接下来要改的位置。next_step 和 anchors 省略表示沿用上一条（交接里会标明沿用自哪条），传空字符串或空数组表示清空。dead_ends 写已失败、不要重试的做法，done_when 写完成条件，可选，省略表示沿用。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -685,6 +685,8 @@ const TOOLS = [
         },
         text: { type: 'string', description: '这一步的要点，一句话。' },
         next_step: { type: 'string', description: '下一步要做什么（任务未完成时填写）。' },
+        dead_ends: { type: 'string', description: '已经试过、走不通、不要再重复的做法（可选，省略表示沿用）。' },
+        done_when: { type: 'string', description: '什么情况下算完成（可选，省略表示沿用）。' },
         anchors: {
           type: 'array',
           description: '接下来要改的位置列表。',
@@ -737,7 +739,7 @@ const TOOLS = [
         view: { type: 'string', description: 'home、current 或 archive:N，默认 home。' },
         query: {
           type: 'string',
-          description: '在 task_id、标题、正文和下一步里搜索的词；也可以填精确的 task_id 或 #L编号 直接看全文。',
+          description: '在 task_id、标题、正文、下一步、走不通的路和完成条件里搜索的词；也可以填精确的 task_id 或 #L编号 直接看全文。',
         },
         limit: {
           type: 'number',

@@ -1809,6 +1809,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       text: raw.text,
     }
     if (typeof raw.next_step === 'string') candidate.next_step = raw.next_step
+    if (typeof raw.dead_ends === 'string') candidate.dead_ends = raw.dead_ends
+    if (typeof raw.done_when === 'string') candidate.done_when = raw.done_when
     if (Array.isArray(raw.anchors)) candidate.anchors = raw.anchors as Anchor[]
     if (Array.isArray(raw.evidence)) candidate.evidence = raw.evidence as number[]
     if (typeof raw.superseded_by === 'string') candidate.superseded_by = raw.superseded_by
@@ -1972,6 +1974,11 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       // An in_progress entry without a next step fails the whole check; blocked takes none.
       if (nextStep !== '') input.next_step = nextStep
       else if (item.status === 'in_progress') continue
+      // A snapshot never clears a field: what it does not carry stays omitted and is inherited.
+      const deadEnds = (item.dead_ends ?? '').trim()
+      if (deadEnds !== '') input.dead_ends = deadEnds
+      const doneWhen = (item.done_when ?? '').trim()
+      if (doneWhen !== '') input.done_when = doneWhen
       // A keepalive that only repeats the task's latest record books nothing: the same state
       // reaching a new window adds no news, and repeating it crowds out what did change. An
       // omitted next step and one written empty are different records, so both kinds book.
