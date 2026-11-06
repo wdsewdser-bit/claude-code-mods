@@ -242,6 +242,121 @@ describe('validate', () => {
   })
 })
 
+describe('dead_ends and done_when', () => {
+  const requests = [person({ seq: 1, ts: 1_000, text: '先改登录页' })]
+
+  test('both must be strings; omitting either is fine', () => {
+    expect(validate(input({ dead_ends: 5 as unknown as string }), context()).join('\n')).toContain(
+      'dead_ends 必须是字符串',
+    )
+    expect(validate(input({ done_when: [] as unknown as string }), context()).join('\n')).toContain(
+      'done_when 必须是字符串',
+    )
+    expect(validate(input({ dead_ends: '不要再走旧接口', done_when: '测试全绿' }), context())).toEqual([])
+    expect(validate(input({ dead_ends: '', done_when: '' }), context())).toEqual([])
+  })
+
+  test('stamp writes both when given and drops a value of the wrong type', () => {
+    const stamped = stamp(input({ dead_ends: '旧接口走不通', done_when: '测试全绿' }), meta)
+    expect(stamped.dead_ends).toBe('旧接口走不通')
+    expect(stamped.done_when).toBe('测试全绿')
+    const bad = stamp(wrong({ ...input(), dead_ends: 5, done_when: {} }), meta)
+    expect('dead_ends' in bad).toBe(false)
+    expect('done_when' in bad).toBe(false)
+  })
+
+  test('both carry over from the newest entry that gave them, and an empty string clears', () => {
+    const [task] = tasksOf([
+      entry({ seq: 1, ts: 100, dead_ends: '旧接口走不通', done_when: '测试全绿' }),
+      entry({ seq: 2, ts: 200 }),
+    ])
+    expect(task?.deadEnds).toEqual({ value: '旧接口走不通', seq: 1, isInherited: true })
+    expect(task?.doneWhen).toEqual({ value: '测试全绿', seq: 1, isInherited: true })
+
+    const [own] = tasksOf([entry({ seq: 1, dead_ends: '别再试旧接口', done_when: '改完即完成' })])
+    expect(own?.deadEnds).toEqual({ value: '别再试旧接口', seq: 1, isInherited: false })
+    expect(own?.doneWhen?.isInherited).toBe(false)
+
+    const [cleared] = tasksOf([
+      entry({ seq: 1, ts: 100, dead_ends: '旧接口走不通', done_when: '测试全绿' }),
+      entry({ seq: 2, ts: 200, dead_ends: '', done_when: '' }),
+      entry({ seq: 3, ts: 300 }),
+    ])
+    expect(cleared?.deadEnds).toBeUndefined()
+    expect(cleared?.doneWhen).toBeUndefined()
+  })
+
+  test('the home page shows both, marks an inherited one with its source, and says nothing once cleared', () => {
+    const own = renderHome(
+      { window: 1, entries: [entry({ seq: 1, dead_ends: '不要再走旧接口', done_when: '测试全绿' })], requests, archive: [] },
+      DEFAULTS,
+    )
+    expect(own).toContain('  - 完成条件：测试全绿')
+    expect(own).toContain('  - 走不通的路：不要再走旧接口')
+    expect(own.indexOf('  - 完成条件：')).toBeGreaterThan(own.indexOf('  - 下一步：'))
+    expect(own.indexOf('  - 走不通的路：')).toBeGreaterThan(own.indexOf('  - 完成条件：'))
+
+    const carried = renderHome(
+      {
+        window: 3,
+        entries: [
+          entry({ seq: 32, ts: 100, window: 1, dead_ends: '旧接口走不通', done_when: '测试全绿' }),
+          entry({ seq: 33, ts: 200, window: 2, text: '补记' }),
+        ],
+        requests,
+        archive: [],
+      },
+      DEFAULTS,
+    )
+    expect(carried).toContain('  - 完成条件（沿用 #L32 的记录）：测试全绿')
+    expect(carried).toContain('  - 走不通的路（沿用 #L32 的记录）：旧接口走不通')
+
+    const cleared = renderHome(
+      {
+        window: 3,
+        entries: [
+          entry({ seq: 1, dead_ends: '旧接口走不通', done_when: '测试全绿' }),
+          entry({ seq: 2, status: 'blocked', dead_ends: '', done_when: '' }),
+        ],
+        requests,
+        archive: [],
+      },
+      DEFAULTS,
+    )
+    expect(cleared).not.toContain('完成条件')
+    expect(cleared).not.toContain('走不通的路')
+  })
+
+  test('only the newest record is whole; an older one keeps 60 characters and an ellipsis', () => {
+    const entries = [
+      entry({ task_id: 't1', text: '甲'.repeat(90), seq: 1, ts: 100 }),
+      entry({ task_id: 't1', text: '乙'.repeat(70), seq: 2, ts: 200 }),
+      entry({ task_id: 't1', text: '最新一条', seq: 3, ts: 300 }),
+    ]
+    const text = renderHome({ window: 2, entries, requests, archive: [] }, DEFAULTS)
+    expect(text).toContain(
+      '  - 记录（最近 3 条，旧→新；只有最新一条是全文，较早的已截断，需要原文用 ledger_read #L编号）：',
+    )
+    expect(text).toContain(`    - #L1：${'甲'.repeat(60)}…`)
+    expect(text).not.toContain('甲'.repeat(61))
+    expect(text).toContain(`    - #L2：${'乙'.repeat(60)}…`)
+    expect(text).not.toContain('乙'.repeat(61))
+    expect(text).toContain('    - #L3：最新一条')
+  })
+
+  test('a query finds a word that appears only in dead_ends or done_when, and renders both', () => {
+    const entries = [
+      entry({ seq: 1, ts: 100, dead_ends: 'STOP-OLD-ROUTE', done_when: 'ALL-GREEN' }),
+      entry({ seq: 2, ts: 200, text: '别的' }),
+      entry({ seq: 3, ts: 300, text: '又一条' }),
+    ]
+    expect(renderQueryResult(entries, 'stop-old-route', QUERY_DEFAULT_LIMIT)).toContain(
+      '走不通的路：STOP-OLD-ROUTE',
+    )
+    expect(renderQueryResult(entries, 'all-green', QUERY_DEFAULT_LIMIT)).toContain('完成条件：ALL-GREEN')
+  })
+})
+
 describe('stamp', () => {
   test('fills seq, time, window and the request the entry belongs to', () => {
     const stamped = stamp(input(), { seq: 7, ts: 9_000, window: 2, latestPersonSeq: 5 })
@@ -498,7 +613,7 @@ describe('renderHome', () => {
       entry({ task_id: 't1', text: '管线事实：两段式', seq: 13, ts: 200, next_step: '跑一遍测试' }),
     ]
     const text = renderHome({ window: 2, entries, requests, archive: [] }, DEFAULTS)
-    expect(text).toContain('  - 记录（同一窗口写的 2 条，旧→新）：')
+    expect(text).toContain('  - 记录（最近 2 条，旧→新；只有最新一条是全文，较早的已截断，需要原文用 ledger_read #L编号）：')
     expect(text).toContain('    - #L12：调研结论：走旧接口')
     expect(text).toContain('    - #L13：管线事实：两段式')
     expect(text.indexOf('#L12')).toBeLessThan(text.indexOf('#L13'))
@@ -512,7 +627,7 @@ describe('renderHome', () => {
       entry({ task_id: 't1', text: `第${index}条记录`, seq: index, ts: index * 100 }),
     )
     const text = renderHome({ window: 2, entries, requests, archive: [] }, DEFAULTS)
-    expect(text).toContain('同一窗口写的 3 条')
+    expect(text).toContain('  - 记录（最近 3 条，旧→新；只有最新一条是全文，较早的已截断，需要原文用 ledger_read #L编号）：')
     expect(text).not.toContain('第1条记录')
     expect(text).toContain('#L2：第2条记录')
     expect(text).toContain('#L4：第4条记录')
@@ -525,9 +640,11 @@ describe('renderHome', () => {
       entry({ task_id: 't1', text: '丙'.repeat(1_500), seq: 3, ts: 300 }),
     ]
     const text = renderHome({ window: 2, entries, requests, archive: [] }, DEFAULTS)
-    expect(text).toContain('同一窗口写的 2 条')
+    expect(text).toContain('  - 记录（最近 2 条，旧→新；只有最新一条是全文，较早的已截断，需要原文用 ledger_read #L编号）：')
     expect(text).not.toContain('#L1：')
-    expect(text).toContain(`#L2：${'乙'.repeat(900)}`)
+    // The older note is a pointer now: only its first 60 characters stay.
+    expect(text).toContain(`#L2：${'乙'.repeat(60)}…`)
+    expect(text).not.toContain('乙'.repeat(61))
     expect(text).toContain(`#L3：${'丙'.repeat(1_500)}`)
   })
 

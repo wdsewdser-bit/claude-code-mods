@@ -270,6 +270,10 @@ export type LedgerInput = {
   status: TaskStatus
   text: string
   next_step?: string
+  /** What was tried and failed: not to be repeated. Omitted carries over, empty clears. */
+  dead_ends?: string
+  /** What counts as done. Omitted carries over, empty clears. */
+  done_when?: string
   anchors?: Anchor[]
   /** History seqs proving a `done`. */
   evidence?: number[]
@@ -341,6 +345,8 @@ export type LedgerSnapshot = {
     status: 'in_progress' | 'blocked'
     text: string
     next_step?: string
+    dead_ends?: string
+    done_when?: string
   }[]
 }
 

@@ -34,6 +34,8 @@ const MAX_SUPERSEDED_SHOWN = 5
 /** An active task shows at most this many notes from its latest window, within a combined text budget. */
 const MAX_WINDOW_NOTES = 3
 const WINDOW_NOTES_CHARS = 3_000
+/** An older note is cut to this many characters: only the newest record stays whole. */
+const OLDER_NOTE_CHARS = 60
 /** Open tasks beyond the newest this many are shown as a short summary, so the home page has an upper bound. */
 const MAX_FULL_ACTIVE = 5
 const SHORT_FIELD_CHARS = 200
@@ -170,6 +172,14 @@ export const validate = (input: LedgerInput, context: ValidateContext): string[]
 
   if (raw.next_step !== undefined && typeof raw.next_step !== 'string') {
     problems.push('next_step 必须是字符串，请用一句话写下一步做什么；不需要就整个省略。')
+  }
+
+  if (raw.dead_ends !== undefined && typeof raw.dead_ends !== 'string') {
+    problems.push('dead_ends 必须是字符串，请写已经试过、走不通、不要再重复的做法；不需要就整个省略。')
+  }
+
+  if (raw.done_when !== undefined && typeof raw.done_when !== 'string') {
+    problems.push('done_when 必须是字符串，请用一句话写什么情况下算完成；不需要就整个省略。')
   }
 
   if (status === 'in_progress') {
@@ -414,6 +424,8 @@ export const stamp = (
     request_ref: asInt(raw.request_ref) ?? defaultRequestSeq(meta.latestPersonSeq, meta.latestRelaySeq) ?? 0,
   }
   if (typeof raw.next_step === 'string') entry.next_step = raw.next_step
+  if (typeof raw.dead_ends === 'string') entry.dead_ends = raw.dead_ends
+  if (typeof raw.done_when === 'string') entry.done_when = raw.done_when
   const anchors = anchorsOf(raw.anchors)
   if (anchors !== undefined) entry.anchors = anchors
   const evidence = intsOf(raw.evidence)
@@ -441,6 +453,10 @@ export type TaskState = {
   nextStep?: Resolved<string>
   /** The anchors in force, resolved the same way as the next step. */
   anchors?: Resolved<Anchor[]>
+  /** What was tried and failed, in force: resolved the same way as the next step. */
+  deadEnds?: Resolved<string>
+  /** What counts as done, in force: resolved the same way as the next step. */
+  doneWhen?: Resolved<string>
   /**
    * The last record that really changed the task: its first one, or a later one that was
    * no keepalive snapshot or that differed from the record before it. Repeats of a
@@ -528,6 +544,18 @@ export const tasksOf = (entries: readonly LedgerEntry[]): TaskState[] => {
       value => value.trim() === '',
     )
     if (nextStep !== undefined) task.nextStep = nextStep
+    const deadEnds = resolveField(
+      task.entries,
+      entry => (typeof entry.dead_ends === 'string' ? entry.dead_ends : undefined),
+      value => value.trim() === '',
+    )
+    if (deadEnds !== undefined) task.deadEnds = deadEnds
+    const doneWhen = resolveField(
+      task.entries,
+      entry => (typeof entry.done_when === 'string' ? entry.done_when : undefined),
+      value => value.trim() === '',
+    )
+    if (doneWhen !== undefined) task.doneWhen = doneWhen
     const anchors = resolveField(
       task.entries,
       entry => (Array.isArray(entry.anchors) ? entry.anchors : undefined),
@@ -578,6 +606,10 @@ const clipAnswered = (text: string): string => {
 
 const clipText = (text: string, limit: number): string =>
   text.length > limit ? `${text.slice(0, limit)}……` : text
+
+/** An older note keeps only its opening; the whole text is one `ledger_read` away. */
+const clipNote = (text: string): string =>
+  text.length > OLDER_NOTE_CHARS ? `${text.slice(0, OLDER_NOTE_CHARS)}…` : text
 
 const newestFirst = (tasks: readonly TaskState[]): TaskState[] =>
   [...tasks].sort(
@@ -712,19 +744,18 @@ export const renderHome = (
     for (const task of full) {
       head.push(headerOf(task))
       const notes = windowNotesOf(task, input.entries)
-      const hasOlderWindow = notes.some(note => note.window !== task.latest.window)
       if (notes.length <= 1) {
         head.push(`  - 最新：${task.latest.text}`)
       } else {
         head.push(
-          hasOlderWindow
-            ? `  - 记录（最近 ${notes.length} 条，旧→新；标了窗口号的是更早的窗口写的）：`
-            : `  - 记录（同一窗口写的 ${notes.length} 条，旧→新）：`,
+          `  - 记录（最近 ${notes.length} 条，旧→新；只有最新一条是全文，较早的已截断，需要原文用 ledger_read #L编号）：`,
         )
-        for (const note of notes) {
+        notes.forEach((note, at) => {
           const from = note.window === task.latest.window ? '' : `（第 ${note.window} 个窗口）`
-          head.push(`    - #L${note.seq}${from}：${note.text}`)
-        }
+          // Only the newest record stays whole; the rest are a pointer back into the ledger.
+          const body = at === notes.length - 1 ? note.text : clipNote(note.text)
+          head.push(`    - #L${note.seq}${from}：${body}`)
+        })
       }
       const next = task.nextStep
       if (next !== undefined) {
@@ -732,6 +763,22 @@ export const renderHome = (
           next.isInherited
             ? `  - 下一步（沿用 #L${next.seq} 的记录，可能已过时）：${next.value}`
             : `  - 下一步：${next.value}`,
+        )
+      }
+      const doneWhen = task.doneWhen
+      if (doneWhen !== undefined) {
+        head.push(
+          doneWhen.isInherited
+            ? `  - 完成条件（沿用 #L${doneWhen.seq} 的记录）：${doneWhen.value}`
+            : `  - 完成条件：${doneWhen.value}`,
+        )
+      }
+      const deadEnds = task.deadEnds
+      if (deadEnds !== undefined) {
+        head.push(
+          deadEnds.isInherited
+            ? `  - 走不通的路（沿用 #L${deadEnds.seq} 的记录）：${deadEnds.value}`
+            : `  - 走不通的路：${deadEnds.value}`,
         )
       }
       head.push(...familyLinesOf(task))
@@ -887,6 +934,8 @@ const SEQ_QUERY = /^#?l(\d+)$/i
 export const renderEntry = (entry: LedgerEntry): string => {
   const parts = [entry.task_id, STATUS_LABEL[entry.status], entry.title, entry.text]
   if (entry.next_step !== undefined && entry.next_step.trim() !== '') parts.push(`下一步：${entry.next_step}`)
+  if (entry.done_when !== undefined && entry.done_when.trim() !== '') parts.push(`完成条件：${entry.done_when}`)
+  if (entry.dead_ends !== undefined && entry.dead_ends.trim() !== '') parts.push(`走不通的路：${entry.dead_ends}`)
   if (Array.isArray(entry.evidence) && entry.evidence.length > 0) {
     parts.push(`证据：${entry.evidence.map(seq => `#${seq}`).join('、')}`)
   }
@@ -953,7 +1002,14 @@ export const renderQueryResult = (
   }
 
   const hits = entries.filter(entry => {
-    const fields: unknown[] = [entry.task_id, entry.title, entry.text, entry.next_step ?? '']
+    const fields: unknown[] = [
+      entry.task_id,
+      entry.title,
+      entry.text,
+      entry.next_step ?? '',
+      entry.dead_ends ?? '',
+      entry.done_when ?? '',
+    ]
     return fields.some(field => typeof field === 'string' && field.toLowerCase().includes(needle))
   })
   if (hits.length === 0) return `没有匹配「${text}」的账本条目。`

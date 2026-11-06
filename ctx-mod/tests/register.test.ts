@@ -502,6 +502,36 @@ test('armed, ledger_read tells the model when a query answers with an index and 
   expect(Object.keys(properties)).toContain('view')
 })
 
+test('armed, ledger_append offers dead_ends and done_when, and says what an omission means', async ($, on) => {
+  const w = world(on, 's-ledger-deadends', { CTX_MOD: '1' })
+  await boot($)
+  const definition = w.schemas.get('ledger_append') as
+    | { description?: string; inputSchema?: { properties?: Record<string, unknown> } }
+    | undefined
+  expect(definition).toBeDefined()
+  const properties = definition?.inputSchema?.properties ?? {}
+  expect(Object.keys(properties)).toContain('dead_ends')
+  expect(Object.keys(properties)).toContain('done_when')
+  expect(definition?.description ?? '').toContain(
+    'dead_ends 写已失败、不要重试的做法，done_when 写完成条件，可选，省略表示沿用',
+  )
+})
+
+test('armed, ledger_read finds a word written only in dead_ends', async ($, on) => {
+  const w = world(on, 's-ledger-deadends-read', { CTX_MOD: '1' })
+  await boot($)
+  const booked = await callTool(
+    $,
+    ledger({ tool_use_id: 'l-dead', task_id: 't1', title: '工作', status: 'in_progress', text: '开始', next_step: '接着做', dead_ends: 'STOP-OLD-ROUTE' }),
+  )
+  expect(booked.isError).not.toBe(true)
+  const answer = textOf(
+    await callTool($, { tool: 'mcp__ctx-mod__ledger_read', tool_use_id: 'read-dead', query: 'STOP-OLD-ROUTE' }),
+  )
+  expect(answer).toContain('#L1')
+  expect(answer).toContain('走不通的路：STOP-OLD-ROUTE')
+})
+
 test('armed, a subagent call of every tool is refused as main-thread only', async ($, on) => {
   const w = world(on, 's-agent', { CTX_MOD: '1' })
   await boot($)

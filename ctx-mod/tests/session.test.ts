@@ -2358,6 +2358,35 @@ describe('the ledger entry a session stores', () => {
     await session.ledgerAppend({ ...base, status: 'done', text: '做完了', evidence: [2] }, env(10_000))
     expect(await session.buildHandoff({ isMidTurn: false })).not.toContain('沿用')
   })
+
+  test('dead_ends and done_when are stored when given and omitted when left out, so a later record can inherit or clear them', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    await session.ledgerAppend({ ...base, next_step: '继续', dead_ends: '旧接口走不通', done_when: '测试全绿' }, env(10_000))
+    await session.ledgerAppend({ ...base, text: '第二步', next_step: '继续' }, env(10_000))
+    await session.ledgerAppend({ ...base, text: '第三步', next_step: '继续', dead_ends: '', done_when: '' }, env(10_000))
+    await session.flush()
+
+    const entries = readLedger(box)
+    expect(entries.map(entry => entry.dead_ends)).toEqual(['旧接口走不通', undefined, ''])
+    expect(entries.map(entry => entry.done_when)).toEqual(['测试全绿', undefined, ''])
+  })
+
+  test('the handoff shows both and names the record an inherited one came from; a clear removes them', async () => {
+    const box = makeIo()
+    const session = await freshSession(box)
+    await session.ledgerAppend({ ...base, next_step: '继续', dead_ends: '旧接口走不通', done_when: '测试全绿' }, env(10_000))
+    await session.ledgerAppend({ ...base, text: '补记' }, env(10_000))
+
+    const carried = await session.buildHandoff({ isMidTurn: false })
+    expect(carried).toContain('完成条件（沿用 #L1 的记录）：测试全绿')
+    expect(carried).toContain('走不通的路（沿用 #L1 的记录）：旧接口走不通')
+
+    await session.ledgerAppend({ ...base, text: '清空', dead_ends: '', done_when: '' }, env(10_000))
+    const cleared = await session.buildHandoff({ isMidTurn: false })
+    expect(cleared).not.toContain('旧接口走不通')
+    expect(cleared).not.toContain('测试全绿')
+  })
 })
 
 describe('historyTool search range', () => {
