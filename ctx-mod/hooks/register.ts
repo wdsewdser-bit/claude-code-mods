@@ -6,6 +6,7 @@
 import type { CommandRunResult, EngineInterface, Register, SessionCompactResult, SessionMessage } from 'claude-code'
 
 import { formatArgs, isBackgroundRow, nonTextNote } from './lib/history.ts'
+import { firstTranscriptUser } from './lib/lineage.ts'
 import { cwdSlug, pickPastedImages } from './lib/images.ts'
 import { createSession, isHandoffText, looksLikePerson, stripInjected } from './lib/session.ts'
 import type { AgentNote, Env, HeldAttachment, ImportedMessage, Io, Session } from './lib/session.ts'
@@ -52,6 +53,8 @@ let lastStep: { turnId: string; index: number } | null = null
 
 /** One Session per session id, over the files under that session's own directory. */
 const sessions = new Map<string, Session>()
+/** A first import must finish before any concurrent hook can allocate history numbers. */
+const openingSessions = new Map<string, Promise<Session>>()
 /** The compaction limit per session, computed once; a key present means it was asked for. */
 const limits = new Map<string, number | undefined>()
 /** The main thread's recent tool calls, by tool_use_id, to name a result's tool and input. */
@@ -339,13 +342,24 @@ const deliverHeld = async ($: EngineInterface, session: Session): Promise<void> 
 const sessionOf = async ($: EngineInterface): Promise<Session | undefined> => {
   const id = await idOf($)
   if (id === undefined) return undefined
+  const opening = openingSessions.get(id)
+  if (opening !== undefined) return opening
   const held = sessions.get(id)
   if (held !== undefined) {
     await held.ready().catch(() => undefined)
 
     return held
   }
+  const work = openSession($, id)
+  openingSessions.set(id, work)
+  let session: Session
+  try { session = await work } finally { openingSessions.delete(id) }
+  // Announcing may append to this same session and re-enter sessionOf. Release the import gate first.
+  await announceLeftovers($, session)
+  return session
+}
 
+const openSession = async ($: EngineInterface, id: string): Promise<Session> => {
   const profile = await attempt(async () => await $.env.get('USERPROFILE'), undefined)
   const raw =
     typeof profile === 'string' && profile !== ''
@@ -359,9 +373,23 @@ const sessionOf = async ($: EngineInterface): Promise<Session | undefined> => {
     write: (path, text) => $.fs.write(path, text),
     exists: path => $.fs.exists(path),
     cwd: () => $.session.cwd(),
+    firstUser: async () => {
+      const projects = home + '/.claude/projects'
+      const cwd = await attempt(async () => await $.session.cwd(), undefined)
+      const preferred = cwd === undefined ? undefined : cwdSlug(cwd)
+      // The cwd's conventional project first, then directories for moved sessions.
+      const names = [preferred, ...await attempt(async () => (await $.fs.list(projects)).filter(entry => entry.kind === 'dir').map(entry => entry.name), [])]
+      for (const name of new Set(names)) {
+        if (name === undefined) continue
+        const text = await attempt(async () => await $.fs.read(projects + '/' + name + '/' + id + '.jsonl'), undefined)
+        if (text !== undefined) return firstTranscriptUser(text) ?? ''
+      }
+      return undefined
+    },
     now: () => Date.now(),
     // The names in a directory, for the cross-session measures: each session's own file is one of them.
     list: async path => (await $.fs.list(path)).filter(entry => entry.kind === 'file').map(entry => entry.name),
+    directories: async path => (await $.fs.list(path)).filter(entry => entry.kind === 'dir').map(entry => entry.name),
     onWriteError: (path, error) => logError($, `write ${path}`, error),
   }
   const session = createSession(dir, io, DEFAULTS)
@@ -372,9 +400,6 @@ const sessionOf = async ($: EngineInterface): Promise<Session | undefined> => {
   // Only a session that has just been opened can be behind: a cached one has
   // seen every row through `session.append` already.
   await importOldConversation($, session)
-  // Only on opening: a cached session's held messages belong to a switch still running.
-  await announceLeftovers($, session)
-
   return session
 }
 
@@ -745,6 +770,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        session_id: { type: 'string', description: '指定旧会话 id；省略时显示本会话及旧会话的账本。' },
         view: { type: 'string', description: 'home、current 或 archive:N，默认 home。' },
         query: {
           type: 'string',
@@ -781,6 +807,7 @@ const TOOLS = [
           description: '只看从某个入口进来的行，如 delivery、attachment、hook-context、note、compaction、command；给了它，背景信息也会被搜到（search）。',
         },
         limit: { type: 'number', description: '最多返回多少条（search）。' },
+        session_id: { type: 'string', description: '指定旧会话 id。同号时本会话优先；没命中会回溯旧会话。' },
         seq: { type: 'number', description: '要读的历史编号（read）。' },
         field: {
           type: 'string',

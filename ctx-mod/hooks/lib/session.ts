@@ -74,6 +74,8 @@ import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
 import { extractDecisions, renderDecisions } from './decisions.ts'
+import { detectLineage, lineageFrom } from './lineage.ts'
+import type { Lineage } from './lineage.ts'
 import type { DecisionRevoke } from './decisions.ts'
 import { describeFill, gateSwitch, isCold, judgeSwitch, levelOf } from './usage.ts'
 
@@ -94,6 +96,10 @@ export type Io = {
   remove?: (path: string) => Promise<void>
   /** The names of the files in a directory; without it only the older shared table is read. */
   list?: (path: string) => Promise<readonly string[]>
+  /** Session directories under the data root; first import only. */
+  directories?: (path: string) => Promise<readonly string[]>
+  /** Physical transcript opening, when available (messages() can be tail-limited). */
+  firstUser?: () => Promise<string | undefined>
   /**
    * The session's working directory. Only the handoff text uses it, to show paths inside it
    * relative to it; what is stored on disk keeps the absolute paths. Left out, paths stay as they are.
@@ -439,6 +445,8 @@ export type Session = {
   historyTool: (input: unknown) => Promise<ToolResult>
   /** The history write-amplification counters as one line, for the context tool's status. */
   historyWriteStats: () => string
+  /** Read-only ledger and decisions view for a successor. */
+  inheritanceView: () => Promise<string>
   status: (env: Env) => string
   requestSwitch: (input: unknown, env: Env) => ToolResult
   /**
@@ -842,8 +850,25 @@ const costlyToolsOf = (tools: readonly LoadedTool[], costly: Record<string, numb
 /** The most unrecorded steps the handoff lists one by one. */
 const MAX_TAIL_ACTIONS = 25
 
-export const createSession =(dir: string, io: Io, config: Config): Session => {
-  const root = dir.replace(/\/+$/, '')
+export const createSession =(dir: string, io: Io, config: Config, ancestors: readonly string[] = []): Session => {
+  const root = dir.replaceAll('\\', '/').replace(/\/+$/, '')
+  const ownId = root.slice(root.lastIndexOf('/') + 1)
+  let lineage: Lineage | null = null
+  let canDetectLineage = false
+  let predecessor: Session | null | undefined
+  const previous = (): Session | null => {
+    if (predecessor !== undefined) return predecessor
+    if (lineage === null || lineage.sessionId === ownId || ancestors.includes(lineage.sessionId) || ancestors.length >= 16) return null
+    const parent = root.slice(0, root.lastIndexOf('/')) + '/' + lineage.sessionId
+    predecessor = createSession(parent, { ...io, write: async () => { throw new Error('前驱会话只读') },
+      rename: undefined, remove: undefined }, config, [...ancestors, ownId])
+    return predecessor
+  }
+  const oldLabel = (): string => '## 旧会话 ' + (lineage?.sessionId ?? '') + '\n（以下编号指向旧会话；history / ledger_read 加 session_id 指定旧 id。本会话同号记录优先；旧记录只读，当前进度以本会话为准，新进展记入本会话账本。）'
+  const lineageSection = async (): Promise<string> => {
+    const old = previous()
+    return old === null ? '' : oldLabel() + '\n' + await old.inheritanceView()
+  }
   const pathIn = (name: string): string => `${root}/${name}`
   /**
    * Paths whose last write failed, with the text that did not land: a read that comes
@@ -1090,6 +1115,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
   const metaJson = (): string =>
     JSON.stringify({
       window: state.window,
+      ...(lineage === null ? {} : { lineage }),
       part: state.part,
       seq: state.seq,
       ledgerSeq: state.ledgerSeq,
@@ -1176,6 +1202,8 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       }
     }
     Object.assign(state, stateFrom(raw))
+    lineage = lineageFrom(raw?.lineage)
+    canDetectLineage = text === null
 
     // meta.json is written after the files it describes and can be lost, stale
     // or damaged, so the files have the last word on everything they can tell:
@@ -1672,6 +1700,14 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
    */
   const importMessages = async (messages: readonly ImportedMessage[]): Promise<number> => {
     await ensureLoaded()
+    if (canDetectLineage && state.seq === 0) {
+      canDetectLineage = false
+      const first = (await io.firstUser?.().catch(() => undefined)) ?? messages.find(message => message.role === 'user')?.text
+      if (first !== undefined) {
+        lineage = await detectLineage(root, first, io)
+        if (lineage !== null) state.window = lineage.lastWindow + 1
+      }
+    }
     // With history on disk only the tail the mod has not seen is filed; with none, everything is.
     const from = state.seq === 0 ? 0 : firstUnrecorded(messages)
 
@@ -2055,7 +2091,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     return { result }
   }
 
-  const ledgerRead = async (input: unknown): Promise<ToolResult> => {
+  const localLedgerRead = async (input: unknown): Promise<ToolResult> => {
     await ensureLoaded()
     const raw =
       typeof input === 'object' && input !== null && !Array.isArray(input)
@@ -2119,6 +2155,32 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     }
 
     return errorOf(`view 只能是 home、current 或 archive:N，收到的是「${view}」。`)
+  }
+
+  const ledgerRead = async (input: unknown): Promise<ToolResult> => {
+    await ensureLoaded()
+    const raw = asInput(input)
+    const old = previous()
+    if (typeof raw.session_id === 'string' && raw.session_id !== ownId) {
+      if (old === null) return errorOf('没有链接的旧会话。')
+      const answer = await old.ledgerRead(raw.session_id === lineage?.sessionId ? { ...raw, session_id: undefined } : raw)
+      return { ...answer, result: oldLabel() + '\n' + answer.result }
+    }
+    const answer = await localLedgerRead(input)
+    if (old === null || raw.session_id === ownId) return answer
+    if (answer.isError && !(typeof raw.view === 'string' && /^archive:[0-9]+$/.test(raw.view))) return answer
+    const inherited = await old.ledgerRead({ ...raw, session_id: undefined })
+    if (answer.isError) return inherited.isError ? answer : { result: oldLabel() + '\n' + inherited.result }
+    return { result: answer.result + '\n\n' + oldLabel() + '\n' + inherited.result }
+  }
+
+  const inheritanceView = async (): Promise<string> => {
+    await ensureLoaded()
+    await ensureAllWindows()
+    const home = await localLedgerRead({})
+    const decisions = renderDecisions(extractDecisions(allRows(), new Set(revokes.keys())), config.decisionChars, state.window - 1)
+    const older = await lineageSection()
+    return [home.result, decisions, older].filter(Boolean).join('\n\n')
   }
 
   const renderHit = (hit: SearchHit): string =>
@@ -2363,7 +2425,23 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       return errorOf('history 工具需要 action："search" 或 "read"。')
     }
 
-    return raw.action === 'search' ? historySearch(raw) : historyRead(raw)
+    const old = previous()
+    if (typeof raw.session_id === 'string' && raw.session_id !== ownId) {
+      if (old === null) return errorOf('没有链接的旧会话。')
+      const answer = await old.historyTool(raw.session_id === lineage?.sessionId ? { ...raw, session_id: undefined } : raw)
+      return { ...answer, result: oldLabel() + '\n' + answer.result }
+    }
+    const answer = await (raw.action === 'search' ? historySearch(raw) : historyRead(raw))
+    if (raw.session_id === ownId) return answer
+    // Local numbering stays untouched. Resolve collisions explicitly with session_id.
+    const missed = raw.action === 'read' ? answer.result.startsWith('历史里没有 #') : !answer.isError && !/^#\d+ w\d+ /m.test(answer.result)
+    if (old !== null && (missed || (raw.action === 'search' && raw.scope === 'all' && !answer.isError))) {
+      const inherited = await old.historyTool({ ...raw, session_id: undefined })
+      if (!inherited.isError && (raw.action === 'read' || /^#\d+ w\d+ /m.test(inherited.result))) {
+        return { result: (missed ? '' : answer.result + '\n\n') + oldLabel() + '\n' + inherited.result }
+      }
+    }
+    return answer
   }
 
   const status = (env: Env): string => {
@@ -2569,7 +2647,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     const window = state.window + 1
     const agents = renderAgents(agentsForHandoff(opts.agents ?? [], state.roster, io.now(), config))
     const archived = await archivedForHome()
-    const home = renderHome(
+    const localHome = renderHome(
       {
         window,
         entries: state.page,
@@ -2582,6 +2660,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
       },
       config,
     )
+    const home = [localHome, await lineageSection()].filter(Boolean).join('\n\n')
     // A running task is already spelled out in the home page: repeating the last
     // reply beside it would only spend the handoff's budget twice on the same turn.
     const running = tasksOf(state.page).some(task => task.status === 'in_progress')
@@ -2811,6 +2890,7 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
     decisionRevoke,
     historyTool,
     historyWriteStats,
+    inheritanceView,
     status,
     blocksCalls,
     requestSwitch,
