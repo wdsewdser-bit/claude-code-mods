@@ -198,6 +198,25 @@ describe('bridge in a session', () => {
     expect(w.submitted.filter(text => text.includes('已重置'))).toHaveLength(0)
   })
 
+  test('background work still out at the reset does not hold back the resume', DEFAULTS, async ($, on) => {
+    const w = world(on, ONE_HOUR)
+    await boot($)
+    await turn($, 't1', 'work')
+    // A long test left running in the background: its notice wakes the session on its own.
+    await $.classic.Stop({
+      stop_hook_active: false,
+      transcript_path: '/t/session.jsonl',
+      background_tasks: [{ id: 'bash-1' }],
+    } as never)
+    expect(await command($, 'status')).toContain('background: 1 in flight')
+    w.limits = HIGH(96) as never
+    await w.clock.advance(10_000)
+    await w.clock.advance(3_130_000)
+    w.limits = HIGH(3, RESET + 5 * 3_600_000) as never
+    await w.clock.advance(4_200_000)
+    expect(w.submitted.filter(text => text.includes('已重置'))).toHaveLength(1)
+  })
+
   test('at 98% of the week asks once for a handoff document and keeps the keeper on', DEFAULTS, async ($, on) => {
     const w = world(on, ONE_HOUR)
     await boot($)
