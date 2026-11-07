@@ -1348,7 +1348,10 @@ const bridgeStep = async (
       now,
       await limitsNow($),
       config.bridgeAtPercent,
-      s.keeper.isTurnRunning || s.backgroundPending > 0,
+      // Only a running turn defers the resume. Background work out (a long test, a patrol
+      // subagent) does not: its notice wakes the session by itself when it lands, and
+      // waiting on it left wrapped sessions stuck long past the reset.
+      s.keeper.isTurnRunning,
     )
     if (verdict === 'wait') return
     b.phase = 'idle'
