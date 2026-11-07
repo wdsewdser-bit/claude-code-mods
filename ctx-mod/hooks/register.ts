@@ -459,16 +459,25 @@ const pastedImageDir = async (
   const temp = await tempRoot($)
   if (temp === undefined) return undefined
   const root = `${temp}/claude`
-  const direct = `${root}/${cwdSlug(cwd)}/${id}/images`
-  if ((await entriesAt($, direct)) !== undefined) return direct
-  // The slug is this build's convention, not a promise: any directory under the
-  // temp root holding this session's images is the right one.
-  for (const entry of (await entriesAt($, root)) ?? []) {
-    const candidate = `${root}/${entry.name}/${id}/images`
-    if ((await entriesAt($, candidate)) !== undefined) return candidate
+  // The slug is this build's convention, not a promise: newer builds name the
+  // directory by a hash and leave the old one behind, so every directory under
+  // the temp root holding this session's images is a candidate, and the one
+  // written to last wins (the cwd slug first only on a tie).
+  const names = [cwdSlug(cwd), ...((await entriesAt($, root)) ?? []).map(entry => entry.name)]
+  let best: string | undefined
+  let bestTime = -Infinity
+  for (const name of new Set(names)) {
+    const candidate = `${root}/${name}/${id}/images`
+    const entries = await entriesAt($, candidate)
+    if (entries === undefined) continue
+    const newest = Math.max(-1, ...entries.map(entry => entry.mtimeMs ?? 0))
+    if (newest > bestTime) {
+      best = candidate
+      bestTime = newest
+    }
   }
 
-  return undefined
+  return best
 }
 
 /**
