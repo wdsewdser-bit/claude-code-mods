@@ -130,8 +130,8 @@ export const register: Register = on => {
       inputSchema: {
         type: 'object',
         properties: {
+          description: { type: 'string', description: '一句中文，说明这个程序要做什么（显示给用户看，写在 code 之前）。' },
           code: { type: 'string', description: 'Body of an async function; use return and console.log.' },
-          description: { type: 'string', description: 'One-line summary of what the program does.' },
           timeoutMs: { type: 'integer', minimum: 1000, maximum: 600000, description: '整个程序的超时毫秒数，默认 300000，最大 600000；程序内 bash 的 timeoutMs 不能超过它' },
           root: { type: 'string', description: '可选：已存在的绝对目录。设置后程序内的相对路径、grep/glob 的默认目录、未指定 cwd 的 bash 都以它为基准，程序里可用 tools.root 读取；不设置则沿用会话 cwd。' },
           maxChars: {
@@ -141,7 +141,7 @@ export const register: Register = on => {
             description: 'Output cap in chars (default 8000). Over it the first 70% and last 30% are kept, the middle is saved as a ref (ref.text(id,{from,to})), and a truncation hint is printed.',
           },
         },
-        required: ['code', 'description'],
+        required: ['description', 'code'],
       },
     })
     return next(e)
