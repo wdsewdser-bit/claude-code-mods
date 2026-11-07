@@ -1343,7 +1343,13 @@ const bridgeStep = async (
 
       return
     }
-    const verdict = resumeVerdict(b, now, await limitsNow($), config.bridgeAtPercent)
+    const verdict = resumeVerdict(
+      b,
+      now,
+      await limitsNow($),
+      config.bridgeAtPercent,
+      s.keeper.isTurnRunning || s.backgroundPending > 0,
+    )
     if (verdict === 'wait') return
     b.phase = 'idle'
     await save($, s)
@@ -1471,6 +1477,15 @@ const setEnabled = async ($: EngineInterface, isOn: boolean): Promise<void> => {
   } else {
     s.bridge.phase = 'idle'
   }
+  await save($, s)
+  await refreshBar($, s)
+}
+
+/** The bar's "到点不继续" button: cancels (or restores) the resume after the reset. */
+const setResumeCancelled = async ($: EngineInterface, isCancelled: boolean): Promise<void> => {
+  const s = await ensure($)
+  if (s.bridge.phase !== 'wrapped') return
+  s.bridge.isTakenOver = isCancelled
   await save($, s)
   await refreshBar($, s)
 }
@@ -1828,6 +1843,13 @@ const runCommand = async ($: EngineInterface, args: string): Promise<string> => 
     return statusText($, s)
   }
   if (sub === 'status') return statusText($, s)
+  if (sub === 'resume') {
+    if (s.bridge.phase !== 'wrapped') return 'Not waiting for a quota reset.'
+    if (words[0] === 'on' || words[0] === 'off') await setResumeCancelled($, words[0] === 'off')
+    else if (words[0] !== undefined) return 'Usage: /cache-keeper resume [on|off]'
+
+    return `resume after the reset: ${s.bridge.isTakenOver ? 'off' : 'on'}`
+  }
   if (sub === 'anchor') {
     if (words[0] === 'on' || words[0] === 'off') await setAnchor($, words[0] === 'on')
     else if (words[0] !== undefined) return 'Usage: /cache-keeper anchor [on|off]'
@@ -1903,6 +1925,8 @@ export const register: Register = (on, options) => {
     const isOn = text.startsWith('缓存保活：开')
     const isAnchor = /^缓存保活：[开关] · 锚点/.test(text)
     const detail = text.replace(/^缓存保活：[开关]( · 锚点)?( · )?/, '')
+    const isWaiting = text.includes('等额度重置')
+    const isResumeCancelled = text.includes('已取消自动继续')
 
     return (
       <Box flexWrap="wrap" columnGap={4} alignItems="center">
@@ -1918,6 +1942,11 @@ export const register: Register = (on, options) => {
           <Button key="anchor-toggle" plain dimColor={!isAnchor} onPress={() => setAnchor($, !isAnchor)}>
             <Text color={isAnchor ? 'warning' : undefined}>{isAnchor ? '★ 锚点' : '☆ 锚点'}</Text>
           </Button>
+          {isWaiting ? (
+            <Button key="resume-toggle" plain dimColor onPress={() => setResumeCancelled($, !isResumeCancelled)}>
+              {isResumeCancelled ? '恢复自动继续' : '到点不继续'}
+            </Button>
+          ) : null}
         </Box>
         {below}
       </Box>
@@ -1974,10 +2003,8 @@ export const register: Register = (on, options) => {
         s.keeper.idleKeepalives = 0
         s.keeper.snapshotAttempts = 0
         s.keeper.isSnapshotParsed = false
-        // Only the person is a takeover: a plugin's own message (the wrap-up itself, a finished background job) is not.
-        if (s.bridge.phase === 'wrapped' && (origin.kind === 'composer' || isHeldPerson)) {
-          s.bridge.isTakenOver = true
-        }
+        // A message while waiting for the reset is not a takeover (often a note for
+        // after it); only the bar's "到点不继续" button cancels the resume.
         await save($, s)
       }
       if (e.origin.kind === 'task-notification' && booting !== undefined) {

@@ -196,10 +196,15 @@ export const resumeVerdict = (
   now: number,
   limits: readonly RateLimit[],
   atPercent: number,
+  isBusy = false,
 ): ResumeVerdict => {
   if (bridge.phase !== 'wrapped' || bridge.resetAtMs === null) return 'wait'
   if (now < bridge.resetAtMs + RESUME_DELAY_MS) return 'wait'
+  // isTakenOver: the person pressed "到点不继续" on the bar. A message they send while
+  // waiting is not a takeover: it is often a note for after the reset.
   if (bridge.isTakenOver) return 'skip'
+  // A turn still running (the person's own, say) is not interrupted: resume once it ends.
+  if (isBusy) return 'wait'
   const limit = fiveHour(limits)
   const isStillHigh = limit !== undefined && limit.percentUsed >= atPercent
   if (isStillHigh && now < bridge.resetAtMs + RESUME_GRACE_MS) return 'wait'
@@ -234,9 +239,9 @@ export const handoffText = (percent: number, resetAtMs: number, now: number): st
   `【cache-keeper 自动通知】周额度已用 ${percent}%，约 ${spanOf(resetAtMs - now)}后（${dayOf(resetAtMs)}）重置。请现在写一份交接检查点：更新已有的台账或交接文档，没有就在工作目录新建 HANDOFF.md，写清目标与授权范围、已完成并验证的结果、进行中的步骤和当前状态、下一步、关键文件位置和要跑的命令，让一个没有本对话上下文的新会话能直接接手。写完把文件路径告诉用户，然后继续手头的工作，之后每完成一个阶段就更新它。额度重置后由新对话按这份文档接手，不续用本对话。`
 
 export const resumeText = (): string =>
-  '【cache-keeper 自动通知】5 小时额度已重置。请接着刚才收尾的地方继续之前的工作。'
+  '【cache-keeper 自动通知】5 小时额度已重置。请接着刚才收尾的地方继续之前的工作；等待期间用户交代的事也一并处理。'
 
 export const describeBridge = (bridge: Bridge, now: number): string =>
   bridge.phase === 'wrapped' && bridge.resetAtMs !== null
-    ? `bridge: waiting for reset in ${spanOf(bridge.resetAtMs - now)} (${clockOf(bridge.resetAtMs)})${bridge.isTakenOver ? ' · you took over: no auto-resume' : ''}`
-    : 'bridge: idle'
+    ? `等额度重置 · ${spanOf(bridge.resetAtMs - now)}后（${clockOf(bridge.resetAtMs)}）${bridge.isTakenOver ? ' · 已取消自动继续' : ''}`
+    : '额度等待：无'
