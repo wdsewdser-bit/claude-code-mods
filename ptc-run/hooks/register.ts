@@ -73,7 +73,7 @@ const PARTIAL_READER = 'const fs=require("fs"),path=require("path"),os=require("
   'process.stdout.write(JSON.stringify({out:clip(out),ops:rows.length?"本程序已生效的写操作：\\n"+rows.slice(0,50).join("\\n"):"本程序已生效的写操作：无"}))'
 
 const DESC_PARTS = [
-  'Run a JavaScript async-function body in a sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch work (loops, grep+aggregate, edits). timeoutMs is the whole-program timeout (default 300000 ms, max 1800000). root:"D:/abs/dir" makes relative paths, path-less glob/grep and cwd-less bash use that existing absolute directory (tools.root exposes it).',
+  'Run a JavaScript async-function body in a sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch work (loops, grep+aggregate, edits). timeoutMs is the whole-program timeout (default 300000 ms, max 600000). root:"D:/abs/dir" makes relative paths, path-less glob/grep and cwd-less bash use that existing absolute directory (tools.root exposes it).',
   'Paths: relative to cwd (or root). On big trees give glob/grep a path or specific pattern. Errors carry .code/.nextAction and "[CODE]" prefix: INVALID_ARGUMENT NOT_FOUND NOT_UNIQUE COUNT_MISMATCH STALE LOCKED EXISTS POLICY_DENIED BUSY OUTPUT_LIMIT RG_UNAVAILABLE RESULT_UNKNOWN.',
   'tools.read({path,offset?,limit?,numbered?,fresh?}) (numbered:true -> "N: text" lines with real line numbers; it always returns the file text itself, dedup never changes what the program sees). Dedup happens on the program output: a read result printed back unchanged (at least 300 chars) whose content this conversation already showed comes back as a one-line [read-dedup] note, and a changed file as a diff; filtered/partial/transformed prints are never touched, and fresh:true on a read turns dedup off for that program output (PTC_RUN_READ_DEDUP=0 turns it off everywhere). tools.revision({path}) -> 16-hex sha256 prefix of the file content; pass it as expectedRevision to tools.edit (or as {path: revision} to tools.replace) to get STALE and write nothing if the content changed since (works across run_code calls). tools.write({path,content}) (write/edit/replace results are capped at 32 MiB per file: over it nothing is written and OUTPUT_LIMIT is thrown); tools.edit({path,old,new,all?,expect?,expectedRevision?}) -> {replaced,lines} (atomic; the mtime STALE check still applies only if this same program read the file first; expectedRevision adds a cross-call content check; revision-guarded writes also take a cross-process lock (one writer at a time; LOCKED after ~2 s, a lock left by a crash is taken over after 30 s); with all:true pass expect:<count you mean to change>, a different count writes nothing and throws COUNT_MISMATCH).',
   'tools.glob({pattern?:string|string[],path?,sort?:"path"|"modified",details?,offset?,limit?=5000}) and tools.grep({pattern,path?,glob?,ignoreCase?,outputMode?:"content"|"files_with_matches"|"count",before?,after?,multiline?,offset?=0,limit?=500}) -> {items,total,complete,nextOffset} (ripgrep: .gitignore honoured; skips hidden, node_modules, target, .venv, files>2MB). glob items: path, or {path,size,mtime} with details. grep items: {file,line,text<=300} (+uncounted context:true rows), {file,count}, or paths.',
@@ -85,7 +85,7 @@ const DESC_PARTS = [
 const DESC = DESC_PARTS.join(' ')
 
 // Short description for delegate's ptc-only mode: there the SDK declarations are already in the system prompt.
-const DESC_SHORT = 'Run a JavaScript async-function body in a sandbox; the SDK bindings (tools.*) are declared in the system prompt. Only console.log output and the return value come back. timeoutMs defaults to 300000 (max 1800000); root:"D:/abs/dir" changes the base directory for relative paths, glob/grep and bash.'
+const DESC_SHORT = 'Run a JavaScript async-function body in a sandbox; the SDK bindings (tools.*) are declared in the system prompt. Only console.log output and the return value come back. timeoutMs defaults to 300000 (max 600000); root:"D:/abs/dir" changes the base directory for relative paths, glob/grep and bash.'
 
 // Extra read-only directories come from the environment only (delegate's readPaths -> PTC_RUN_READ_ROOTS, separated
 // the way PATH is: ';' on Windows, ':' elsewhere). They widen reads, never writes. Both separators are accepted, and a
@@ -111,7 +111,7 @@ const refLineRo = (s: string): string => s.replace('ref.store(key,value)->{key,b
 // Read-only mode descriptions: only the read-side bindings are advertised.
 const descRo = (roots: string[]): string =>
   [
-    'Run a JavaScript async-function body in a READ-ONLY sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch reading, grep+aggregate and summaries. timeoutMs defaults to 300000 (max 1800000); root:"D:/abs/dir" changes the base directory for relative paths and glob/grep.',
+    'Run a JavaScript async-function body in a READ-ONLY sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch reading, grep+aggregate and summaries. timeoutMs defaults to 300000 (max 600000); root:"D:/abs/dir" changes the base directory for relative paths and glob/grep.',
     'Read-only mode: tools.write/edit/replace/batch/bash/parallel/job throw POLICY_DENIED, the program itself cannot write files or start processes (fs writes and child_process are blocked), and only files under the working directory and the extra readable directories (if any) can be read or searched; anything else fails with an access error.' + rootsLine(roots),
     DESC_PARTS[1], DESC_PARTS[2].split('. tools.write')[0] + '.', DESC_PARTS[3], refLineRo(DESC_PARTS[7]),
   ].join(' ')
@@ -132,7 +132,7 @@ export const register: Register = on => {
         properties: {
           code: { type: 'string', description: 'Body of an async function; use return and console.log.' },
           description: { type: 'string', description: 'One-line summary of what the program does.' },
-          timeoutMs: { type: 'integer', minimum: 1000, maximum: 1800000, description: '整个程序的超时毫秒数，默认 300000，最大 1800000；程序内 bash 的 timeoutMs 不能超过它' },
+          timeoutMs: { type: 'integer', minimum: 1000, maximum: 600000, description: '整个程序的超时毫秒数，默认 300000，最大 600000；程序内 bash 的 timeoutMs 不能超过它' },
           root: { type: 'string', description: '可选：已存在的绝对目录。设置后程序内的相对路径、grep/glob 的默认目录、未指定 cwd 的 bash 都以它为基准，程序里可用 tools.root 读取；不设置则沿用会话 cwd。' },
           maxChars: {
             type: 'integer',
@@ -215,7 +215,7 @@ export const register: Register = on => {
       // Dropping the oldest ids would make the next liveness check blind to them: cut the record and start over.
       dedupRuns.set(dedupKey, next.length > DEDUP_MAX_IDS ? { ids: [], cut: true } : { ids: next, cut: false })
     }
-    const timeoutMs = Math.min(Math.max(Math.trunc(input.timeoutMs ?? 300000), 1000), 1800000)
+    const timeoutMs = Math.min(Math.max(Math.trunc(input.timeoutMs ?? 300000), 1000), 600000)
     const readLimitRaw = ((await $.env.get('PTC_RUN_DSH_READ_LIMIT')) || '').trim()
     const dshReadLimit = /^\d+$/.test(readLimitRaw) && Number(readLimitRaw) > 0 ? Number(readLimitRaw) : undefined
     const logName = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
@@ -238,8 +238,12 @@ export const register: Register = on => {
       return '[RESULT_UNKNOWN] 程序在 ' + (timeoutMs / 1000) + ' 秒超时被终止，以下是已打印的输出（前 4000 字 + 后 4000 字）' +
         (ro ? '\n（只读模式：不会修改项目文件）' : '') + '\n' + ops + '\n' + (parsed.out || '（无输出）')
     }
+    // The host caps process.run (600 s as of 2.1.319) and rejects a larger timeout at once; only an
+    // error that came near the deadline is a timeout, anything sooner is reported as itself.
+    let startedAt = Date.now()
     try {
       const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, dedup: dedupOn, dedupTag, dedupReset: !dedupLive, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
+      startedAt = Date.now()
       const r = await $.process.run(['node', '-e', BOOT], {
         cwd,
         stdin: ro
@@ -260,7 +264,7 @@ export const register: Register = on => {
     } catch (err) {
       const msg = String((err as Error)?.message ?? err)
       // The host reports its own timeout as e.g. "$.process.run(node) aborted: still running after 4000ms".
-      const killed = /time(d)?[ -]?out|timeout|killed|exceed|abort|still running/i.test(msg)
+      const killed = Date.now() - startedAt >= timeoutMs * 0.9 && /time(d)?[ -]?out|timeout|killed|exceed|abort|still running/i.test(msg)
       if (killed) {
         const partial = await readPartial()
         return { result: [{ type: 'text', text: partialText(partial) }], isError: true } as never
