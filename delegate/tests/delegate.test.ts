@@ -410,6 +410,21 @@ describe('delegate tool', () => {
     expect(JSON.stringify(readAgain)).toContain('read')
   })
 
+  test('resume that switches mode tells the agent, so it does not trust the old mode from its history', { timeoutMs: 10_000 }, async ($: never, on: never) => {
+    const jobs = setup(on as never, 'k-1', { ok: true, text: 'done', sessionId: 'sid-1', turns: 1, ms: 1000 })
+    await start($ as never)
+    await call($ as never, { task: 'a', tier: 'pro', cwd: '/proj', mode: 'read' })
+    expect(String((jobs[0] as { task: string }).task)).toBe('a')
+    await call($ as never, { task: 'b', tier: 'pro', resume: 'sid-1', mode: 'work' })
+    expect(jobs[1]).toMatchObject({ resume: 'sid-1', mode: 'work' })
+    expect((jobs[1] as { ptc?: unknown }).ptc).toBeUndefined()
+    expect(String((jobs[1] as { task: string }).task)).toMatch(new RegExp('^【模式切换】[^\n]*work 模式[^\n]*\n\nb$'))
+    await call($ as never, { task: 'c', tier: 'pro', resume: 'sid-1' })
+    expect(String((jobs[2] as { task: string }).task)).toBe('c')
+    await call($ as never, { task: 'd', tier: 'pro', resume: 'sid-1', mode: 'read' })
+    expect(String((jobs[3] as { task: string }).task)).toMatch(new RegExp('^【模式切换】[^\n]*read 模式[^\n]*\n\nd$'))
+  })
+
   test('resume keeps ptc, and fills in mode on a note that never recorded it', { timeoutMs: 10_000 }, async ($: never, on: never) => {
     const jobs = setup(on as never, 'k-1', {
       ok: true,

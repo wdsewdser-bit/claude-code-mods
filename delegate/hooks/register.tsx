@@ -1103,8 +1103,16 @@ const callTool = async (
           ? old?.effort
           : undefined
   const recordedCwd = cwd ?? (await sessionCwd($)) ?? ''
+  // resume 换了 mode 时，工具池已按新 mode 重建，但代理的对话历史里还是旧 mode 的说法：
+  // 不提醒的话，它会凭记忆认定自己仍是只读、一个工具都不试就回报 blocked。
+  const modeSwitch =
+    old?.mode === undefined || old.mode === mode
+      ? ''
+      : mode === 'work'
+        ? '【模式切换】从这一轮起你是 work 模式：run_code 可以写文件、改文件、跑命令，之前轮次的只读限制已经解除。不要凭之前的记忆判断权限，以本轮工具实际的返回为准。\n\n'
+        : '【模式切换】从这一轮起你是 read 模式：run_code 只读，不能写文件、改文件或跑命令，之前轮次的写权限已经收回。\n\n'
   const common = {
-    task,
+    task: modeSwitch + task,
     mode,
     ...(mode === 'read' ? { ptc: ptc === 'off' ? false : 'only' } : {}),
     ...(readPathsActive ? { readPaths } : {}),
