@@ -38,20 +38,190 @@ export type FileState = {
   isEditedSinceRead: boolean
 }
 
-/** Turns one tool call into the file activity the working set is built from; null when no file was touched. */
-export const activityOf = (
+/** The quotes a path literal can wear in a program's source. */
+const QUOTES = ["'", '"', '`']
+
+const isIdentifierChar = (ch: string): boolean => ch !== '' && /[A-Za-z0-9_$]/.test(ch)
+
+/** The index just past the string that starts at the quote `at`; the end of the text when it never closes. */
+function afterString(text: string, at: number): number {
+  const quote = text.charAt(at)
+  let i = at + 1
+  while (i < text.length) {
+    const ch = text.charAt(i)
+    if (ch === '\\') {
+      i += 2
+      continue
+    }
+    if (ch === quote) return i + 1
+    // A ${…} inside a template is code, not text: it is skipped whole.
+    if (quote === '`' && ch === '$' && text.charAt(i + 1) === '{') {
+      i = afterBraces(text, i + 1)
+      continue
+    }
+    if (quote !== '`' && ch === '\n') return i
+    i += 1
+  }
+
+  return text.length
+}
+
+/** The index just past the `}` that closes the `{` at `at`. */
+function afterBraces(text: string, at: number): number {
+  let depth = 0
+  let i = at
+  while (i < text.length) {
+    const ch = text.charAt(i)
+    if (QUOTES.includes(ch)) {
+      i = afterString(text, i)
+      continue
+    }
+    if (ch === '{') depth += 1
+    else if (ch === '}') {
+      depth -= 1
+      if (depth === 0) return i + 1
+    }
+    i += 1
+  }
+
+  return text.length
+}
+
+/** The string literal that starts at the quote `at`; none when it interpolates (${…) or never closes. */
+const literalAt = (text: string, at: number): string | undefined => {
+  const quote = text.charAt(at)
+  if (!QUOTES.includes(quote)) return undefined
+  let value = ''
+  let i = at + 1
+  while (i < text.length) {
+    const ch = text.charAt(i)
+    if (ch === '\\') {
+      value += text.charAt(i + 1)
+      i += 2
+      continue
+    }
+    if (ch === quote) return value.trim() === '' ? undefined : value
+    if (quote === '`' && ch === '$' && text.charAt(i + 1) === '{') return undefined
+    if (quote !== '`' && ch === '\n') return undefined
+    value += ch
+    i += 1
+  }
+
+  return undefined
+}
+
+/** The index of the `)` closing the call opened at `open`, counting only the parentheses outside strings. */
+const closingParen = (code: string, open: number): number => {
+  let depth = 0
+  let i = open
+  while (i < code.length) {
+    const ch = code.charAt(i)
+    if (QUOTES.includes(ch)) {
+      i = afterString(code, i)
+      continue
+    }
+    if (ch === '(') depth += 1
+    else if (ch === ')') {
+      depth -= 1
+      if (depth === 0) return i
+    }
+    i += 1
+  }
+
+  return code.length
+}
+
+/** The path one call names: the first `path:` string literal in its own arguments, never in a nested call. */
+const pathInArgs = (args: string): string | undefined => {
+  let i = 0
+  while (i < args.length) {
+    const ch = args.charAt(i)
+    if (QUOTES.includes(ch)) {
+      i = afterString(args, i)
+      continue
+    }
+    if (args.startsWith('path', i) && !isIdentifierChar(args.charAt(i - 1))) {
+      let j = i + 4
+      while (j < args.length && /\s/.test(args.charAt(j))) j += 1
+      if (args.charAt(j) === ':') {
+        j += 1
+        while (j < args.length && /\s/.test(args.charAt(j))) j += 1
+        const path = literalAt(args, j)
+        if (path !== undefined) return path
+      }
+    }
+    i += 1
+  }
+
+  return undefined
+}
+
+/** A Windows drive, a UNC path or a leading slash already names the file on its own. */
+const isAbsolutePath = (path: string): boolean => /^(?:[A-Za-z]:[\\/]|[\\/])/.test(path)
+
+/** A path a program named relative to the `root` it was given is a path inside that directory. */
+const withRoot = (path: string, root: unknown): string => {
+  if (isAbsolutePath(path)) return path
+  const dir = asPath(root)
+  if (dir === undefined) return path
+  return `${dir.replace(/[\\/]+$/, '')}/${path}`
+}
+
+/** The PTC runner: its `code` is a program, and the files it writes are named inside that text. */
+const isRunCode = (tool: string): boolean => /^mcp__[A-Za-z0-9_-]+__run_code$/.test(tool)
+
+/** Every file a `run_code` program writes: one activity per `tools.write`/`edit`/`replace` call. */
+const codeActivities = (
+  input: Readonly<Record<string, unknown>>,
+  base: (path: string, op: FileActivity['op']) => FileActivity,
+): FileActivity[] => {
+  const code = field(input, 'code')
+  if (typeof code !== 'string') return []
+  const root = field(input, 'root')
+  const call = /tools\.(write|edit|replace)\s*\(/y
+  const out: FileActivity[] = []
+  let i = 0
+  while (i < code.length) {
+    const ch = code.charAt(i)
+    // A write named in a string or a comment is text about a write, not one.
+    if (QUOTES.includes(ch)) {
+      i = afterString(code, i)
+      continue
+    }
+    if (ch === '/' && code.charAt(i + 1) === '/') {
+      const eol = code.indexOf('\n', i)
+      i = eol === -1 ? code.length : eol + 1
+      continue
+    }
+    if (ch === '/' && code.charAt(i + 1) === '*') {
+      const end = code.indexOf('*/', i + 2)
+      i = end === -1 ? code.length : end + 2
+      continue
+    }
+    call.lastIndex = i
+    const found = isIdentifierChar(code.charAt(i - 1)) ? null : call.exec(code)
+    if (found === null) {
+      i += 1
+      continue
+    }
+    const open = i + (found[0] ?? '').length - 1
+    const path = pathInArgs(code.slice(open + 1, closingParen(code, open)))
+    if (path !== undefined) {
+      out.push(base(withRoot(path, root), found[1] === 'write' ? 'write' : 'edit'))
+    }
+    i = open + 1
+  }
+
+  return out
+}
+
+/** One tool call's single activity, for the tools that name one file; null when no file was touched. */
+const singleActivity = (
   tool: string,
   input: Readonly<Record<string, unknown>>,
   meta: { seq: number; window: number; isError: boolean },
+  base: (path: string, op: FileActivity['op']) => FileActivity,
 ): FileActivity | null => {
-  const base = (path: string, op: FileActivity['op']): FileActivity => ({
-    path,
-    op,
-    seq: meta.seq,
-    window: meta.window,
-    isError: meta.isError,
-  })
-
   if (tool === 'Read') {
     const path = asPath(field(input, 'file_path'))
     if (path === undefined) return null
@@ -96,6 +266,36 @@ export const activityOf = (
 
   return null
 }
+
+/**
+ * Turns one tool call into the file activities the working set is built from; one call can touch
+ * several files (a `run_code` program), so the answer is a list, empty when no file was touched.
+ */
+export const activitiesOf = (
+  tool: string,
+  input: Readonly<Record<string, unknown>>,
+  meta: { seq: number; window: number; isError: boolean },
+): FileActivity[] => {
+  const base = (path: string, op: FileActivity['op']): FileActivity => ({
+    path,
+    op,
+    seq: meta.seq,
+    window: meta.window,
+    isError: meta.isError,
+  })
+
+  if (isRunCode(tool)) return codeActivities(input, base)
+  const one = singleActivity(tool, input, meta, base)
+
+  return one === null ? [] : [one]
+}
+
+/** The first file a call touched, for callers that only follow one: null when no file was touched. */
+export const activityOf = (
+  tool: string,
+  input: Readonly<Record<string, unknown>>,
+  meta: { seq: number; window: number; isError: boolean },
+): FileActivity | null => activitiesOf(tool, input, meta)[0] ?? null
 
 /** One row per file the window worked in, newest activity first; failures and searches say nothing about the file. */
 export const filesOf = (activities: readonly FileActivity[], window?: number): FileState[] => {
