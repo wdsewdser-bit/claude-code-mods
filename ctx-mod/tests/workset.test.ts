@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
+  activitiesOf,
   activityOf,
   MAX_LISTED_FILES,
   cut,
@@ -110,6 +111,73 @@ describe('activityOf', () => {
     expect(activityOf('Edit', { file_path: null }, meta(1))).toBeNull()
     expect(activityOf('Write', {}, meta(1))).toBeNull()
     expect(activityOf('NotebookEdit', { file_path: 'C:\\a.ts' }, meta(1))).toBeNull()
+  })
+})
+
+describe('activitiesOf', () => {
+  const run = (code: string, root?: string) =>
+    activitiesOf('mcp__ptc-run__run_code', root === undefined ? { code } : { code, root }, meta(7, 2))
+
+  test('one program that writes several files gives one activity per file', () => {
+    const code = [
+      "await tools.write({ path: 'src/a.ts', content })",
+      'await tools.edit({ path: "src/b.ts", old_string, new_string })',
+      "await tools.replace({ pattern: 'x', replacement: 'y', path: 'src', glob: '*.ts' })",
+    ].join('\n')
+    expect(run(code)).toEqual([
+      { path: 'src/a.ts', op: 'write', seq: 7, window: 2, isError: false },
+      { path: 'src/b.ts', op: 'edit', seq: 7, window: 2, isError: false },
+      { path: 'src', op: 'edit', seq: 7, window: 2, isError: false },
+    ])
+  })
+
+  test('single, double and backtick literals all name a path', () => {
+    const code = [
+      "tools.write({ path: 'a.ts', content })",
+      'tools.write({ path: "b.ts", content })',
+      'tools.write({ path: `c.ts`, content })',
+    ].join('\n')
+    expect(run(code).map(activity => activity.path)).toEqual(['a.ts', 'b.ts', 'c.ts'])
+  })
+
+  test('a read call, a stream write and a plain fs write are no file activity', () => {
+    const code = [
+      "await tools.read({ path: 'a.ts' })",
+      "process.stdout.write('done')",
+      "fs.writeFileSync('b.ts', 'x')",
+      'process.stderr.write("no")',
+    ].join('\n')
+    expect(run(code)).toEqual([])
+    expect(activityOf('mcp__ptc-run__run_code', { code }, meta(1))).toBeNull()
+  })
+
+  test('a path a program interpolates is skipped, and the literal after it still counts', () => {
+    const code = [
+      'tools.write({ path: `${dir}/a.ts`, content })',
+      "tools.write({ path: 'b.ts', content })",
+    ].join('\n')
+    expect(run(code).map(activity => activity.path)).toEqual(['b.ts'])
+  })
+
+  test('a relative path is taken under the root, an absolute one is left alone', () => {
+    const code = [
+      "tools.write({ path: 'src/a.ts', content })",
+      "tools.edit({ path: 'C:/repo/c.ts', old, new })",
+    ].join('\n')
+    expect(run(code, 'C:/root/').map(activity => activity.path)).toEqual([
+      'C:/root/src/a.ts',
+      'C:/repo/c.ts',
+    ])
+  })
+
+  test('a write named inside another write is not a second file', () => {
+    const code = "tools.write({ path: 'a.ts', content: \"tools.write({ path: 'b.ts' })\" })"
+    expect(run(code).map(activity => activity.path)).toEqual(['a.ts'])
+  })
+
+  test('the single-value reader answers with the first file of the call', () => {
+    const code = "tools.write({ path: 'a.ts' })\ntools.write({ path: 'b.ts' })"
+    expect(activityOf('mcp__ptc-run__run_code', { code }, meta(1))?.path).toBe('a.ts')
   })
 })
 

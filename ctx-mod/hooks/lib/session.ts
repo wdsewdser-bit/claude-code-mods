@@ -69,7 +69,7 @@ import {
   validate,
 } from './ledger.ts'
 import type { AnchorCheck, ArchivePage, TaskState } from './ledger.ts'
-import { activityOf, filesOf, locate, pathKey, pathsToRead, relativePath, renderWorkset, snippetsOf } from './workset.ts'
+import { activitiesOf, filesOf, locate, pathKey, pathsToRead, relativePath, renderWorkset, snippetsOf } from './workset.ts'
 import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
@@ -1424,9 +1424,10 @@ export const createSession =(dir: string, io: Io, config: Config): Session => {
   }
 
   const activity = (tool: string, input: Readonly<Record<string, unknown>>, seq: number, isError: boolean): void => {
-    const found = activityOf(tool, input, { seq, window: state.window, isError })
-    if (found === null) return
-    state.activities.push(found)
+    // One call can name several files (a `run_code` program), so every activity it yields is kept.
+    const found = activitiesOf(tool, input, { seq, window: state.window, isError })
+    if (found.length === 0) return
+    state.activities.push(...found)
     if (state.activities.length > MAX_ACTIVITIES) {
       state.activities.splice(0, state.activities.length - MAX_ACTIVITIES)
     }
