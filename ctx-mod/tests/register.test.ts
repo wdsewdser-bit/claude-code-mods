@@ -471,6 +471,30 @@ test('with CTX_MOD unset a compaction reaches core and nothing is written', asyn
   expect(w.files.size).toBe(0)
 })
 
+test('armed, a new session imports a handoff as window 37 and resolves predecessor history', async ($, on) => {
+  const w = world(on, 's-lineage-new', { CTX_MOD: '1' })
+  const root = slashed(HOME) + '/.claude/ctx-mod'
+  const opening = '这是第 36 个窗口，上一个窗口的对话不在上下文里。\n同一份交接正文'
+  w.messages = [{ role: 'user', text: opening, toolUses: [] }]
+  w.readable.set(slashed(HOME) + '/.claude/projects/-work/s-lineage-new.jsonl', [
+    { type: 'custom-title', customTitle: '相同标题不作为证据' },
+    { type: 'system', subtype: 'compact_boundary' },
+    { type: 'user', message: { content: opening } },
+  ].map(row => JSON.stringify(row)).join('\n'))
+  w.dirs.set(root, [{ name: 's-lineage-old', kind: 'dir', size: 0, mtimeMs: START }])
+  w.readable.set(root + '/s-lineage-old/handoff-w036.md', opening)
+  w.readable.set(root + '/s-lineage-old/meta.json', JSON.stringify({ window: 36, seq: 7552 }))
+  w.readable.set(root + '/s-lineage-old/history-w036.jsonl', JSON.stringify({ seq: 7552, window: 36, uuid: '', ts: START, role: 'user', text: '前驱原始历史', isPerson: true }) + '\n')
+  await boot($)
+  const answer = textOf(await callTool($, history({ action: 'read', seq: 7552 })))
+  expect(answer).toContain('前驱原始历史')
+  expect(answer).toContain('旧会话 s-lineage-old')
+  const meta = JSON.parse(fileAt(w, 's-lineage-new/meta.json') ?? '{}')
+  expect(meta.window).toBe(37)
+  expect(meta.lineage.lastSeq).toBe(7552)
+  expect([...w.files.keys()].some(p => p.includes('/s-lineage-old/'))).toBe(false)
+})
+
 test('armed, session.start registers five tools and the ctx-mod command', async ($, on) => {
   const w = world(on, 's-armed', { CTX_MOD: '1' })
   await boot($)
