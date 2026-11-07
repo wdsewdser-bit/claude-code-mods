@@ -141,6 +141,9 @@ describe('bridge logic', () => {
     expect(resumeVerdict(wrapped(), at(30_000), HIGH(95), 90)).toBe('wait')
     expect(resumeVerdict(wrapped(), at(400_000), HIGH(95), 90)).toBe('resume')
     expect(resumeVerdict(wrapped({ isTakenOver: true }), at(30_000), HIGH(5), 90)).toBe('skip')
+    // A running turn is not interrupted: the resume waits for it to end.
+    expect(resumeVerdict(wrapped(), at(30_000), HIGH(5), 90, true)).toBe('wait')
+    expect(resumeVerdict(wrapped(), at(30_000), HIGH(5), 90, false)).toBe('resume')
   })
 })
 
@@ -162,6 +165,37 @@ describe('bridge in a session', () => {
     // One wrap per window: nothing more is sent.
     await w.clock.advance(600_000)
     expect(w.submitted).toHaveLength(2)
+  })
+
+  test('a message while waiting does not cancel the resume; the resume command does', DEFAULTS, async ($, on) => {
+    const w = world(on, ONE_HOUR)
+    await boot($)
+    await turn($, 't1', 'work')
+    w.limits = HIGH(96) as never
+    await w.clock.advance(10_000)
+    expect(w.submitted).toHaveLength(1)
+    // The person leaves a note before the reset: a real message, not a takeover.
+    await $.prompt.submit({ text: 'after the reset, also do X', origin: { kind: 'composer' } } as never)
+    await turn($, 't2', 'after the reset, also do X')
+    await w.clock.advance(3_130_000)
+    w.limits = HIGH(3, RESET + 5 * 3_600_000) as never
+    await w.clock.advance(4_200_000)
+    const resumes = w.submitted.filter(text => text.includes('已重置'))
+    expect(resumes).toHaveLength(1)
+    expect(resumes[0]).toContain('等待期间用户交代的事')
+  })
+
+  test('the resume can be cancelled before the reset', DEFAULTS, async ($, on) => {
+    const w = world(on, ONE_HOUR)
+    await boot($)
+    await turn($, 't1', 'work')
+    w.limits = HIGH(96) as never
+    await w.clock.advance(10_000)
+    expect(await command($, 'resume off')).toContain('off')
+    await w.clock.advance(3_130_000)
+    w.limits = HIGH(3, RESET + 5 * 3_600_000) as never
+    await w.clock.advance(4_200_000)
+    expect(w.submitted.filter(text => text.includes('已重置'))).toHaveLength(0)
   })
 
   test('at 98% of the week asks once for a handoff document and keeps the keeper on', DEFAULTS, async ($, on) => {
