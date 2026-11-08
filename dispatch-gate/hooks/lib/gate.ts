@@ -28,9 +28,18 @@ export type Config = {
   agentPerHour: number
   /** Read-only acceptance requests after a dispatch that are free. */
   grace: number
+  /** Minutes one L2 refusal keeps the next stretch from refusing; 0 means no cooldown. */
+  denyCooldownMinutes: number
 }
 
-export const DEFAULTS: Config = { mode: 'soft', remindAt: 4, denyAt: 8, agentPerHour: 3, grace: 3 }
+export const DEFAULTS: Config = {
+  mode: 'soft',
+  remindAt: 4,
+  denyAt: 8,
+  agentPerHour: 3,
+  grace: 3,
+  denyCooldownMinutes: 15,
+}
 
 /** The rolling window of the Claude-subagent limit. */
 export const AGENT_WINDOW_MS = 3_600_000
@@ -158,6 +167,8 @@ export type State = {
   agentCalls: number[]
   /** When this hour window gave its one refusal; null when it has not. */
   agentDeniedAt: number | null
+  /** When the last L2 refusal was given, in ms; null when none was. Survives a reset. */
+  lastDenyAt: number | null
   /** The last request counted, so the same step seen twice counts once. */
   lastStep: string | null
 }
@@ -170,6 +181,7 @@ export const createState = (): State => ({
   armed: false,
   agentCalls: [],
   agentDeniedAt: null,
+  lastDenyAt: null,
   lastStep: null,
 })
 
@@ -180,6 +192,18 @@ export const resetStreak = (state: State, config: Config): void => {
   state.denied = false
   state.armed = false
   state.grace = Math.max(0, Math.floor(config.grace))
+}
+
+/** How long one L2 refusal keeps the next stretch of self-work from refusing. */
+export const denyCooldownMs = (config: Config): number =>
+  Math.max(0, Math.floor(config.denyCooldownMinutes)) * 60_000
+
+/** Whether the last L2 refusal is still too recent for another one. */
+export const coolingDown = (state: State, config: Config, now: number): boolean => {
+  const window = denyCooldownMs(config)
+  if (window === 0 || state.lastDenyAt === null) return false
+
+  return now - state.lastDenyAt < window
 }
 
 export type Outcome = {
@@ -197,6 +221,7 @@ export const observeRequest = (
   config: Config,
   uses: readonly Use[],
   stepKey?: string,
+  now: number = Date.now(),
 ): Outcome => {
   if (stepKey !== undefined) {
     if (state.lastStep === stepKey) return { kind: 'other', remind: false }
@@ -226,7 +251,9 @@ export const observeRequest = (
     state.reminded = true
     remind = true
   }
-  if (config.mode === 'soft' && state.streak >= config.denyAt && !state.denied) {
+  // The refusal, once per streak, and never inside the cooldown the last one
+  // started: the reminder still comes, the refusal waits for the window.
+  if (config.mode === 'soft' && state.streak >= config.denyAt && !state.denied && !coolingDown(state, config, now)) {
     state.denied = true
     state.armed = true
   }
@@ -280,6 +307,7 @@ export const judge = (
 
   if (config.mode === 'soft' && state.armed && isExec({ tool, input })) {
     state.armed = false
+    state.lastDenyAt = now
 
     return { deny: denyText(state.streak) }
   }
@@ -304,11 +332,11 @@ const judgeAgentWindow = (state: State, config: Config, now: number): string | u
 
 /** L1: the reminder injected once per streak, after the batch that earned it. */
 export const remindText = (streak: number): string =>
-  `dispatch-gate：主会话已连续 ${streak} 个执行请求，没有派发。接下来把剩下的工作按文件集合打包，交给 mcp__delegate__delegate_pro（mode=work），写清要改的文件、验收标准和不要碰的文件；主会话只做派发和验收。探针、浏览器、交互式调试这类只能自己做的，继续即可。`
+  `dispatch-gate：主会话已连续 ${streak} 个执行请求，没有派发。接下来把剩下的工作按文件集合打包，交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件；主会话只做派发和验收。探针、浏览器、交互式调试这类只能自己做的，继续即可。`
 
 /** L2: the one refusal per streak, given at the tool call that would keep going. */
 export const denyText = (streak: number): string =>
-  `dispatch-gate：这一段已连续 ${streak} 个执行请求，先停一下。把接下来的工作按文件集合合并成 1–2 个工作包，用 mcp__delegate__delegate_pro（mode=work）派出去，写清要改的文件、验收标准、不要碰的文件。确实只能主会话做的，重新调用同一个工具即可放行；本段不会再拦。`
+  `dispatch-gate：这一段已连续 ${streak} 个执行请求，先停一下。把接下来的工作按文件集合合并成 1–2 个工作包，用 mcp__delegate__delegate_flash 派出去，写清要改的文件、验收标准、不要碰的文件。确实只能主会话做的，重新调用同一个工具即可放行；本段不会再拦。`
 
 /** The refusal of a Claude subagent dispatched past the hourly limit. */
 export const agentDenyText = (count: number): string =>
@@ -336,6 +364,10 @@ export const readConfig = (options: Readonly<Record<string, unknown>> | undefine
     denyAt: Math.max(1, Math.floor(numberOf(held['denyAt'], DEFAULTS.denyAt))),
     agentPerHour: Math.max(0, Math.floor(numberOf(held['agentPerHour'], DEFAULTS.agentPerHour))),
     grace: Math.max(0, Math.floor(numberOf(held['grace'], DEFAULTS.grace))),
+    denyCooldownMinutes: Math.max(
+      0,
+      Math.floor(numberOf(held['denyCooldownMinutes'], DEFAULTS.denyCooldownMinutes)),
+    ),
   }
 }
 

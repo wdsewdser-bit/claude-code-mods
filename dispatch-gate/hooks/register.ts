@@ -61,7 +61,7 @@ export const register: Register = (on, options) => {
     state = createState()
     pendingRemind = false
     config = await configure($)
-    debug($, `mode=${config.mode} remindAt=${config.remindAt} denyAt=${config.denyAt} agentPerHour=${config.agentPerHour} grace=${config.grace}`)
+    debug($, `mode=${config.mode} remindAt=${config.remindAt} denyAt=${config.denyAt} agentPerHour=${config.agentPerHour} grace=${config.grace} denyCooldownMinutes=${config.denyCooldownMinutes}`)
 
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -89,7 +89,8 @@ export const register: Register = (on, options) => {
     const result = yield* next(e)
     try {
       if (e.agentId === undefined && config.mode !== 'off') {
-        const outcome = observeRequest(state, config, usesOf(result), `${e.turnId}:${e.index}`)
+        const now = await attempt(() => $.clock.now(), Date.now())
+        const outcome = observeRequest(state, config, usesOf(result), `${e.turnId}:${e.index}`, now)
         if (outcome.remind) {
           pendingRemind = true
           debug($, `remind at streak ${state.streak}`)
@@ -105,22 +106,18 @@ export const register: Register = (on, options) => {
   // L1: one reminder per streak, injected once for the whole batch. It cannot
   // refuse anything, which is why the refusal lives at the tool call.
   on('classic.PostToolBatch', async ($, e, next) => {
-    const forMain = (e as { agent_id?: unknown }).agent_id === undefined
-    const remind = pendingRemind && forMain
+    const remind = pendingRemind && e.agent_id === undefined
     if (remind) pendingRemind = false
     const result = await next(e)
     if (!remind) return result
     try {
-      const held = (result ?? {}) as { hookSpecificOutput?: Record<string, unknown> }
+      // The engine's classic result carries additionalContext flat, one entry
+      // per hook, and reads it as a string array (ClassicResult).
+      const held = (result ?? {}) as { additionalContext?: readonly string[] }
+      const contexts = Array.isArray(held.additionalContext) ? held.additionalContext : []
+      debug($, `injected remind streak=${state.streak}`)
 
-      return {
-        ...held,
-        hookSpecificOutput: {
-          ...(held.hookSpecificOutput ?? {}),
-          hookEventName: 'PostToolBatch',
-          additionalContext: remindText(state.streak),
-        },
-      }
+      return { ...held, additionalContext: [...contexts, remindText(state.streak)] }
     } catch (error) {
       debug($, `PostToolBatch: ${messageOf(error)}`)
 
