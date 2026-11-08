@@ -24,6 +24,12 @@
       "description": "Consecutive requests the main session spends on its own work before one execution call is refused. Once per stretch; the retry runs.",
       "default": 8
     },
+    "denyCooldownMinutes": {
+      "type": "number",
+      "title": "Cooldown after a refusal (minutes)",
+      "description": "Minutes after one refusal during which a new stretch is reminded but not refused again, however far past denyAt it runs. 0 lifts the cooldown.",
+      "default": 15
+    },
     "agentPerHour": {
       "type": "number",
       "title": "Claude subagents per hour",

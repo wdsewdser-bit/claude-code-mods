@@ -658,6 +658,8 @@ const main = async () => {
         CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY: '3',
         ENABLE_TOOL_SEARCH: 'false',
         CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: '1',
+        // dispatch-gate 只管主会话：委派子进程本身就是执行者，不提醒也不拦。
+        DISPATCH_GATE: '0',
       })
       // Claude Code caps output at 32000 by default; DS max-effort thinking alone can use all of it.
       env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = gpt ? '128000' : '358000'
