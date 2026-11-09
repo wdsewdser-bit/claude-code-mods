@@ -257,6 +257,41 @@ test('真实格式：后台子代理按 agentId 的 <task-id> 通知完成 → i
   expect(verdict.interrupted).toHaveLength(0)
 })
 
+const agentInterim = (agentId: string) =>
+  JSON.stringify({
+    type: 'user',
+    cwd: 'D:/work',
+    message: {
+      role: 'user',
+      content: `<task-notification>\n<task-id>${agentId}</task-id>\n<status>completed</status>\n<summary>Agent "重启测试" is waiting on its own background work</summary>\n<note>This agent stopped with background work of its own still running.</note>\n<result>OK</result>\n</task-notification>`,
+    },
+  })
+
+test('后台子代理只有中间通知（自己的后台命令还在跑）→ 算中断', () => {
+  const digest = digestFromLines([
+    assistantTool('toolu_01AaUeNmMgKovDDQr5hrjWWr', 'Agent', { description: '第十一次巡检 B 组', run_in_background: true, prompt: '巡检' }),
+    userResult('toolu_01AaUeNmMgKovDDQr5hrjWWr', AGENT_LAUNCH),
+    agentInterim(AGENT_ID),
+    assistantText('子代理还在等它的后台命令。'),
+  ])
+  const verdict = judgeTranscript(digest)
+  expect(verdict.state).toBe('working')
+  expect(verdict.interrupted.map(item => item.type)).toEqual(['agent'])
+})
+
+test('中间通知之后又来了最终通知 → 算完成', () => {
+  const digest = digestFromLines([
+    assistantTool('toolu_01AaUeNmMgKovDDQr5hrjWWr', 'Agent', { description: '第十一次巡检 B 组', run_in_background: true, prompt: '巡检' }),
+    userResult('toolu_01AaUeNmMgKovDDQr5hrjWWr', AGENT_LAUNCH),
+    agentInterim(AGENT_ID),
+    agentDone(AGENT_ID),
+    assistantText('收尾完成。'),
+  ])
+  const verdict = judgeTranscript(digest)
+  expect(verdict.state).toBe('idle')
+  expect(verdict.interrupted).toHaveLength(0)
+})
+
 test('真实格式：后台子代理有 agentId 但没有完成通知 → wake', () => {
   const digest = digestFromLines([
     assistantTool('toolu_01AaUeNmMgKovDDQr5hrjWWr', 'Agent', { description: '第十一次巡检 B 组', subagent_type: 'browser-worker', run_in_background: true, prompt: '巡检' }),

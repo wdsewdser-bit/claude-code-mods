@@ -71,7 +71,7 @@ export type Digest = {
   backgroundAgents: { id: string; detail: string; agentId?: string }[]
   delegateStarts: { id: string; detail: string }[]
   delegateDones: string[]
-  notifications: { taskId: string; toolUseId: string }[]
+  notifications: { taskId: string; toolUseId: string; interim?: boolean }[]
   monitors: { id: string; detail: string }[]
   wakeups: { id: string; detail: string; stop: boolean }[]
   crons: { id: string; detail: string }[]
@@ -89,6 +89,9 @@ const DELEGATE_START = /后台任务\s*\[?\s*(bg-[A-Za-z0-9_-]+)\]?\s*已启动/
 const DELEGATE_DONE = /【delegate 后台任务\s*([^\s】]+)\s*(?:完成|失败)】/
 const TASK_ID = /<task-id>\s*([^<\s]+)/
 const TOOL_USE_ID = /<tool-use-id>\s*([^<\s]+)/
+// An agent whose turn ended with its own background work still running gets an interim
+// notice; the same task-id notifies again once that work is done.
+const INTERIM_NOTICE = /waiting on its own background work|stopped with background work of its own still running/i
 
 function blockText(block: any): string {
   const content = block?.content
@@ -215,7 +218,11 @@ export function digestFromLines(lines: readonly string[]): Digest {
       const taskId = TASK_ID.exec(recordText)
       if (taskId?.[1]) {
         const toolUseId = TOOL_USE_ID.exec(recordText)
-        digest.notifications.push({ taskId: taskId[1], toolUseId: toolUseId?.[1] ?? '' })
+        digest.notifications.push({
+          taskId: taskId[1],
+          toolUseId: toolUseId?.[1] ?? '',
+          ...(INTERIM_NOTICE.test(recordText) ? { interim: true } : {}),
+        })
       }
       const done = DELEGATE_DONE.exec(recordText)
       if (done?.[1]) digest.delegateDones.push(done[1])
@@ -264,7 +271,9 @@ export function judgeTranscript(digest: Digest): { state: 'working' | 'idle'; re
     if (!digest.notifications.some(note => note.taskId === job.id)) add({ type: 'bash', id: job.id, detail: job.detail })
   }
   for (const agent of digest.backgroundAgents) {
-    const done = digest.notifications.some(note => note.toolUseId === agent.id || (!!agent.agentId && note.taskId === agent.agentId))
+    // Only the latest notice counts: an interim one means its background work was still running.
+    const notes = digest.notifications.filter(note => note.toolUseId === agent.id || (!!agent.agentId && note.taskId === agent.agentId))
+    const done = notes.length > 0 && notes[notes.length - 1]?.interim !== true
     if (!done) add({ type: 'agent', id: agent.id, detail: agent.detail })
   }
   for (const job of digest.delegateStarts) {
