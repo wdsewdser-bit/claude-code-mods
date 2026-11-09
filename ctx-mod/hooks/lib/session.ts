@@ -298,6 +298,8 @@ type HeldItem = {
   attachments: HeldAttachment[]
   /** Where Claude saved the pasted images, when it saved them: a re-submission points there. */
   images: string[]
+  /** The origin kind of a message that was not the person's own (another session, a trigger): re-submitted framed, never as the person's. */
+  from?: string
 }
 
 /** The paths a held row kept; a row written before this field has none. */
@@ -341,6 +343,7 @@ const heldFrom = (text: string | null): HeldItem[] => {
         at: typeof row.at === 'number' ? row.at : 0,
         attachments: attachmentsOf(row.attachments),
         images: imagesOf(row.images),
+        ...(typeof row.from === 'string' && row.from !== '' ? { from: row.from } : {}),
       })
     }
 
@@ -482,6 +485,7 @@ export type Session = {
     text: string,
     attachments?: readonly HeldAttachment[],
     images?: readonly string[],
+    from?: string,
   ) => Promise<number | null>
   /** The held messages, oldest first; `await ready()` first. */
   heldItems: () => HeldItem[]
@@ -2818,6 +2822,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     text: string,
     attachments: readonly HeldAttachment[] = [],
     images: readonly string[] = [],
+    from?: string,
   ): Promise<number | null> => {
     await ensureLoaded()
     const id = held.reduce((top, item) => Math.max(top, item.id), 0) + 1
@@ -2829,6 +2834,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
         at: io.now(),
         attachments: attachments.map(item => ({ ...item })),
         images: [...images],
+        ...(from === undefined ? {} : { from }),
       },
     ]
     const isWritten = await queue.push(pathIn(HELD_FILE), heldJson())

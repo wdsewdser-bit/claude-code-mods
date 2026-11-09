@@ -69,6 +69,8 @@ type World = {
   notices: string[]
   /** The texts the bottom saw from a plugin, in order. */
   resubmits: string[]
+  /** For each re-submission, whether it went in as the person's own words. */
+  resubmitAsUser: boolean[]
   /** The texts the bottom saw from anyone, in order. */
   submits: string[]
   /** Commands run and plugin re-submissions in the one order they happened, as `run:<command>` and `resubmit:<text>`. */
@@ -154,6 +156,7 @@ const world = (
     resubmit: 'enter',
     notices: [],
     resubmits: [],
+    resubmitAsUser: [],
     submits: [],
     timeline: [],
     keeper: null,
@@ -233,6 +236,7 @@ const world = (
     w.submits.push(e.text)
     if ((e.origin as { kind: string }).kind === 'plugin') {
       w.resubmits.push(e.text)
+      w.resubmitAsUser.push((e.origin as { asUser?: unknown }).asUser === true)
       w.timeline.push(`resubmit:${e.text}`)
       if (w.resubmit === 'drop') return { drop: 'another plugin refused it' }
       if (w.resubmit === 'throw') throw new Error('submit failed')
@@ -1468,6 +1472,44 @@ test('a held prompt is submitted again after the switch, and nothing stays on di
   expect(w.resubmits).toEqual(['换完再说'])
   expect(w.notices).toEqual([])
   expect(heldLeft(w)).toEqual([])
+})
+
+test('a cold cache holds another session\'s message too, and re-submits it framed as not the person\'s words', async ($, on) => {
+  const w = world(on, 's-held-peer', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  const result = await $.prompt.submit({ text: '帮我看下这个 mod', wait: false, origin: { kind: 'peer' } } as never)
+  expect(isDropped(result)).toBe(true)
+  expect(heldLeft(w)).toEqual(['帮我看下这个 mod'])
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
+  expect(w.resubmits).toHaveLength(1)
+  expect(w.resubmits[0]).toContain('另一个会话发来的消息，不是用户本人的话')
+  expect(w.resubmits[0]).toContain('帮我看下这个 mod')
+  expect(w.resubmitAsUser).toEqual([false])
+  expect(heldLeft(w)).toEqual([])
+})
+
+test('a task notification is not held by a cold cache', async ($, on) => {
+  const w = world(on, 's-held-task', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  const result = await $.prompt.submit({ text: '<task-notification>done</task-notification>', wait: false, origin: { kind: 'task-notification' } } as never)
+  expect(isDropped(result)).toBe(false)
+  expect(heldLeft(w)).toEqual([])
+})
+
+test('a held message from the person still goes back as their own words', async ($, on) => {
+  const w = world(on, 's-held-asuser', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  await sayWhileCold($, '我自己的话')
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.resubmits).toEqual(['我自己的话'])
+  expect(w.resubmitAsUser).toEqual([true])
 })
 
 test('a re-submission another plugin drops tells the person, with the words, and clears the shelf', async ($, on) => {

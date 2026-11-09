@@ -322,10 +322,14 @@ const deliverHeld = async ($: EngineInterface, session: Session): Promise<void> 
       attachment => !(item.images.length > 0 && attachment.type === 'image'),
     )
     if (lost.length > 0) notes.push(lostAttachmentsNote(lost))
-    const text = notes.length === 0 ? item.text : `${item.text}\n\n${notes.join('\n')}`
+    const body = notes.length === 0 ? item.text : `${item.text}\n\n${notes.join('\n')}`
+    // Someone else's message goes back framed under this plugin, labelled with where it came from:
+    // re-submitted as the person's own it would read, and be booked, as the user's words.
+    const outside = item.from === undefined ? undefined : (OUTSIDE_KINDS[item.from] ?? item.from)
+    const text = outside === undefined ? body : `（换窗口前收到的${outside}，不是用户本人的话，原文如下）\n\n${body}`
     let isDelivered = false
     try {
-      const entered = await $.prompt.submit({ text, asUser: true })
+      const entered = await $.prompt.submit(outside === undefined ? { text, asUser: true } : { text })
       isDelivered = !(typeof entered === 'object' && entered !== null && 'drop' in entered)
       if (!isDelivered) logError($, 'prompt.submit resubmit', 'the re-submitted prompt was dropped')
     } catch (error) {
@@ -563,6 +567,23 @@ const argsOf = (e: unknown): Readonly<Record<string, unknown>> => {
 
 const isPersonOrigin = (origin: { kind: string }): boolean =>
   origin.kind === 'composer' || origin.kind === 'bridge' || origin.kind === 'sdk'
+
+/**
+ * Not the person's words, yet a turn of its own that would write the whole cold cache:
+ * another session's message, a hand-off, a relayed channel, a scheduled prompt. Held
+ * like the person's, and re-submitted framed under its origin, never as the person's.
+ */
+const OUTSIDE_KINDS: Record<string, string> = {
+  peer: '另一个会话发来的消息',
+  'peer-send-message': '另一个会话发来的消息',
+  'projects-relay': '协调会话转来的消息',
+  coordinator: '协调会话的转交',
+  channel: '频道转来的消息',
+  'slack-ping': 'Slack 上的呼叫',
+  'scheduled-trigger': '定时任务触发的提示',
+}
+
+const isOutsideOrigin = (origin: { kind: string }): boolean => origin.kind in OUTSIDE_KINDS
 
 /** A prompt this mod itself re-submitted as the person's own words. */
 const isOurUser = (origin: { kind: string }): boolean => {
@@ -1750,7 +1771,7 @@ export const register: Register = (on, options) => {
     try {
       const session = await sessionOf($)
       const id = await idOf($)
-      if (session !== undefined && id !== undefined && isPersonOrigin(e.origin)) {
+      if (session !== undefined && id !== undefined && (isPersonOrigin(e.origin) || isOutsideOrigin(e.origin))) {
         // During a switch every such message waits its turn; otherwise only a cold cache holds one.
         let wants = isHoldingFlow
         if (!wants) {
@@ -1772,7 +1793,8 @@ export const register: Register = (on, options) => {
         const attachments = e.attachments ?? []
         const images =
           wants && attachments.length > 0 ? await pastedImages($, attachments, id) : []
-        const heldId = wants ? await session.hold(e.text, attachments, images) : null
+        const from = isOutsideOrigin(e.origin) ? e.origin.kind : undefined
+        const heldId = wants ? await session.hold(e.text, attachments, images, from) : null
         if (heldId !== null) {
           holds = true
           heldSession = session

@@ -309,7 +309,7 @@ export const judge = (
     state.armed = false
     state.lastDenyAt = now
 
-    return { deny: denyText(state.streak) }
+    return { deny: denyText(state.streak, Math.max(0, Math.floor(config.denyCooldownMinutes))) }
   }
 
   return {}
@@ -335,8 +335,8 @@ export const remindText = (streak: number): string =>
   `dispatch-gate：主会话已连续 ${streak} 个执行请求，没有派发。接下来把剩下的工作按文件集合打包，交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件；主会话只做派发和验收。探针、浏览器、交互式调试这类只能自己做的，继续即可。`
 
 /** L2: the one refusal per streak, given at the tool call that would keep going. */
-export const denyText = (streak: number): string =>
-  `dispatch-gate：这一段已连续 ${streak} 个执行请求，先停一下。把接下来的工作按文件集合合并成 1–2 个工作包，用 mcp__delegate__delegate_flash 派出去，写清要改的文件、验收标准、不要碰的文件。确实只能主会话做的，重新调用同一个工具即可放行；本段不会再拦。`
+export const denyText = (streak: number, cooldownMinutes: number): string =>
+  `dispatch-gate（软拦截，可直接重试）：主会话已连续 ${streak} 个执行请求没有派发。如果剩下的工作能按文件集合打成 1–2 个工作包，建议交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件。如果改法已定、交接比自己做更费事，或者只能主会话做，重新调用同一个工具即可放行。${cooldownMinutes > 0 ? `放行后 ${cooldownMinutes} 分钟内不会再拦，期间最多只有提醒。` : '放行后这一段不会再拦。'}`
 
 /** The refusal of a Claude subagent dispatched past the hourly limit. */
 export const agentDenyText = (count: number): string =>
