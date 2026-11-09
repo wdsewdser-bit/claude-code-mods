@@ -5,6 +5,7 @@
 | mod | 作用 |
 | --- | --- |
 | [cache-keeper](cache-keeper) | 观察 prompt cache 的命中情况，在会话闲置时保活主会话和子代理的缓存，额度快用完时让主会话收尾并在重置后继续，还能跑 5 分钟 / 1 小时 TTL 的对比实验 |
+| [cc-restart](cc-restart) | 让会话里的模型自己重启 Claude 桌面版（Windows），重启后用一次性定时任务唤醒发起会话，再由它通知其他正在干活的会话 |
 | [delegate](delegate) | 把任务派给 DS（任意 OpenAI 协议供应商）或 GPT（ChatGPT 订阅）执行，支持后台、续用、中途插话和实时面板 |
 | [dispatch](dispatch) | 技能：根代理派活规则（分包、模型与档位、执行包写法、验收），配合 delegate 和 dispatch-gate |
 | [dispatch-gate](dispatch-gate) | 主会话的软闸门：连续自己干太多就提醒一次、再拦一次；Claude 子代理一小时内派超过 3 个也拦一次。都是软拦截，重试即放行 |
@@ -36,6 +37,7 @@
 - ctx-mod 把会话的全部内容（包括工具输出）写在 `~/.claude/ctx-mod/` 下，不上传，也不自动清理。
 - delegate 依赖本地代理（a2o、CLIProxyAPI），`work` 模式的子代理可以直接改文件、执行命令。
 - ptc-run 的 `run_code` 不经过 Claude Code 的权限确认，等于让模型直接读写文件、执行命令。
+- cc-restart 的重启会打断所有会话（包括后台子代理），只支持 Windows 上 MSIX 安装的桌面版。
 - 这些 mod 都依赖引擎的内部事件，Claude Code 升级后可能需要跟着改。
 
 ## 开发

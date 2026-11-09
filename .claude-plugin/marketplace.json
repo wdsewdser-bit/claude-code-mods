@@ -9,6 +9,10 @@
       "source": "./cache-keeper"
     },
     {
+      "name": "cc-restart",
+      "source": "./cc-restart"
+    },
+    {
       "name": "ctx-mod",
       "source": "./ctx-mod"
     },

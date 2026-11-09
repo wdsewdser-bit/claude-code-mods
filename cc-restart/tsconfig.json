@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "typeRoots": ["../ctx-mod/.claude-plugin/types"],
+    "types": ["claude-code", "claude-code-tools", "claude-code-mcp", "cache-keeper"]
+  },
+  "include": ["hooks"]
+}

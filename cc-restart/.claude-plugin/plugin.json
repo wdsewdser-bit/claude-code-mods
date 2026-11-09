@@ -1,0 +1,7 @@
+{
+  "name": "cc-restart",
+  "version": "0.1.0",
+  "description": "让会话里的模型自己重启 Claude 桌面版，并在重启后唤醒同一个会话继续干活。",
+  "author": { "name": "yadaz" },
+  "license": "MIT"
+}
