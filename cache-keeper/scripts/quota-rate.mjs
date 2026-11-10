@@ -4,7 +4,7 @@
 // 额度进度来自 cache-keeper 记下的 rate_limits（~/.claude/cache-keeper/raw），
 // 用量来自 ~/.claude/projects 的会话记录（主线程 + 子代理）和保活 fork 的记录。
 // 加权（Opus 输入 token = 1）：输入 1，输出 5，缓存读 0.1，缓存写 2；
-// Sonnet 按 Opus 的一半；Haiku 和外部模型不占 Opus 额度，只列出不计入。
+// Sonnet 按 Opus 的一半；Fable / Mythos 的输入、输出、缓存写按 Opus 两倍，缓存读与 Opus 相同；Haiku 和外部模型不占额度，只列出不计入。
 //
 // 用法：node quota-rate.mjs [--window <resetsAt ISO>] [--step 5] [--data <cache-keeper 数据目录>]
 import fs from 'node:fs'
@@ -26,7 +26,14 @@ const weightOf = model => {
   if (/sonnet/i.test(model)) return 0.5
   return 0
 }
-const classOf = model => (/opus/i.test(model) ? 'opus' : /sonnet/i.test(model) ? 'sonnet' : /haiku/i.test(model) ? 'haiku' : 'other')
+// Fable / Mythos：缓存读与 Opus 相同，输入、输出、缓存写都是 Opus 的两倍（用户 2026-11-10 给的口径）。
+const isFable = model => /fable|mythos/i.test(model)
+const unitsOf = (model, input, output, read, write) =>
+  isFable(model)
+    ? 2 * (W.input * input + W.output * output + W.write * write) + W.read * read
+    : weightOf(model) * (W.input * input + W.output * output + W.read * read + W.write * write)
+const classOf = model =>
+  isFable(model) ? 'fable' : /opus/i.test(model) ? 'opus' : /sonnet/i.test(model) ? 'sonnet' : /haiku/i.test(model) ? 'haiku' : 'other'
 
 const walk = (dir, ext, out = []) => {
   if (!fs.existsSync(dir)) return out
@@ -91,7 +98,7 @@ const take = (t, model, u) => {
     t,
     cls,
     tokens: input + output + read + write,
-    units: weightOf(model) * (W.input * input + W.output * output + W.read * read + W.write * write),
+    units: unitsOf(model, input, output, read, write),
   })
 }
 for (const f of walk(path.join(os.homedir(), '.claude', 'projects'), '.jsonl')) {
@@ -144,7 +151,7 @@ const rate = (a, b) => {
 }
 
 console.log(`窗口 ${clock(startMs)} → ${clock(resetMs)}，当前 ${line.at(-1).p}%（记录时间 ${clock(line.at(-1).t)}）`)
-console.log('加权单位：Opus 输入 token = 1（输入 1 / 输出 5 / 缓存读 0.1 / 缓存写 2；Sonnet 减半）\n')
+console.log('加权单位：Opus 输入 token = 1（输入 1 / 输出 5 / 缓存读 0.1 / 缓存写 2；Sonnet 减半；Fable 输入/输出/缓存写两倍、缓存读不变）\n')
 console.log('分段（每 ' + STEP + '% 左右）')
 for (const s of segs) {
   const r = rate(s.a, s.b)

@@ -4,11 +4,13 @@
 
 | mod | 作用 |
 | --- | --- |
+| [away-autopilot](away-autopilot) | 用户 5 分钟没回复带 `[待确认]` 标记的问题时，提示模型自行决定、继续推进；模型也可以调用 `pause` 工具停下等用户 |
 | [cache-keeper](cache-keeper) | 观察 prompt cache 的命中情况，在会话闲置时保活主会话和子代理的缓存，额度快用完时让主会话收尾并在重置后继续，还能跑 5 分钟 / 1 小时 TTL 的对比实验 |
 | [cc-restart](cc-restart) | 让会话里的模型自己重启 Claude 桌面版（Windows），重启后用一次性定时任务唤醒发起会话，再由它通知其他正在干活的会话 |
 | [delegate](delegate) | 把任务派给 DS（任意 OpenAI 协议供应商）或 GPT（ChatGPT 订阅）执行，支持后台、续用、中途插话和实时面板 |
 | [dispatch](dispatch) | 技能：根代理派活规则（分包、模型与档位、执行包写法、验收），配合 delegate 和 dispatch-gate |
 | [dispatch-gate](dispatch-gate) | 主会话的软闸门：连续自己干太多就提醒一次、再拦一次；Claude 子代理一小时内派超过 3 个也拦一次。都是软拦截，重试即放行 |
+| [effort-auto](effort-auto) | 主会话专用的自适应思考档位：常驻 low，需要判断时模型自己临时升档、判断完自动回落；子代理不处理，默认关闭 |
 | [ctx-mod](ctx-mod) | 任务账本、可检索的完整历史、不靠模型摘要的换窗口、子代理冷续用提醒。依赖 cache-keeper |
 | [ptc-run](ptc-run) | 程序化工具调用：一段 JS 程序一次完成多步读写、搜索、批量文件操作和并发命令，只把结果放回上下文 |
 | [read-dedup](read-dedup) | 重复 Read 去重：文件没变只回一行提示，变了只回差异 |
@@ -42,12 +44,42 @@
 
 ## 开发
 
+跑全部测试（每个 mod 的 `claude plugin test`，加上插件测试器跑不了的 `node --test` 文件），末尾打印一张汇总表，有失败时退出码为 1：
+
 ```
-claude plugin validate cache-keeper
-claude plugin test cache-keeper
-claude plugin validate ctx-mod
-claude plugin test ctx-mod
+node scripts/test-all.mjs
+node scripts/test-all.mjs ptc-run   # 只跑一个 mod
 ```
+
+单个 mod 用：
+
+```
+claude plugin validate <mod>
+claude plugin test <mod>
+```
+
+read-dedup 的测试（`read-dedup/tests/*.ts`）、`ptc-run/tests/*.mjs` 和 `delegate/tests/*.test.mjs` 用的是 node:test，插件测试器会报 cannot import "node:test"，要直接 `node --test <文件>` 跑；`scripts/test-all.mjs` 已经包含这些。
+
+最后一项是 `scripts/mod-compat-check.ts` 的兼容性检查：把各 mod 用到的引擎事件 / `$` API 名和已安装的 claude 二进制比对，防止引擎升级后钩子静默失效。二进制路径运行时解析（`CLAUDE_BIN` → `where claude` / `which claude` → `npm root -g` 下的 `@anthropic-ai/claude-code/bin/`），找不到时该项显示 skipped、不算失败；`node scripts/test-all.mjs --no-compat` 可跳过。
+
+## 数据清理
+
+这些 mod 的数据只增不减。`scripts/prune-data.mjs` 按保留期清理，默认只列清单（dry-run），加 `--apply` 才真正删除：
+
+```
+node scripts/prune-data.mjs                        # 看看会删什么
+node scripts/prune-data.mjs --apply                # 真的删
+node scripts/prune-data.mjs --days 14 --tmp-hours 24 --only ctx-mod,tmp
+```
+
+| 数据 | 规则 |
+| --- | --- |
+| `~/.claude/ctx-mod` | 删最后写入早于保留期（默认 30 天）的 GUID 会话目录；根下的 `costly.json`、`probe-*.jsonl` 等不动 |
+| `~/.claude/delegate` | 删早于保留期、已结束（非运行中）的 `jobs/<id>/` 及其 `results/<id>.md`；key、配置、keepalive、venv、usage 账本和认不出归属的文件一律不删 |
+| `~/.claude/cache-keeper` | 只删 `raw/events-*.jsonl` 和 `raw/run-*.json`；`cache-events.csv`、`experiment-summary.json`、`cache-report.md` 不动 |
+| 临时目录 `cc-ptc` / `cc-ptc-locks` | `cc-ptc` 下 mtime 早于 `--tmp-hours`（默认 48 小时）的条目；`cc-ptc-locks` 里超过 1 天的陈旧锁 |
+
+参数还有 `--ctx-days` / `--delegate-days` / `--cache-days` / `--json`；保留期小于 1 会被拒绝。只删数据根内的路径，链接和目录联接不跟进，删不掉的单项记录后继续、最后非零退出。
 
 ## 许可
 

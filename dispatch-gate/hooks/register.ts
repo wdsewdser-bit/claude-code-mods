@@ -117,7 +117,7 @@ export const register: Register = (on, options) => {
       const contexts = Array.isArray(held.additionalContext) ? held.additionalContext : []
       debug($, `injected remind streak=${state.streak}`)
 
-      return { ...held, additionalContext: [...contexts, remindText(state.streak)] }
+      return { ...held, additionalContext: [...contexts, remindText(state.requests)] }
     } catch (error) {
       debug($, `PostToolBatch: ${messageOf(error)}`)
 

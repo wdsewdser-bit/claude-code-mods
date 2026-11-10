@@ -8,10 +8,13 @@ import {
   DEFAULTS,
   classify,
   createState,
+  denyText,
+  isReadOnlyUse,
   judge,
   modeOf,
   observeRequest,
   readConfig,
+  remindText,
   resetStreak,
   usesOf,
   withEnv,
@@ -70,7 +73,8 @@ test('the refusal arms at denyAt, once per streak, and disarms on use', () => {
 
 test('a dispatch clears the streak and leaves three read-only acceptance requests free', () => {
   const state = createState()
-  const config = cfg()
+  // The Reads here stand in for ordinary execution requests: keep the old one-per-request count.
+  const config = cfg({ readOnlyWeight: 1 })
   for (let i = 0; i < 3; i += 1) exec(state, config)
   expect(observeRequest(state, config, [u('Agent')]).kind).toBe('dispatch')
   expect(state.streak).toBe(0)
@@ -114,7 +118,8 @@ test('the same step seen twice counts once', () => {
 
 test('a parallel batch is one request', () => {
   const state = createState()
-  const config = cfg()
+  // The batch is all Reads: keep the old one-per-request count.
+  const config = cfg({ readOnlyWeight: 1 })
   for (let i = 0; i < 3; i += 1) exec(state, config)
   const batch = [u('Read'), u('Read'), u('Read'), u('Read'), u('Read')]
   expect(observeRequest(state, config, batch).remind).toBe(true)
@@ -208,11 +213,123 @@ test('readConfig: defaults, overrides and the environment switch', () => {
     denyAt: 5,
     agentPerHour: 1,
     grace: 0,
+    denyCooldownMinutes: 15,
+    readOnlyWeight: 0.5,
   })
+  expect(readConfig({ denyCooldownMinutes: 5 }).denyCooldownMinutes).toBe(5)
+  expect(readConfig({ denyCooldownMinutes: -3 }).denyCooldownMinutes).toBe(0)
+  expect(readConfig({ readOnlyWeight: 0.3 }).readOnlyWeight).toBe(0.3)
+  expect(readConfig({ readOnlyWeight: -1 }).readOnlyWeight).toBe(0)
+  expect(readConfig({ readOnlyWeight: 2 }).readOnlyWeight).toBe(1)
+  expect(readConfig({ readOnlyWeight: 'x' }).readOnlyWeight).toBe(DEFAULTS.readOnlyWeight)
   expect(readConfig({ mode: 'nonsense', remindAt: 'x' }).mode).toBe('soft')
   expect(readConfig({ mode: 'nonsense', remindAt: 'x' }).remindAt).toBe(DEFAULTS.remindAt)
   expect(modeOf('OFF')).toBe('off')
   expect(withEnv(DEFAULTS, '0', undefined).mode).toBe('off')
   expect(withEnv(DEFAULTS, undefined, 'remind').mode).toBe('remind')
   expect(withEnv(DEFAULTS, undefined, undefined).mode).toBe('soft')
+})
+
+test('isReadOnlyUse: reads and look-only commands are read-only', () => {
+  for (const tool of ['Read', 'Grep', 'Glob', 'BashOutput']) expect(isReadOnlyUse(u(tool))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'ls -la' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'git status && git diff' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'cat a | grep b' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'find . -name "*.ts"' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: "sed -n '1,5p' a" }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'cat a 2>&1 | tail -20' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'cat a > /dev/null' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'git remote -v' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'git branch' }))).toBe(true)
+  expect(isReadOnlyUse(u('Bash', { command: 'git rev-parse HEAD' }))).toBe(true)
+  expect(isReadOnlyUse(u('PowerShell', { command: 'pwd; ls' }))).toBe(true)
+  expect(isReadOnlyUse(u('mcp__ptc-run__run_code', { code: 'return await tools.read({ file_path: "a" })' }))).toBe(true)
+  expect(isReadOnlyUse(u('mcp__ptc-run__run_code', { code: 'return await tools.grep({ pattern: "x" })' }))).toBe(true)
+})
+
+test('isReadOnlyUse: writes, programs and anything unsure are not', () => {
+  expect(isReadOnlyUse(u('Edit', { file_path: 'a' }))).toBe(false)
+  expect(isReadOnlyUse(u('Write', { file_path: 'a' }))).toBe(false)
+  expect(isReadOnlyUse(u('MultiEdit', { file_path: 'a' }))).toBe(false)
+  expect(isReadOnlyUse(u('NotebookEdit', { notebook_path: 'a' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'npm test' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'node app.js' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'find . -delete' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'find . -exec rm {} ;' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: "sed -i 's/a/b/' f" }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'echo x > f' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'cat a | tee b' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'ls | xargs rm' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'sudo ls' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'ls $(pwd)' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'ls `pwd`' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'cmd 2>&1 | tail' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'git status; rm -rf x' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'git branch -D old' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'git remote' }))).toBe(false)
+  expect(isReadOnlyUse(u('Bash', { command: 'cp a b' }))).toBe(false)
+  expect(isReadOnlyUse(u('mcp__ptc-run__run_code', { code: 'return await tools.edit({ file_path: "a" })' }))).toBe(false)
+  expect(isReadOnlyUse(u('mcp__ptc-run__run_code', { code: 'return await tools . bash ({ command: "ls" })' }))).toBe(false)
+  expect(isReadOnlyUse(u('mcp__ptc-run__run_code', { code: 'ref.store("x", 1)' }))).toBe(false)
+})
+
+test('read-only requests weigh half: eight remind, sixteen refuse', () => {
+  const state = createState()
+  const config = cfg()
+  const read = (): ReturnType<typeof observeRequest> => observeRequest(state, config, [u('Read')])
+  for (let i = 0; i < 7; i += 1) expect(read().remind).toBe(false)
+  expect(read().remind).toBe(true)
+  expect(state.streak).toBe(4)
+  expect(state.requests).toBe(8)
+  expect(remindText(state.requests)).toContain('连续 8 个执行请求')
+  for (let i = 0; i < 7; i += 1) read()
+  expect(state.armed).toBe(false)
+  expect(state.streak).toBe(7.5)
+  read()
+  expect(state.armed).toBe(true)
+  expect(state.requests).toBe(16)
+  expect(denyText(state.requests, 15)).toContain('连续 16 个执行请求')
+})
+
+test('a mixed request counts one; a read-only one counts its weight', () => {
+  const state = createState()
+  const config = cfg()
+  observeRequest(state, config, [u('Read'), u('Edit')])
+  expect(state.streak).toBe(1)
+  observeRequest(state, config, [u('Read'), u('mcp__ctx-mod__ledger_read')])
+  expect(state.streak).toBe(1.5)
+  observeRequest(state, config, [u('Bash', { command: 'git status' })])
+  expect(state.streak).toBe(2)
+  observeRequest(state, config, [u('Bash', { command: 'npm test' })])
+  expect(state.streak).toBe(3)
+  expect(state.requests).toBe(4)
+})
+
+test('the acceptance grace still covers only Read, Grep and Glob', () => {
+  const state = createState()
+  const config = cfg()
+  observeRequest(state, config, [u('Agent')])
+  expect(state.grace).toBe(3)
+  observeRequest(state, config, [u('Bash', { command: 'git status' })])
+  expect(state.grace).toBe(0)
+  expect(state.streak).toBe(0.5)
+})
+
+test('readOnlyWeight=1 restores the old counting', () => {
+  const state = createState()
+  const config = cfg({ readOnlyWeight: 1 })
+  for (let i = 0; i < 3; i += 1) expect(observeRequest(state, config, [u('Read')]).remind).toBe(false)
+  expect(observeRequest(state, config, [u('Read')]).remind).toBe(true)
+  expect(state.streak).toBe(4)
+  for (let i = 0; i < 4; i += 1) observeRequest(state, config, [u('Read')])
+  expect(state.streak).toBe(8)
+  expect(state.armed).toBe(true)
+})
+
+test('readOnlyWeight=0 never advances the streak', () => {
+  const state = createState()
+  const config = cfg({ readOnlyWeight: 0 })
+  for (let i = 0; i < 20; i += 1) expect(observeRequest(state, config, [u('Read')]).remind).toBe(false)
+  expect(state.streak).toBe(0)
+  expect(state.requests).toBe(20)
 })

@@ -9,6 +9,8 @@ export type Config = {
   gptSource?: string
   /** GPT 模型名的显示：true（默认）只显示裸模型名，false 显示 '供应商id/模型'。发给 CPA 的 model 一直带前缀。 */
   gptHidePrefix?: boolean
+  /** DS（flash / pro）每日 token 上限；0 或缺省 = 不设上限，只统计不提醒。 */
+  dsDailyLimit?: number
 }
 
 export const TIERS: readonly Tier[] = ['flash', 'pro']
@@ -26,6 +28,7 @@ export const SEED: Config = {
   },
   gptSource: '',
   gptHidePrefix: true,
+  dsDailyLimit: 0,
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -64,6 +67,11 @@ export const normalize = (raw: unknown): Config => {
     gptSource: wanted !== '' && providers.some(p => p.id === wanted) ? wanted : '',
     // 只有明确写了 false 才显示前缀；旧配置没有这个字段，按默认（隐藏）处理。
     gptHidePrefix: raw.gptHidePrefix !== false,
+    // 每日上限是用户估的数：旧配置没有就是 0（不设上限），负数/垃圾值也按不设上限。
+    dsDailyLimit:
+      typeof raw.dsDailyLimit === 'number' && Number.isFinite(raw.dsDailyLimit)
+        ? Math.max(0, Math.round(raw.dsDailyLimit))
+        : 0,
   }
 }
 
@@ -172,6 +180,11 @@ export const setGptSource = (config: Config, providerId: string): Result => {
 
 export const setGptHidePrefix = (config: Config, hide: boolean): Result => ({
   config: { ...config, gptHidePrefix: hide },
+})
+
+/** 0 = 不设上限（只统计）。 */
+export const setDsDailyLimit = (config: Config, limit: number): Result => ({
+  config: { ...config, dsDailyLimit: Math.max(0, Math.round(limit)) },
 })
 
 export const maskKey = (key: string): string =>

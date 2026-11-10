@@ -1,7 +1,6 @@
 import type { Register } from 'claude-code'
 
 const RUNNER = __RUNNER__
-const RG = __RG__
 // Read-only mode (PTC_RUN_READONLY=1): the hook starts this broker instead of the runner; the broker runs the runner
 // under the Node permission model and executes rg for it (see src/broker.js). The runner travels inside its input JSON.
 const BROKER = __BROKER__
@@ -242,7 +241,12 @@ export const register: Register = on => {
     // error that came near the deadline is a timeout, anything sooner is reported as itself.
     let startedAt = Date.now()
     try {
-      const payload = { cwd, code: input.code, rg: RG, scope, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, dedup: dedupOn, dedupTag, dedupReset: !dedupLive, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
+      // ripgrep lives in this mod's own directory: the engine hands it over as `$.plugin.root` (a property,
+      // absolute). A host without that field (or an unusual root) simply omits the field below, and the runner/broker
+      // fall back to PTC_RUN_RG, the installed skills path and PATH -- the generated hook never bakes a path in.
+      const pluginRoot = $.plugin.root
+      const bundledRg = typeof pluginRoot === 'string' && pluginRoot !== '' ? pluginRoot.replace(/[\\/]+$/, '') + '/bin/rg.exe' : undefined
+      const payload = { cwd, code: input.code, ...(bundledRg ? { rg: bundledRg } : {}), scope, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, dedup: dedupOn, dedupTag, dedupReset: !dedupLive, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
       startedAt = Date.now()
       const r = await $.process.run(['node', '-e', BOOT], {
         cwd,

@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'delegate-cpa-test-'))
 const keyFile=path.join(dir,'mgmt.key');fs.writeFileSync(keyFile,'fake-management-secret')
 const state={'openai-compatibility':[{name:'other',prefix:'other','base-url':'https://other.example/v1',keys:[{'api-key':'fake-other-secret'}],models:[{name:'old',alias:'old'}]}],codex:[],claude:[]}
@@ -74,6 +75,7 @@ try {
   const before=JSON.stringify(state);await assert.rejects(()=>execute('save',{id:'bad/id',protocol:'chat',baseUrl:base,models:[]}));assert.equal(JSON.stringify(state),before)
  })
  await test('CLI emits safe JSON for malformed stdin without echoing input',async()=>{
-  const c=spawn(process.execPath,['scripts/cpa-admin.mjs','save'],{stdio:['pipe','pipe','pipe']});let out='';c.stdout.on('data',d=>out+=d);c.stderr.resume();c.stdin.end('{"key":"do-not-echo-this-secret"');const code=await new Promise(r=>c.on('close',r));assert.equal(code,1);assert.equal(JSON.parse(out).ok,false);assert.ok(!out.includes('do-not-echo-this-secret'))
+  const scriptPath=fileURLToPath(new URL('../scripts/cpa-admin.mjs',import.meta.url))
+  const c=spawn(process.execPath,[scriptPath,'save'],{stdio:['pipe','pipe','pipe'],cwd:dir});let out='';c.stdout.on('data',d=>out+=d);c.stderr.resume();c.stdin.end('{"key":"do-not-echo-this-secret"');const code=await new Promise(r=>c.on('close',r));assert.equal(code,1);assert.equal(JSON.parse(out).ok,false);assert.ok(!out.includes('do-not-echo-this-secret'))
  })
 } finally { await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true}) }

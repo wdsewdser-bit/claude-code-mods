@@ -1,5 +1,5 @@
-# Written by the engine when it loads a mod.
-.claude-plugin/types/
+# Written by the engine when it loads a mod: every mod gets its own .claude-plugin/types/.
+**/.claude-plugin/types/
 node_modules/
 *.bak-*
 # Local tooling.
@@ -10,10 +10,10 @@ node_modules/
 /ctx-mod/NOTES-dev.md
 /ctx-mod/REVIEW-*.md
 # Dev leftovers inside each mod.
+*.pre-*
 *.bak
 *.bak-*
 *.dedup-v1
 dryrun.log
 /ptc-run/bin/
-.claude-plugin/types/
 phase0/

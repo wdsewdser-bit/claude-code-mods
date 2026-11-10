@@ -9,7 +9,7 @@
 | 请求里有什么 | 对计数 |
 | --- | --- |
 | 派发：`Agent`、`Task`、`SendMessage`、`mcp__delegate__delegate_flash/pro` | 清零，并给 3 批只读验收宽限 |
-| 执行：`Read/Grep/Glob/Bash/PowerShell/Edit/MultiEdit/Write/NotebookEdit/BashOutput/mcp__ptc-run__run_code` | +1（宽限期内全是 Read/Grep/Glob 的批次不计） |
+| 执行：`Read/Grep/Glob/Bash/PowerShell/Edit/MultiEdit/Write/NotebookEdit/BashOutput/mcp__ptc-run__run_code` | +1；全是只读的执行请求 +`readOnlyWeight`（默认 0.5）（宽限期内全是 Read/Grep/Glob 的批次不计） |
 | 簿记：`mcp__ccd_turn__update_plan/wrap_up`、`mcp__ctx-mod__context/history/ledger_append/ledger_read` | 不变，也不清零 |
 | 其他（WebFetch、浏览器、LSP、AskUserQuestion、纯文本） | 不变，也不清零 |
 
@@ -17,6 +17,7 @@
 
 - 第 4 个连续执行请求（`remindAt`）：在 `classic.PostToolBatch` 里注入一次提醒，本段只提醒一次。
 - 第 8 个连续执行请求（`denyAt`）：该请求里的第一个执行类 `tool.call` 被拒一次，本段只拒一次，重试即放行。
+- **只读按半个计**：一个请求里的执行类调用全是只读的，就按 `readOnlyWeight`（默认 0.5）计入连续请求数：8 个纯只读请求才提醒、16 个才拦；提醒/拦截文案里的 N 仍是实际请求数，不是加权值。只读指 `Read/Grep/Glob/BashOutput`，以及 Bash/PowerShell 里每一段命令都是只读命令（如 `git status && git diff`、`cat a | grep b`；写文件的重定向、`$(`、反引号、`xargs`、`sudo`、`rm/mv/cp/tee`、跑测试/构建都不算），或 run_code 代码里没有调用写/执行工具。
 - 用户新消息、`session.start/end`、任何派发都会清零。
 - 只能主会话做的事不计：`claude --version/--print/--doctor`、`--inspect`、`debugpy/gdb/lldb`、`-it`/`--interactive`、`chrome/msedge/playwright` 这类 Bash 或 run_code 输入，以及本来就不在执行类里的浏览器、LSP、AskUserQuestion。
 
@@ -33,6 +34,8 @@
 | `denyAt` | 8 | 连续第几个执行请求后拦一次 |
 | `agentPerHour` | 3 | 一小时内允许派几个 Claude 子代理 |
 | `grace` | 3 | 派发之后几批只读验收不计 |
+| `denyCooldownMinutes` | 15 | 一次软拦截后多少分钟内不再拦（新连续段仍然提醒）；0 取消冷却 |
+| `readOnlyWeight` | 0.5 | 全只读的执行请求按多少计入连续请求数；1 = 与旧行为一致，0 = 只读请求不计数 |
 
 环境变量（启动 Claude Code 时给）：`DISPATCH_GATE=0` 整段关掉，`DISPATCH_GATE_MODE=off|remind|soft` 覆盖 `mode`。
 
@@ -56,7 +59,7 @@ claude plugin test dispatch-gate
 离线回放（不调模型、不联网，只读转录）：
 
 ```
-node dispatch-gate/scripts/replay.ts [--mode off|remind|soft] [--remind-at N] [--deny-at N] [--agent-per-hour N] [--json] <transcript.jsonl>...
+node dispatch-gate/scripts/replay.ts [--mode off|remind|soft] [--remind-at N] [--deny-at N] [--agent-per-hour N] [--read-only-weight N] [--json] <transcript.jsonl>...
 ```
 
 它按主会话的请求走同一套状态机，打印 L1 提醒、L2 拦截和每次 Claude 子代理派发（被拒的标 `REFUSED`）。子代理自己的转录在 sidechain 文件里，所以主会话转录正好是主线程的请求。

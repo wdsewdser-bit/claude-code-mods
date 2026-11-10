@@ -2,7 +2,7 @@
 
 Claude Code mod（function hooks 插件）：让长会话跨多个上下文窗口继续干活，而不靠模型写摘要。它给模型一本任务账本和一份可检索的完整历史，换窗口时由代码拼出交接信息，不调用模型。
 
-状态：实验性，0.1.0。针对 Claude Code 2.1.29x 的 Mods API 开发和测试。给模型看的工具说明和交接文字目前是中文。
+状态：实验性，0.2.0。针对 Claude Code 2.1.29x 的 Mods API 开发和测试。给模型看的工具说明和交接文字目前是中文。
 
 ## 它做什么
 
@@ -21,7 +21,7 @@ Claude Code mod（function hooks 插件）：让长会话跨多个上下文窗�
 /plugin install ctx-mod --marketplace wdsewdser-bit/claude-code-mods
 ```
 
-装好后默认什么都不做。只有启动 Claude Code 时带着环境变量 `CTX_MOD=1`，它才会注册工具并接管换窗：
+装好后默认什么都不做。启动 Claude Code 时带着环境变量 `CTX_MOD=1`，或在插件配置里把 `enabled` 设为 `true`，它才会注册工具并接管换窗：
 
 ```
 # macOS / Linux
@@ -30,6 +30,8 @@ CTX_MOD=1 claude
 # Windows PowerShell
 $env:CTX_MOD = '1'; claude
 ```
+
+也可以不设环境变量，在插件配置里把 `enabled` 设为 `true`（插件配置界面，或 settings 里的 `pluginConfigs`）。环境变量优先：`CTX_MOD=1` 开、`CTX_MOD=0` 关，未设时才看 `enabled`。`enabled` 默认 `false`，所以不配置时行为与只认 `CTX_MOD=1` 时完全相同。
 
 ## 模型得到的工具
 
@@ -46,12 +48,12 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 
 | 命令 | 作用 |
 | --- | --- |
-| `/ctx-mod` | 显示是否启用和当前用量；未设 `CTX_MOD=1` 时只提示如何启用 |
+| `/ctx-mod` | 显示是否启用和当前用量，以及被改过默认值的配置；未启用时只提示如何启用 |
 | `/ctx-mod switch` | 立即换到新窗口，不调用模型 |
 
 ## 什么时候换窗
 
-默认按 40 万 token 的窗口算，上下文到 25 万、30 万、35 万 token 时分三级提醒：到 25 万时，如果任务刚告一段落就换窗；到 30 万时，边做边记账、到下一个任务边界换窗；到 35 万时，立刻准备换窗。三档是绝对 token 数，不随上限变化，但都不会晚于上限减 3 万——上限只有 30 万时，30 万和 35 万两档都落在 27 万。故意放得晚：换窗会丢掉工作细节，所以尽量把一个窗口用完。
+默认按 40 万 token 的窗口算，上下文到 20 万、30 万、35 万 token 时分三级提醒：到 20 万时，如果任务刚告一段落就换窗；到 30 万时，边做边记账、到下一个任务边界换窗；到 35 万时，立刻准备换窗。三档是绝对 token 数，不随上限变化，但都不会晚于上限减 3 万——上限只有 30 万时，30 万和 35 万两档都落在 27 万。故意放得晚：换窗会丢掉工作细节，所以尽量把一个窗口用完。
 
 - 模型自己申请换窗，要求距上次换窗至少 30 次模型请求（按真实模型请求计，不按工具调用计；上下文到 20 万 token 时不受此限），每小时最多 4 次；账本要新，即最近一次用户请求之后本窗口有记账，且之后的工具结果不超过 5 个。否则申请被拒，并告诉模型原因。
 - 引擎自动压缩时由 mod 接管，用交接信息代替摘要。账本不新，或者之后有超过 25 个没记账的工具结果时，把摘要交还给引擎。
@@ -62,7 +64,26 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 
 - 冷缓存换窗前，先把 cache-keeper 保活看到的任务状态写进账本：它发布在 `cache-keeper.snapshot`（`{ at, entries }`），每次覆盖上一份，这里只认最新那份。`at` 不早于最后一次真实主线程请求、且这份快照没被消费过，就逐条 `ledger_append`，`text` 以「保活快照：」开头；单条没通过校验（比如 in_progress 缺 next_step）只跳过那一条，写失败只记日志，都不挡住换窗。每份快照只消费一次。
 
-这些数字都在 `hooks/lib/types.ts` 的 `DEFAULTS` 里。
+## 配置
+
+下面这些阈值可以在插件配置里改，也可以用同名的大写环境变量改（环境变量优先）。
+
+| 选项 | 环境变量 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `enabled` | `CTX_MOD` | `false` | 不设环境变量时是否启用；`CTX_MOD=1` 开、`CTX_MOD=0` 关，环境变量优先 |
+| `compactWindow` | `CTX_MOD_COMPACT_WINDOW` | `400000` | 引擎没报告自动压缩阈值时，按多大的窗口算 |
+| `boundaryTokens` | `CTX_MOD_BOUNDARY_TOKENS` | `200000` | 一级提醒：上下文到这么多 token 时，任务告一段落就换窗 |
+| `softTokens` | `CTX_MOD_SOFT_TOKENS` | `300000` | 二级提醒：边做边记账，到下一个任务边界换窗 |
+| `urgentTokens` | `CTX_MOD_URGENT_TOKENS` | `350000` | 三级提醒：立刻准备换窗 |
+| `cooldownRequests` | `CTX_MOD_COOLDOWN_REQUESTS` | `30` | 两次换窗之间至少经过多少次模型请求；`0` 去掉冷却 |
+| `maxSwitchesPerHour` | `CTX_MOD_MAX_SWITCHES_PER_HOUR` | `4` | 每小时最多换几次窗；`0` 表示不再批准换窗 |
+| `coldMinTokens` | `CTX_MOD_COLD_MIN_TOKENS` | `80000` | 缓存已过期时，上下文超过多少 token 才扣下消息、先换窗 |
+| `gateMinTokens` | `CTX_MOD_GATE_MIN_TOKENS` | `120000` | 上下文超过多少 token 时，加载会重建缓存的工具组之前先换窗 |
+
+- 配置只在会话启动时读一次。取值必须是有限正数（`cooldownRequests`、`maxSwitchesPerHour` 可以是 `0`）；读不到或数值非法时回退默认值，不会报错。
+- 三档提醒必须满足 `boundaryTokens ≤ softTokens ≤ urgentTokens`；不满足时三档整组回退默认值，并在调试日志里记一条。
+- 想更早换窗（例如上下文到 16–20 万就换），把三档一起调低，比例和默认差不多：比如 `boundaryTokens=160000`、`softTokens=180000`、`urgentTokens=200000`。代价是换窗更频繁：每换一次都只带走账本里记下的东西和磁盘上的文件，没记账的中间结论会丢，缓存也要整段重建。调低之前先让账本保持新。
+- 其余阈值仍是 `hooks/lib/types.ts` 里 `DEFAULTS` 的内部常量，不对外开放。`/ctx-mod` 会把与默认值不同的配置列出来；全是默认时不多输出任何东西。
 
 ## 数据放在哪
 

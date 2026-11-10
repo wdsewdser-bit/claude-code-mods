@@ -36,6 +36,9 @@ export type JobRecord = {
   owner?: string
 }
 
+/** 整次运行的 token 分项（runner 从流里累加；DS 每日用量用）。 */
+export type JobUsage = { input: number; cacheRead: number; cacheWrite: number; output: number }
+
 /** runner 写的 status.json，读到什么算什么（写端非原子，字段可能缺）。 */
 export type JobStatusFile = {
   jobId?: string
@@ -51,6 +54,8 @@ export type JobStatusFile = {
   outputTokens?: number
   /** 最近一次请求的真实输入（runner 从 message_delta 取；事件流里的是 CPA 预估，偏大）。 */
   contextTokens?: number
+  /** 整次运行的输入分项 + 输出；拿不到就是没有这个字段（未知，不是 0）。 */
+  usage?: JobUsage
   /** 后台作业最近一次请示主会话：seq 递增，主会话靠它去重；正文已由 runner 截到 4000 字。 */
   ask?: { seq: number; text: string; at: number }
   /** runner 等回复的时长（毫秒，0 = 这个作业不支持请示）；通知里用它算“几分钟内没有回复”。 */
@@ -229,10 +234,19 @@ const askOf = (v: unknown): { seq: number; text: string; at: number } | undefine
   return { seq, text: str(v.text), at: num(v.at) ?? 0 }
 }
 
+const jobUsageOf = (v: unknown): JobUsage | undefined => {
+  if (!isRecord(v)) return undefined
+  const count = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) && x >= 0 ? Math.round(x) : 0)
+  const usage = { input: count(v.input), cacheRead: count(v.cacheRead), cacheWrite: count(v.cacheWrite), output: count(v.output) }
+
+  return usage.input + usage.cacheRead + usage.cacheWrite + usage.output > 0 ? usage : undefined
+}
+
 export const normalizeStatus = (raw: unknown): JobStatusFile | undefined => {
   if (!isRecord(raw)) return undefined
   const ask = askOf(raw.ask)
   const askWaitMs = num(raw.askWaitMs)
+  const usage = jobUsageOf(raw.usage)
 
   return {
     ...(str(raw.jobId) === '' ? {} : { jobId: str(raw.jobId) }),
@@ -246,6 +260,7 @@ export const normalizeStatus = (raw: unknown): JobStatusFile | undefined => {
     lastText: str(raw.lastText),
     ...(num(raw.outputTokens) === undefined || num(raw.outputTokens)! < 0 ? {} : { outputTokens: num(raw.outputTokens) }),
     ...(num(raw.contextTokens) === undefined || num(raw.contextTokens)! <= 0 ? {} : { contextTokens: num(raw.contextTokens) }),
+    ...(usage === undefined ? {} : { usage }),
     ...(ask === undefined ? {} : { ask }),
     ...(askWaitMs === undefined || askWaitMs < 0 ? {} : { askWaitMs }),
     startedAt: num(raw.startedAt),

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
+import { register } from '../hooks/register.ts'
 
 // The hook is the only place that reads the environment, so this file tests it: PTC_RUN_READ_ROOTS (delegate's
 // readPaths) must reach the broker payload as an array of absolute directories, and the read-only description must
@@ -185,3 +186,60 @@ describe('read dedup handshake (PTC_RUN_READ_DEDUP)', () => {
   })
 })
 
+// The bundled ripgrep travels to the runner and the read-only broker as `rg`, taken from `$.plugin.root` (a
+// property on the real engine). A host without it must simply omit the field: the runner/broker then fall back to
+// PTC_RUN_RG, the installed skills path and PATH, and nothing may throw.
+const hookWithFakeEngine = (plugin: { root: string }) => {
+  const handlers: { name: string; fn: (...args: unknown[]) => unknown }[] = []
+  const on = (name: string, a: unknown, b?: unknown) => {
+    const fn = (typeof a === 'function' ? a : b) as (...args: unknown[]) => unknown
+    handlers.push({ name, fn })
+    const chain = { catch: () => chain }
+    return chain
+  }
+  ;(register as unknown as (o: unknown) => void)(on)
+  const payloads: Record<string, unknown>[] = []
+  const env: Record<string, string> = { PTC_RUN_READONLY: '1' }
+  const $ = {
+    plugin,
+    env: { get: async (n: unknown) => env[String(n)] },
+    session: { cwd: async () => 'C:/work/proj', id: async () => 'sid-rg', messages: async () => [] },
+    tool: { register: async () => ({}) },
+    process: {
+      run: async (_argv: unknown, init: { stdin: string }) => {
+        payloads.push(JSON.parse(init.stdin.split('\n')[0]))
+        return { exitCode: 0, stdout: 'ok', stderr: '' }
+      },
+    },
+  }
+  const call = async () => {
+    const start = handlers.find((h) => h.name === 'session.start')
+    await start?.fn($, { cwd: 'C:/work/proj' }, async () => ({}))
+    const tool = handlers.find((h) => h.name === 'tool.call')
+    await tool?.fn($, { code: 'return 1', description: 'x', tool_use_id: 'toolu_rg' })
+    return payloads[0]
+  }
+  return { call }
+}
+
+describe('bundled ripgrep (plugin.root)', () => {
+  test('the payload carries this mod\'s own bin/rg.exe', { timeoutMs: 20_000 }, async () => {
+    const payload = await hookWithFakeEngine({ root: 'C:/plugins/ptc-run/' }).call()
+    expect(payload?.rg).toBe('C:/plugins/ptc-run/bin/rg.exe')
+  })
+
+  test('an empty plugin root omits the field and nothing throws', { timeoutMs: 20_000 }, async () => {
+    const payload = await hookWithFakeEngine({ root: '' }).call()
+    expect(payload === undefined ? undefined : 'rg' in payload).toBe(false)
+    expect(payload?.readRoots).toEqual([])
+  })
+
+  test('the engine supplies $.plugin.root and the payload rg comes from it', { timeoutMs: 20_000 }, async ($, on) => {
+    const t = wire($ as never, on as never, {})
+    await t.start()
+    await t.call()
+    const rg = t.payloads[0]?.rg
+    expect(typeof rg).toBe('string')
+    expect(String(rg).replace(/\\/g, '/')).toMatch(/\/bin\/rg\.exe$/)
+  })
+})

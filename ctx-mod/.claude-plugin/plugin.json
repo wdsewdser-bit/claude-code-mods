@@ -1,7 +1,63 @@
 {
   "name": "ctx-mod",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Proactive context management: a task ledger, a searchable history and zero-summary window switches.",
   "author": { "name": "yadaz" },
-  "dependencies": ["cache-keeper"]
+  "dependencies": ["cache-keeper"],
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "description": "Turn the plugin on without the CTX_MOD=1 environment variable. CTX_MOD wins when set: 1 turns it on, 0 turns it off. Off by default, so an unconfigured install behaves as before.",
+      "default": false
+    },
+    "compactWindow": {
+      "type": "number",
+      "title": "Assumed window (tokens)",
+      "description": "The context window assumed when the engine reports no auto-compact threshold.",
+      "default": 400000
+    },
+    "boundaryTokens": {
+      "type": "number",
+      "title": "First reminder (tokens)",
+      "description": "Context fill, in tokens, at which the first reminder fires: switch at the next task boundary.",
+      "default": 200000
+    },
+    "softTokens": {
+      "type": "number",
+      "title": "Second reminder (tokens)",
+      "description": "Context fill, in tokens, at which the second reminder fires: record progress as you go and switch at the next task boundary.",
+      "default": 300000
+    },
+    "urgentTokens": {
+      "type": "number",
+      "title": "Third reminder (tokens)",
+      "description": "Context fill, in tokens, at which the third reminder fires: prepare to switch at once.",
+      "default": 350000
+    },
+    "cooldownRequests": {
+      "type": "number",
+      "title": "Cooldown (model requests)",
+      "description": "Model requests that must pass between two window switches. 0 lifts the cooldown.",
+      "default": 30
+    },
+    "maxSwitchesPerHour": {
+      "type": "number",
+      "title": "Switches per hour",
+      "description": "Window switches allowed in one rolling hour. 0 approves none.",
+      "default": 4
+    },
+    "coldMinTokens": {
+      "type": "number",
+      "title": "Cold-cache switch above (tokens)",
+      "description": "With an expired cache, the context fill above which a prompt is held back and the window switched first.",
+      "default": 80000
+    },
+    "gateMinTokens": {
+      "type": "number",
+      "title": "Load gate above (tokens)",
+      "description": "Context fill above which a load that would rebuild the cached prefix switches the window first. The same group is held back once per window.",
+      "default": 120000
+    }
+  }
 }

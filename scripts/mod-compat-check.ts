@@ -22,11 +22,14 @@
  *
  * usage
  *   node scripts/mod-compat-check.ts [options]
- *     --claude PATH   claude binary (default: this machine's npm install)
+ *     --claude PATH   claude binary (default: resolved at run time: CLAUDE_BIN, then
+ *                     `where claude` / `which claude`, then the npm global package's real
+ *                     binary under <npm root -g>/@anthropic-ai/claude-code/bin/)
  *     --mods DIR      mods repository root (default: parent of scripts/)
  *     --contract FILE engine-generated plugin API declarations (default: the
- *                     newest .claude-plugin/types/claude-code/index.d.ts the
- *                     engine laid beside an installed local mod)
+ *                     newest .claude-plugin/types/claude-code/index.d.ts among
+ *                     the mods under --mods, else the newest one the engine
+ *                     laid beside an installed local mod)
  *     --json FILE     write a machine-readable report as well
  *     --strict        also exit 1 when an item is merely suspicious
  *     --quiet         summary only
@@ -41,8 +44,6 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-const DEFAULT_CLAUDE =
-  'C:/Users/yadaz/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe'
 const SOURCE_EXT = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs'])
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out',
                            '.cache', 'coverage', '.turbo', '.next'])
@@ -243,13 +244,12 @@ function lastSegment(token: string): string {
   return dot === -1 ? token : token.slice(dot + 1)
 }
 
-/** Newest engine-laid contract beside an installed local mod, or ''. */
-function defaultContract(): string {
-  const base = path.join(os.homedir(), '.claude', 'plugins', 'cache', 'local-mods')
+/** Newest <dir>/.claude-plugin/types/claude-code/index.d.ts at most maxDepth levels below base, or ''. */
+function newestContractUnder(base: string, maxDepth: number): string {
   let best = ''
   let bestTime = -1
   const walk = (dir: string, depth: number) => {
-    if (depth > 3) return
+    if (depth > maxDepth) return
     let entries: fs.Dirent[]
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true })
@@ -273,6 +273,15 @@ function defaultContract(): string {
   }
   walk(base, 0)
   return best
+}
+
+/**
+ * The engine contract to read: the newest declarations the engine laid beside a mod in this repository
+ * (.claude-plugin/types/ is gitignored but on disk), otherwise the newest one beside an installed local mod.
+ */
+function defaultContract(modsRoot: string): string {
+  return newestContractUnder(modsRoot, 1) ||
+    newestContractUnder(path.join(os.homedir(), '.claude', 'plugins', 'cache', 'local-mods'), 3)
 }
 
 /** Member names the contract declares (`name:`, `name?:`, `name(`). */
@@ -351,9 +360,67 @@ function claudeVersion(binary: string): string {
   return 'unknown'
 }
 
+/** npm's global module root ("" when npm is unavailable). */
+function npmGlobalRoot(): string {
+  const result = spawnSync('npm', ['root', '-g'], {
+    encoding: 'utf8',
+    timeout: 60000,
+    shell: process.platform === 'win32',
+  })
+  if (result.status !== 0) return ''
+  const lines = String(result.stdout || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  return lines.length ? lines[lines.length - 1] : ''
+}
+
+/** The real executable inside a claude-code package's bin/ directory, or "". */
+function realClaudeBinary(dir: string): string {
+  const names = process.platform === 'win32' ? ['claude.exe', 'claude'] : ['claude', 'claude.exe']
+  for (const name of names) {
+    const file = path.join(dir, name)
+    try {
+      if (fs.statSync(file).isFile()) return file
+    } catch { /* keep looking */ }
+  }
+  return ''
+}
+
+/**
+ * Where the claude binary is on this machine, without any machine-specific path in the source:
+ * CLAUDE_BIN, then PATH (a shim such as .cmd/.ps1 or a bare name is not the binary), then the npm
+ * global package's bin/. Returns { bin, source }; bin is "" when nothing usable was found.
+ */
+function resolveClaude(): { bin: string; source: string } {
+  const fromEnv = String(process.env.CLAUDE_BIN || '').trim()
+  if (fromEnv) {
+    try {
+      if (fs.statSync(fromEnv).isFile()) return { bin: fromEnv, source: 'CLAUDE_BIN' }
+    } catch { /* fall through */ }
+    return { bin: '', source: 'CLAUDE_BIN points at nothing: ' + fromEnv }
+  }
+  const finder = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['claude'], {
+    encoding: 'utf8',
+    timeout: 30000,
+  })
+  const onPath = String(finder.stdout || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  for (const file of onPath) {
+    // A .cmd / .ps1 wrapper or an extensionless shim only launches the real binary.
+    if (process.platform === 'win32' ? !/\.exe$/i.test(file) : path.extname(file) !== '') continue
+    try {
+      if (fs.statSync(file).isFile()) return { bin: file, source: 'PATH' }
+    } catch { /* keep looking */ }
+  }
+  const root = npmGlobalRoot()
+  if (root) {
+    const bin = realClaudeBinary(path.join(root, '@anthropic-ai', 'claude-code', 'bin'))
+    if (bin) return { bin, source: 'npm root -g' }
+    return { bin: '', source: 'no @anthropic-ai/claude-code/bin under ' + root }
+  }
+  return { bin: '', source: 'not on PATH and npm root -g failed' }
+}
+
 function parseArgs(argv: string[]) {
   const options = {
-    claude: DEFAULT_CLAUDE,
+    claude: '',
     contract: '',
     mods: path.resolve(path.dirname(process.argv[1] || '.'), '..'),
     json: '',
@@ -382,8 +449,20 @@ function parseArgs(argv: string[]) {
 
 function main(): number {
   const options = parseArgs(process.argv.slice(2))
+  let source = '--claude'
+  if (!options.claude) {
+    const resolved = resolveClaude()
+    if (!resolved.bin) {
+      console.error('cannot find the claude binary (' + resolved.source + ').')
+      console.error('Pass --claude PATH or set CLAUDE_BIN, e.g. ' +
+                    '--claude "<npm root -g>/@anthropic-ai/claude-code/bin/claude.exe"')
+      return 2
+    }
+    options.claude = resolved.bin
+    source = resolved.source
+  }
   if (!fs.existsSync(options.claude)) {
-    console.error('claude binary not found: ' + options.claude)
+    console.error('claude binary not found: ' + options.claude + ' (' + source + ')')
     return 2
   }
   if (!fs.existsSync(options.mods)) {
@@ -420,7 +499,7 @@ function main(): number {
   }
 
   const { names, files: declFiles } = declaredNames(mods)
-  const contractFile = options.contract || defaultContract()
+  const contractFile = options.contract || defaultContract(options.mods)
   const contract = contractMembers(contractFile)
   const findings = classify(tokens, counts, names, contract)
   // Test-only usages are reported but never fail the check: mocks are

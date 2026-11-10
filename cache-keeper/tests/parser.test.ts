@@ -235,6 +235,46 @@ describe('apiEquivalentCost', () => {
     expect(apiEquivalentCost('some-other-model', usage, null, '5m').usd).toBeNull()
   })
 
+  test('matches each generation without a shorter id shadowing it', () => {
+    const readOnly = {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_input_tokens: 1_000_000,
+      cache_creation_input_tokens: 0,
+    }
+    const readPrice = (model: string): number | null =>
+      apiEquivalentCost(model, readOnly, null, '5m').usd
+    expect(readPrice('claude-fable-5-2')).toBe(0.2)
+    expect(readPrice('claude-mythos-5-2')).toBe(0.2)
+    expect(readPrice('claude-fable-5-1')).toBe(0.25)
+    expect(readPrice('claude-mythos-5-1')).toBe(0.25)
+    expect(readPrice('claude-fable-5')).toBe(1)
+    expect(readPrice('claude-fable-5-20260101')).toBe(1)
+    expect(readPrice('claude-opus-5')).toBe(0.5)
+    expect(readPrice('claude-opus-5-5')).toBe(0.2)
+    expect(readPrice('claude-sonnet-5')).toBe(0.2)
+    expect(readPrice('claude-sonnet-5-5')).toBe(0.1)
+    expect(readPrice('some-other-model')).toBeNull()
+  })
+
+  test('prices Fable 5.2 from the split', () => {
+    const oneHour = { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 1_000_000 }
+    const fiveMinutes = { ephemeral_5m_input_tokens: 1_000_000, ephemeral_1h_input_tokens: 0 }
+    const micro = (usd: number | null): number => Math.round((usd ?? 0) * 1_000_000)
+    const hourly = apiEquivalentCost('claude-fable-5-2', usage, oneHour, null)
+    expect(hourly.basis).toBe('split')
+    // 1M input at $8, 1M output at $40, 1M read at $0.2, 1M 1h write at $16
+    expect(micro(hourly.usd)).toBe(64_200_000)
+    // the same write on the 5m row is $10, not $16
+    expect(micro(apiEquivalentCost('claude-fable-5-2', usage, fiveMinutes, '1h').usd)).toBe(
+      58_200_000,
+    )
+    expect(breakEvenKeepalives('claude-fable-5-2', '5m')).toBe(49)
+    expect(breakEvenKeepalives('claude-fable-5-2', '1h')).toBe(79)
+    expect(breakEvenKeepalives('claude-opus-5', '5m')).toBe(11)
+    expect(breakEvenKeepalives('claude-mythos-5', '1h')).toBe(19)
+  })
+
   test('break-even keepalives follow the price table', () => {
     expect(breakEvenKeepalives('claude-opus-5-5', '5m')).toBe(24)
     expect(breakEvenKeepalives('claude-opus-5-5', '1h')).toBe(39)
