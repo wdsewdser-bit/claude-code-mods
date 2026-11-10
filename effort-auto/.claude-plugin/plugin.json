@@ -1,0 +1,32 @@
+{
+  "name": "effort-auto",
+  "version": "0.3.0",
+  "description": "Adaptive thinking effort for the main conversation only: rest at low, raise it by steps when judgement is needed.",
+  "author": { "name": "yadaz" },
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "description": "Turn the plugin on. When off it changes no request, injects no rules and registers no tool.",
+      "default": false
+    },
+    "maxRaises": {
+      "type": "number",
+      "title": "Raises per turn",
+      "description": "How many effort raises one turn accepts; the ones past it are ignored with a message to the model.",
+      "default": 4
+    },
+    "maxHighSteps": {
+      "type": "number",
+      "title": "Steps per raise to high",
+      "description": "The longest one raise to high or xhigh may last.",
+      "default": 5
+    },
+    "logPath": {
+      "type": "string",
+      "title": "Log path",
+      "description": "The JSONL file that records every step. Empty: ~/.claude/effort-auto/steps-<session>.jsonl.",
+      "default": ""
+    }
+  }
+}
