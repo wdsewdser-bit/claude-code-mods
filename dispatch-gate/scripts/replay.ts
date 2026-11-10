@@ -174,7 +174,7 @@ const replay = (file: string, config: Config): Report => {
     const uses = event.uses
 
     report.requests += 1
-    const outcome = observeRequest(state, config, uses, undefined, at)
+    const outcome = observeRequest(state, config, uses)
     report[outcome.kind] += 1
     if (outcome.remind) report.reminds.push({ at: stamp, streak: state.streak })
 

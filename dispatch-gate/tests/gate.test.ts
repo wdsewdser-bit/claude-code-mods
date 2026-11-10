@@ -30,7 +30,7 @@ test('classify: dispatch beats execution beats bookkeeping', () => {
   expect(classify([u('Read')])).toBe('exec')
   expect(classify([u('Read'), u('mcp__ctx-mod__ledger_append')])).toBe('exec')
   expect(classify([u('Read'), u('Agent')])).toBe('dispatch')
-  expect(classify([u('mcp__delegate__delegate_flash')])).toBe('dispatch')
+  expect(classify([u('mcp__delegate__delegate_pro')])).toBe('dispatch')
   expect(classify([u('SendMessage')])).toBe('dispatch')
   expect(classify([u('mcp__ccd_turn__update_plan')])).toBe('book')
   expect(classify([u('WebFetch')])).toBe('other')
@@ -66,56 +66,6 @@ test('the refusal arms at denyAt, once per streak, and disarms on use', () => {
   expect(judge(state, config, 'Edit', {}, NOW).deny === undefined).toBe(true)
   exec(state, config)
   expect(judge(state, config, 'Edit', {}, NOW).deny === undefined).toBe(true)
-})
-
-/** A stretch of n execution requests, all inside the same minute, from `at`. */
-const stretch = (state: State, config: Config, n: number, at: number): boolean[] => {
-  const reminds: boolean[] = []
-  for (let i = 0; i < n; i += 1) reminds.push(observeRequest(state, config, [u('Edit')], undefined, at + i).remind)
-
-  return reminds
-}
-
-test('one refusal starts a cooldown: the next stretch is reminded, not refused', () => {
-  const state = createState()
-  const config = cfg()
-  stretch(state, config, 8, NOW)
-  expect(state.armed).toBe(true)
-  expect(typeof judge(state, config, 'Edit', {}, NOW + 100).deny).toBe('string')
-  expect(state.lastDenyAt).toBe(NOW + 100)
-  // a person's message clears the count and the flags, never the clock
-  resetStreak(state, config)
-  expect(state.lastDenyAt).toBe(NOW + 100)
-  const reminds = stretch(state, config, 12, NOW + 60_000)
-  expect(reminds.filter(Boolean)).toHaveLength(1)
-  expect(state.streak).toBe(12)
-  expect(state.armed).toBe(false)
-  expect(judge(state, config, 'Edit', {}, NOW + 61_000).deny === undefined).toBe(true)
-})
-
-test('the cooldown is a window: past it, the next stretch refuses again', () => {
-  const state = createState()
-  const config = cfg()
-  stretch(state, config, 8, NOW)
-  judge(state, config, 'Edit', {}, NOW + 100)
-  resetStreak(state, config)
-  stretch(state, config, 8, NOW + 15 * 60_000 - 1)
-  expect(state.armed).toBe(false)
-  resetStreak(state, config)
-  stretch(state, config, 8, NOW + 15 * 60_000 + 100)
-  expect(state.armed).toBe(true)
-  expect(typeof judge(state, config, 'Edit', {}, NOW + 16 * 60_000).deny).toBe('string')
-})
-
-test('denyCooldownMinutes 0 refuses every stretch', () => {
-  const state = createState()
-  const config = cfg({ denyCooldownMinutes: 0 })
-  for (let round = 0; round < 3; round += 1) {
-    stretch(state, config, 8, NOW + round * 1000)
-    expect(state.armed).toBe(true)
-    expect(typeof judge(state, config, 'Edit', {}, NOW + round * 1000 + 50).deny).toBe('string')
-    resetStreak(state, config)
-  }
 })
 
 test('a dispatch clears the streak and leaves three read-only acceptance requests free', () => {
@@ -214,7 +164,7 @@ test('the subagent limit is a rolling hour', () => {
 test('delegating to DeepSeek is unlimited and clears the self-work count', () => {
   const state = createState()
   const config = cfg()
-  for (let i = 0; i < 10; i += 1) expect(judge(state, config, 'mcp__delegate__delegate_flash', {}, NOW + i).deny === undefined).toBe(true)
+  for (let i = 0; i < 10; i += 1) expect(judge(state, config, 'mcp__delegate__delegate_pro', {}, NOW + i).deny === undefined).toBe(true)
   for (let i = 0; i < 3; i += 1) exec(state, config)
   judge(state, config, 'mcp__delegate__delegate_flash', {}, NOW)
   expect(state.streak).toBe(0)
@@ -258,13 +208,7 @@ test('readConfig: defaults, overrides and the environment switch', () => {
     denyAt: 5,
     agentPerHour: 1,
     grace: 0,
-    denyCooldownMinutes: DEFAULTS.denyCooldownMinutes,
   })
-  expect(readConfig({ denyCooldownMinutes: 30 }).denyCooldownMinutes).toBe(30)
-  // never negative, never fractional; 0 is the cooldown lifted
-  expect(readConfig({ denyCooldownMinutes: -5 }).denyCooldownMinutes).toBe(0)
-  expect(readConfig({ denyCooldownMinutes: 2.7 }).denyCooldownMinutes).toBe(2)
-  expect(readConfig({ denyCooldownMinutes: 0 }).denyCooldownMinutes).toBe(0)
   expect(readConfig({ mode: 'nonsense', remindAt: 'x' }).mode).toBe('soft')
   expect(readConfig({ mode: 'nonsense', remindAt: 'x' }).remindAt).toBe(DEFAULTS.remindAt)
   expect(modeOf('OFF')).toBe('off')

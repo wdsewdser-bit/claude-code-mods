@@ -17,7 +17,6 @@
 
 - 第 4 个连续执行请求（`remindAt`）：在 `classic.PostToolBatch` 里注入一次提醒，本段只提醒一次。
 - 第 8 个连续执行请求（`denyAt`）：该请求里的第一个执行类 `tool.call` 被拒一次，本段只拒一次，重试即放行。
-- 冷却（`denyCooldownMinutes`，默认 15 分钟）：一次拒绝之后 15 分钟内，新的一段即使又走到 `denyAt` 也只提醒、不拒绝；超过 15 分钟才恢复。冷却计时**不随清零重置**——用户消息、派发清零照旧，但 `lastDenyAt` 不动；只有 `session.start` 才清。子代理每小时那条不受影响。
 - 用户新消息、`session.start/end`、任何派发都会清零。
 - 只能主会话做的事不计：`claude --version/--print/--doctor`、`--inspect`、`debugpy/gdb/lldb`、`-it`/`--interactive`、`chrome/msedge/playwright` 这类 Bash 或 run_code 输入，以及本来就不在执行类里的浏览器、LSP、AskUserQuestion。
 
@@ -32,7 +31,6 @@
 | `mode` | `soft` | `off` 什么都不做；`remind` 只提醒不拦；`soft` 提醒 + 两处软拦截 |
 | `remindAt` | 4 | 连续第几个执行请求后提醒 |
 | `denyAt` | 8 | 连续第几个执行请求后拦一次 |
-| `denyCooldownMinutes` | 15 | 一次拒绝后多少分钟内不再拒绝（只提醒）；0 表示不冷却 |
 | `agentPerHour` | 3 | 一小时内允许派几个 Claude 子代理 |
 | `grace` | 3 | 派发之后几批只读验收不计 |
 
