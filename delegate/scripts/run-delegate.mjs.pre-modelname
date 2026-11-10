@@ -1,0 +1,263 @@
+// One delegated job. Reads a JSON job on stdin, starts a local Anthropic->OpenAI
+// proxy for it, runs a headless Claude Code against that proxy and prints one
+// JSON line: { ok, text, turns, ms, usage } or { ok: false, error }.
+// The key travels on stdin and in the child's environment only; nothing is
+// written to disk. The proxy is always killed on the way out.
+import { spawn, spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import net from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const home = os.homedir()
+const venvPython = path.join(home, '.claude', 'delegate', 'venv', 'Scripts', 'python.exe')
+const READ_TOOLS = 'Read,Grep,Glob,WebFetch'
+const WORK_TOOLS = 'Read,Grep,Glob,WebFetch,Edit,Write,Bash'
+const PTC_TOOL = 'mcp__ptc-run__run_code'
+const PTC_SERVER = 'mcp__ptc-run'
+// ptc-only: the whole system prompt is replaced by DSH's PTC-only prompt (plus our SDK declarations) from this file.
+const PTC_ONLY_PROMPT = process.env.DELEGATE_PTC_PROMPT || path.join(here, 'ptc-only-system.md') // env override: A/B tests only
+// read + ptc: 'only': the same presentation with only read/glob/grep/ref declared; ptc-run runs read-only (PTC_RUN_READONLY=1).
+const PTC_RO_PROMPT = process.env.DELEGATE_PTC_RO_PROMPT || path.join(here, 'ptc-readonly-system.md')
+// Settings for ptc-only: no output style, no language line, and the plugins whose MCP instructions would show up
+// anyway are switched off (ptc-run must stay: run_code is a plugin tool, and --bare would drop it).
+const PTC_ONLY_SETTINGS = JSON.stringify({
+  outputStyle: 'default',
+  language: '',
+  enabledPlugins: { 'ctx-mod@skills-dir': false, 'delegate@skills-dir': false },
+})
+const BLOCKED_MCP = ['mcp__ctx-mod', 'mcp__delegate']
+
+const finish = (value, code = 0) => {
+  process.stdout.write(JSON.stringify(value) + '\n')
+  process.exit(code)
+}
+
+const readStdin = () =>
+  new Promise(resolve => {
+    let s = ''
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', d => (s += d))
+    process.stdin.on('end', () => resolve(s))
+  })
+
+const freePort = () =>
+  new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address()
+      srv.close(() => resolve(port))
+    })
+    srv.on('error', reject)
+  })
+
+const canConnect = port =>
+  new Promise(resolve => {
+    const sock = net.connect(port, '127.0.0.1')
+    sock.on('connect', () => (sock.destroy(), resolve(true)))
+    sock.on('error', () => resolve(false))
+  })
+
+const waitFor = async (port, ms) => {
+  const end = Date.now() + ms
+  while (Date.now() < end) {
+    if (await canConnect(port)) return true
+    await new Promise(r => setTimeout(r, 200))
+  }
+  return false
+}
+
+const killTree = child => {
+  if (!child?.pid) return
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+  } else {
+    try { child.kill('SIGKILL') } catch {}
+  }
+}
+
+const findClaude = () => {
+  if (process.env.DELEGATE_CLAUDE) return process.env.DELEGATE_CLAUDE
+  const local = process.env.LOCALAPPDATA
+  if (local) {
+    const packages = path.join(local, 'Packages')
+    const found = []
+    try {
+      for (const pkg of fs.readdirSync(packages)) {
+        if (!pkg.startsWith('Claude_')) continue
+        const base = path.join(packages, pkg, 'LocalCache', 'Roaming', 'Claude', 'claude-code')
+        if (!fs.existsSync(base)) continue
+        for (const ver of fs.readdirSync(base)) {
+          for (const hash of fs.readdirSync(path.join(base, ver))) {
+            const exe = path.join(base, ver, hash, 'claude.exe')
+            if (fs.existsSync(exe)) found.push({ ver, exe })
+          }
+        }
+      }
+    } catch {}
+    found.sort((a, b) => a.ver.localeCompare(b.ver, undefined, { numeric: true }))
+    if (found.length > 0) return found.at(-1).exe
+  }
+  return 'claude'
+}
+
+const main = async () => {
+  let job
+  try {
+    job = JSON.parse(await readStdin())
+  } catch {
+    return finish({ ok: false, error: 'the job on stdin is not JSON' }, 2)
+  }
+  const { url, key, model, task } = job
+  if (!url || !key || !model || !task) {
+    return finish({ ok: false, error: 'url, key, model and task are required' }, 2)
+  }
+  // A bad cwd makes spawn fail with nothing readable; say what is wrong before anything starts.
+  if (job.cwd) {
+    let cwdStat
+    try { cwdStat = fs.statSync(job.cwd) } catch { cwdStat = undefined }
+    if (!cwdStat) return finish({ ok: false, error: `cwd 不存在：${job.cwd}` }, 2)
+    if (!cwdStat.isDirectory()) return finish({ ok: false, error: `cwd 不是目录：${job.cwd}` }, 2)
+  }
+  // work defaults to ptc-only (run_code + the DSH-style prompt); ptc: true keeps the built-ins beside run_code, false drops it.
+  if (job.ptc === undefined) job.ptc = 'only' // read defaults to the read-only ptc too; ptc: false gives read the built-ins back
+  if (!fs.existsSync(venvPython)) {
+    return finish({
+      ok: false,
+      error: 'proxy not installed: create ~/.claude/delegate/venv and pip install ant2oai into it',
+    })
+  }
+  const started = Date.now()
+  const port = await freePort()
+  const effort = ['low', 'high', 'max', 'off'].includes(job.effort) ? ['--effort', job.effort] : []
+  const proxy = spawn(
+    venvPython,
+    [path.join(here, 'run_proxy.py'), '--upstream', url, '--model', model, '--port', String(port), ...effort],
+    { stdio: 'ignore', windowsHide: true },
+  )
+  try {
+    if (!(await waitFor(port, 20_000))) {
+      return finish({ ok: false, error: 'the local proxy did not start within 20 s' })
+    }
+    const env = {}
+    for (const [k, v] of Object.entries(process.env)) {
+      if (!/^(CLAUDE|ANTHROPIC)/i.test(k)) env[k] = v
+    }
+    Object.assign(env, {
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+      ANTHROPIC_AUTH_TOKEN: key,
+      ANTHROPIC_MODEL: model,
+      ANTHROPIC_SMALL_FAST_MODEL: model,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+      CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: '1',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    })
+    // read + ptc: 'only' (the default; ptc: false gives the built-in Read/Grep/Glob/WebFetch): run_code is the only
+    // tool, like work's ptc-only, but ptc-run runs it read-only (Node permission model: no writes, no child processes).
+    const roOnly = job.mode !== 'work' && job.ptc === 'only'
+    if (job.ptc === 'only') {
+      env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = '1' // no CLAUDE.md in the request
+      env.PTC_RUN_SDK_IN_PROMPT = '1' // ptc-run: short run_code description + DSH-shaped tools.*
+      if (roOnly) env.PTC_RUN_READONLY = '1' // ptc-run: read-only sandbox (broker + restricted runner)
+    }
+    // ptc: 'only' leaves run_code as the sole tool (like DSH's PTC-only presentation), so no
+    // built-in tool descriptions are sent at all. --tools "" would also drop plugin tools, so name it.
+    const only = job.ptc === 'only'
+    // read's ptc-only keeps WebFetch beside run_code: the read-only sandbox has no network tool of its own to offer.
+    const tools = only ? (roOnly ? `${PTC_TOOL},WebFetch` : PTC_TOOL) : job.mode === 'work' ? WORK_TOOLS : READ_TOOLS
+    // Plugin tools ($.tool.register) are not MCP config, so --strict-mcp-config does not remove them;
+    // each plugin is shut out by name. work may keep ptc-run's run_code (it can already write and run
+    // commands, like Bash); read gets it only as ptc: 'only', where ptc-run confines it (PTC_RUN_READONLY), since the
+    // unconfined run_code would undo --restricted.
+    const ptc = (job.mode === 'work' && job.ptc !== false) || roOnly
+    const blocked = ptc ? BLOCKED_MCP : [...BLOCKED_MCP, PTC_SERVER]
+    const args = [
+      ...(job.resume ? ['--resume', String(job.resume)] : []),
+      '-p',
+      task,
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--allowedTools',
+      only ? tools : ptc ? `${tools},${PTC_TOOL}` : tools,
+      '--tools',
+      tools,
+      ...(only ? ['--system-prompt-file', roOnly ? PTC_RO_PROMPT : PTC_ONLY_PROMPT, '--settings', PTC_ONLY_SETTINGS, '--exclude-dynamic-system-prompt-sections'] : []),
+      '--strict-mcp-config',
+      '--disallowedTools',
+      blocked.join(','),
+      // --restricted strips code-running tools, run_code included, so read + ptc: 'only' goes without it; there
+      // ptc-run's read-only sandbox confines reads to the cwd (Node permission model) and refuses all writes/commands.
+      ...(job.mode === 'work' || roOnly ? [] : ['--restricted']),
+      '--max-turns',
+      String(Math.max(Number(job.maxTurns) || 1000, 1)),
+    ]
+    // No practical turn/time cap: 2 h only catches a hung child process
+    const timeoutMs = Number(job.timeoutMs) || 7_200_000
+    const child = spawn(findClaude(), args, {
+      cwd: job.cwd || process.cwd(),
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    let out = ''
+    let err = ''
+    child.stdout.on('data', d => (out += d))
+    child.stderr.on('data', d => (err += d))
+    const timer = setTimeout(() => killTree(child), timeoutMs)
+    const code = await new Promise(resolve => child.on('close', resolve))
+    clearTimeout(timer)
+    const ms = Date.now() - started
+    // stream-json: keep the session id and the last assistant text, so a run cut short still reports what it did.
+    let parsed
+    let sid = null
+    let lastText = ''
+    let turnCount = 0
+    for (const line of out.split('\n')) {
+      let o
+      try { o = JSON.parse(line) } catch { continue }
+      if (typeof o.session_id === 'string') sid = o.session_id
+      if (o.type === 'assistant') {
+        turnCount += 1
+        const text = (o.message?.content ?? []).filter(c => c.type === 'text').map(c => c.text).join('')
+        if (text) lastText = text
+      }
+      if (o.type === 'result') parsed = o
+    }
+    if (parsed && typeof parsed.result === 'string') {
+      return finish({
+        ok: parsed.is_error !== true,
+        text: parsed.result,
+        sessionId: parsed.session_id ?? null,
+        turns: parsed.num_turns ?? null,
+        ms,
+        usage: parsed.usage ?? null,
+      })
+    }
+    const tail = (err || out).replace(/\s+/g, ' ').trim().slice(-600)
+    const cut = code === null || Date.now() - started >= timeoutMs
+    if (cut && sid) {
+      const said = lastText ? '\n它最后说的：' + lastText : ''
+      return finish({
+        ok: false,
+        error: '超时（' + Math.round(ms / 1000) + ' 秒）被中止，但代理已经做了 ' + turnCount + ' 轮，改动的文件可能已经写好，先去核对；要它接着做就用 resume 续用，不要新建。' + said,
+        text: lastText,
+        sessionId: sid,
+        turns: turnCount,
+        ms,
+      })
+    }
+    return finish({
+      ok: false,
+      error: code === null || Date.now() - started >= timeoutMs ? `timed out after ${Math.round(ms / 1000)} s` : `claude exited ${code}: ${tail}`,
+    })
+  } finally {
+    killTree(proxy)
+  }
+}
+
+main().catch(e => finish({ ok: false, error: String(e?.message ?? e) }, 1))

@@ -9,4 +9,11 @@ node_modules/
 /ctx-mod/SPEC-*.md
 /ctx-mod/NOTES-dev.md
 /ctx-mod/REVIEW-*.md
-/ctx-mod/phase0/
+# Dev leftovers inside each mod.
+*.bak
+*.bak-*
+*.dedup-v1
+dryrun.log
+/ptc-run/bin/
+.claude-plugin/types/
+phase0/
