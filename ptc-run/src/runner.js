@@ -1,5 +1,5 @@
 "use strict";
-// ptc-run sandbox runner. CommonJS, node built-ins only. Input (stdin JSON): {cwd, code, rg, scope, maxChars}.
+// ptc-run sandbox runner. CommonJS, node built-ins only. Input (stdin JSON): {cwd, code, rg?, scope, maxChars}.
 const fs = require("fs"), path = require("path"), os = require("os"), cp = require("child_process"), crypto = require("crypto");
 // Launched by a tiny bootstrap (the full source exceeds the Windows 32K command-line limit): the bootstrap
 // puts the input JSON in globalThis.__PTC_IN and evals this file. Falls back to stdin when run directly.
@@ -959,15 +959,28 @@ tools.parallel = (calls, opts) => {
 // ---------- ripgrep ----------
 const SKIP = ["!node_modules", "!target", "!.venv", "!.git", "!.dsh-ops"];
 let rgCache;
+// The mod's own directory is not exposed to a mod module or to this runner, so the generated hook cannot embed the
+// bundle's absolute path (that would bake one machine's layout into the repo). Resolve at runtime instead:
+// PTC_RUN_RG, then the path the hook passed explicitly, then the installed bundle (~/.claude/skills/<mod>/bin/rg.exe),
+// then PATH. Both the normal and the read-only path (src/broker.js resolves its own, same order) work this way.
+const rgCandidates = () => {
+  const names = WIN ? ["rg.exe"] : ["rg"];
+  const out = [];
+  const env = String(process.env.PTC_RUN_RG || "").trim();
+  if (env) out.push(env);
+  if (input.rg) out.push(input.rg);
+  try { out.push(path.join(os.homedir(), ".claude", "skills", "ptc-run", "bin", names[0])); } catch {}
+  return out;
+};
 const rgPath = () => {
   if (rgCache) return rgCache;
-  if (input.rg && fs.existsSync(input.rg)) return (rgCache = input.rg);
   const names = WIN ? ["rg.exe"] : ["rg"];
+  for (const p of rgCandidates()) { try { if (p && fs.statSync(p).isFile()) return (rgCache = p); } catch {} }
   for (const d of String(process.env.PATH || process.env.Path || "").split(path.delimiter)) {
     if (!d) continue;
     for (const n of names) { const p = path.join(d, n); try { if (fs.statSync(p).isFile()) return (rgCache = p); } catch {} }
   }
-  throw E("RG_UNAVAILABLE", "ripgrep (rg) was not found at the bundled path or on PATH", "Install ripgrep and put it on PATH, or use tools.bash with another search command.");
+  throw E("RG_UNAVAILABLE", "ripgrep (rg) was not found (PTC_RUN_RG, the bundled bin/rg.exe, or PATH)", "Install ripgrep and put it on PATH, or set PTC_RUN_RG, or use tools.bash with another search command.");
 };
 const globArgs = (g) => [].concat(g || []).flatMap((x) => ["-g", x]).concat(SKIP.flatMap((x) => ["-g", x]));
 // read-only mode: hand the argv to the broker (reqDir/<id>.req) and wait for resDir/<id>.res; exit if the broker is gone

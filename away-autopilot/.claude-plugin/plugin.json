@@ -1,5 +1,25 @@
 {
   "name": "away-autopilot",
-  "version": "0.1.0",
-  "description": "用户离开 5 分钟未回复待确认的问题时，提示模型自行决定；模型可调用工具暂停自动推进。"
+  "version": "0.2.0",
+  "description": "用户离开 5 分钟未回复待确认的问题时，提示模型自行决定；模型可调用工具暂停自动推进。",
+  "userConfig": {
+    "idleMinutes": {
+      "type": "number",
+      "title": "Idle minutes before the nudge",
+      "description": "Minutes without a reply from the user before a waiting turn is nudged. Decimals are allowed; 0.5 to 240. Out-of-range or invalid values fall back to the default.",
+      "default": 5
+    },
+    "maxAutoNudges": {
+      "type": "number",
+      "title": "Auto-nudges per away stretch",
+      "description": "How many times one away stretch may nudge the model on its own. 0 turns automatic progress off; 0 to 50. Out-of-range or invalid values fall back to the default.",
+      "default": 8
+    },
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "description": "Whether the plugin runs at all. When false: no pause tool, no system prompt section, no timer.",
+      "default": true
+    }
+  }
 }

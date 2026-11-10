@@ -2912,3 +2912,70 @@ test('the shared archive keeps only the shared types, in the fixed order, and on
   expect(sharedAttachmentsPath(w)).toBeUndefined()
   expect(storedAttachmentsPath(w)).toBeDefined()
 })
+
+// ---- 配置：manifest 的 userConfig 与环境变量 ----
+
+test('enabled in userConfig arms the mod with no CTX_MOD', { options: { enabled: true } }, async ($, on) => {
+  const w = world(on, 's-cfg-enabled')
+  await boot($)
+
+  expect(w.tools).toContain('context')
+  expect(await runCommand($)).toContain('插件配置 enabled=true')
+})
+
+test('CTX_MOD=0 turns the mod off even when userConfig enables it', { options: { enabled: true } }, async ($, on) => {
+  const w = world(on, 's-cfg-off', { CTX_MOD: '0' })
+  await boot($)
+
+  expect(w.tools).toEqual([])
+  expect(await runCommand($)).toContain('未启用')
+})
+
+test('a bare /ctx-mod with the default configuration adds no configuration line', { options: {} }, async ($, on) => {
+  const w = world(on, 's-cfg-default', { CTX_MOD: '1' })
+  await boot($)
+  await personRequest($, '看看状态', 'person-1')
+  const text = await runCommand($)
+
+  expect(text).toContain('ctx-mod 已启用（CTX_MOD=1）。')
+  expect(text).toContain('距上次换窗口')
+  expect(text).not.toContain('配置：')
+})
+
+test('/ctx-mod lists the fields that differ from their defaults', { options: { boundaryTokens: 150_000, softTokens: 200_000, urgentTokens: 250_000 } }, async ($, on) => {
+  world(on, 's-cfg-listed', { CTX_MOD: '1' })
+  await boot($)
+  const text = await runCommand($)
+
+  expect(text).toContain('配置：boundaryTokens=150000（默认 200000）')
+  expect(text).toContain('softTokens=200000（默认 300000）')
+  expect(text).not.toContain('compactWindow=')
+})
+
+test('the configured cold threshold decides whether a cold prompt is held', { options: { coldMinTokens: 200_000 } }, async ($, on) => {
+  const w = world(on, 's-cfg-cold', { CTX_MOD: '1' })
+  await boot($)
+  // A cold cache and 150k of context: over the default 80k, under the configured 200k.
+  await goCold($, w)
+  expect(isDropped(await sayWhileCold($, '还没到配置的线'))).toBe(false)
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs).toEqual([])
+})
+
+test('the environment overrides the manifest value where it is used', { options: { coldMinTokens: 60_000 } }, async ($, on) => {
+  const w = world(on, 's-cfg-env', { CTX_MOD: '1', CTX_MOD_COLD_MIN_TOKENS: '100000' })
+  await boot($)
+  await goCold($, w)
+  // 90k is over the option's 60k but under the environment's 100k.
+  w.usage.tokens = 90_000
+  expect(isDropped(await sayWhileCold($, '听环境变量的'))).toBe(false)
+})
+
+test('three fills out of order arm with the defaults and leave one log line', { options: { boundaryTokens: 260_000, softTokens: 250_000 } }, async ($, on) => {
+  const w = world(on, 's-cfg-order', { CTX_MOD: '1' })
+  await boot($)
+
+  expect(w.logs.filter(line => line.includes('ctx-mod: config:')).length).toBe(1)
+  expect(await runCommand($)).not.toContain('配置：')
+})

@@ -18,6 +18,7 @@
  *     --remind-at N            default 4
  *     --deny-at N              default 8
  *     --agent-per-hour N       default 3
+ *     --read-only-weight N     default 0.5 (1 counts every request as one)
  *     --json                   print the report as JSON
  *
  * No engine, no model, no network: it only reads the file.
@@ -176,7 +177,8 @@ const replay = (file: string, config: Config): Report => {
     report.requests += 1
     const outcome = observeRequest(state, config, uses)
     report[outcome.kind] += 1
-    if (outcome.remind) report.reminds.push({ at: stamp, streak: state.streak })
+    // `streak` in a mark is the request count the refusal texts name, not the weighted sum.
+    if (outcome.remind) report.reminds.push({ at: stamp, streak: state.requests })
 
     // The request's tool calls, in the order the model asked for them.
     for (const use of uses) {
@@ -185,10 +187,10 @@ const replay = (file: string, config: Config): Report => {
       if (isAgent) {
         const model = typeof use.input['model'] === 'string' ? use.input['model'] : ''
         const type = typeof use.input['subagent_type'] === 'string' ? use.input['subagent_type'] : ''
-        report.agents.push({ at: stamp, streak: state.streak, model, type, refused: verdict.deny !== undefined })
+        report.agents.push({ at: stamp, streak: state.requests, model, type, refused: verdict.deny !== undefined })
       }
       if (verdict.deny !== undefined) {
-        report.refusals.push({ at: stamp, streak: state.streak, tool: use.tool, text: verdict.deny.slice(0, 40) })
+        report.refusals.push({ at: stamp, streak: state.requests, tool: use.tool, text: verdict.deny.slice(0, 40) })
       }
     }
   }
@@ -212,7 +214,7 @@ const number = (name: string, fallback: number): number => {
 }
 
 /** The options that take a value, so the value is not mistaken for a file. */
-const VALUE_OPTIONS = new Set(['mode', 'remind-at', 'deny-at', 'agent-per-hour'])
+const VALUE_OPTIONS = new Set(['mode', 'remind-at', 'deny-at', 'agent-per-hour', 'read-only-weight'])
 const files: string[] = []
 for (let i = 2; i < process.argv.length; i += 1) {
   const arg = process.argv[i] ?? ''
@@ -223,7 +225,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
   files.push(arg)
 }
 if (files.length === 0) {
-  console.error('usage: node dispatch-gate/scripts/replay.ts [--mode off|remind|soft] [--remind-at N] [--deny-at N] [--agent-per-hour N] [--json] <transcript.jsonl>...')
+  console.error('usage: node dispatch-gate/scripts/replay.ts [--mode off|remind|soft] [--remind-at N] [--deny-at N] [--agent-per-hour N] [--read-only-weight N] [--json] <transcript.jsonl>...')
   process.exit(2)
 }
 
@@ -234,6 +236,7 @@ const config: Config = {
   remindAt: number('remind-at', DEFAULTS.remindAt),
   denyAt: number('deny-at', DEFAULTS.denyAt),
   agentPerHour: number('agent-per-hour', DEFAULTS.agentPerHour),
+  readOnlyWeight: number('read-only-weight', DEFAULTS.readOnlyWeight),
 }
 
 const reports = files.map(file => replay(file, config))

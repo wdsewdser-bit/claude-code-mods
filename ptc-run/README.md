@@ -14,7 +14,7 @@
 - `tools.parallel([{command,cwd?,timeoutMs?}], {concurrency})`：并发执行多条命令，默认并发 4（最大 16），单次最多 64 条；按输入顺序返回；单项超时不影响其他项，结束时清理子进程。
 - `ref.put / page / text / release`：输出超过 8000 字符（可用 `maxChars` 调整，最大 50000）时保留前约 70% 和后 30%，中段落盘成 ref，按需分页读取（`ref.page` 默认每页 50 条、单条上限 16384 字节）。ref 存在系统临时目录 `cc-ptc/` 下，保留 24 小时。
 - `ref.store(key,value)` / `ref.load(key)`：按名字存一个 JSON 值，供后面的 `run_code` 直接取用，不用重复打印或重跑。key 限 1–64 位 `[A-Za-z0-9_.-]`，值上限 8 MB；存在同一会话目录下的 `kv-<key>.json`，和 ref 一样保留 24 小时，同名覆盖（原子写）。`ref.store` 返回 `{key,bytes}`；`ref.load` 在不存在或已过期时返回 `undefined`，不抛错。只读模式下只有 `ref.load` 可用。
-- `run_code` 整程序默认超时 300000 ms（最大 1800000 ms）；`root:"D:/abs/dir"` 可把相对路径、glob/grep 和 bash 的基准目录切到该目录。
+- `run_code` 整程序默认超时 300000 ms（最大 600000 ms）；`root:"D:/abs/dir"` 可把相对路径、glob/grep 和 bash 的基准目录切到该目录。
 
 错误带 `[CODE]` 前缀和 `nextAction` 提示。
 
@@ -25,8 +25,10 @@
 - DSH 方言（delegate 的 ptc-only）里另有 `tools.test`（测试摘要），以及 read 结果的不可枚举字段 `.text` / `.content`；设了 `PTC_RUN_DSH_READ_LIMIT` 时，不带 limit 的读取会截断，并追加一行 `kind:"notice"` 提示。这些都是实验功能，默认不写进提示。
 - `run_code` 里的工具调用不经过 Claude Code 的权限确认，等同于给了模型直接读写文件和执行命令的能力。
 - 设置环境变量 `PTC_DENY_CREDENTIALS=1` 后，读取类操作会拒绝 `~/.ssh`、`.env`、`*.pem` 等凭据文件（`bash` 不受限）。默认关闭。
-- 只读模式（`PTC_RUN_READONLY=1`）下写入和命令类工具被拒绝，但 `tools.read`、`tools.revision`、`tools.glob`、`tools.grep` 等只读工具可用，且只能读取工作目录（及 `PTC_RUN_RO_ROOTS` 指定的额外目录）内的文件。
-- 需要 ripgrep：优先用 `bin/rg.exe`（仓库里不带，可从 ripgrep 官方 Release 下载放进去后运行 `node build.cjs`），否则从 PATH 找 `rg`。
+- 只读模式（`PTC_RUN_READONLY=1`）下写入和命令类工具被拒绝，但 `tools.read`、`tools.revision`、`tools.glob`、`tools.grep` 等只读工具可用，且只能读取会话工作目录和 `PTC_RUN_READ_ROOTS` 指定的额外可读目录内的文件。
+  - `PTC_RUN_READ_ROOTS`（delegate 的 `readPaths` 走这个）是**可读目录列表**：既放宽读，也放宽 `root` 能指向的范围；分隔符同 PATH，Windows 用 `;`、其他平台用 `:`，两种分隔符都接受，盘符后的冒号（`C:/`）不算分隔符。相对路径、不存在的目录会被忽略。
+  - `PTC_RUN_RO_ROOTS` 不是可读目录列表：它只列“只读模式下 `run_code` 的 `root` 参数可以指向哪些目录”（会话工作目录之外的额外基准目录），每项是绝对路径，只按 `;` 分隔；它不放宽普通读取，读取范围仍由工作目录和 `PTC_RUN_READ_ROOTS` 决定。
+- 需要 ripgrep：默认用 mod 自己目录下的 `bin/rg.exe`（钩子在 `$.plugin.root` 下拼 `bin/rg.exe` 传给 runner，只读模式的 broker 拿同一个值）。解析顺序是 `PTC_RUN_RG` 环境变量（显式覆盖）、钩子传入的 mod 目录下的 `bin/rg.exe`、`~/.claude/skills/ptc-run/bin/rg.exe`、PATH 上的 `rg`；普通路径由 runner 解析，只读路径由 broker 按同一顺序自己解析。仓库的 `ptc-run/bin/rg.exe` 不入库，从 ripgrep 官方 Release 下载放进去即可；`node build.cjs` 生成的文件里不写任何本机绝对路径。
 - 沙箱用 Node 子进程执行，需要本机装有 Node。
 
 ## 开发

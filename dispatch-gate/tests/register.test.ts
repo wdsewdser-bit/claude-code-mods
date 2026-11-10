@@ -225,7 +225,8 @@ test("a person's message clears the streak", async ($, on) => {
   expect(w.notices).toHaveLength(2)
 })
 
-test('a parallel batch counts as one request', async ($, on) => {
+// The batch is all Reads, standing in for ordinary requests: keep the old one-per-request count.
+test('a parallel batch counts as one request', { options: { readOnlyWeight: 1 } }, async ($, on) => {
   const w = world(on)
   await boot($)
   for (let i = 0; i < 3; i += 1) await exec($, w)
@@ -319,6 +320,16 @@ test('mode=remind reminds but never refuses', async ($, on) => {
   expect(w.refusals).toHaveLength(0)
   for (let i = 0; i < 6; i += 1) await dispatch($, w)
   expect(w.refusals).toHaveLength(0)
+})
+
+test('a read-only stretch counts half, and the reminder names the request count', async ($, on) => {
+  const w = world(on)
+  await boot($)
+  for (let i = 0; i < 7; i += 1) await exec($, w, 'Read')
+  expect(w.notices).toHaveLength(0)
+  await exec($, w, 'Read')
+  expect(w.notices).toHaveLength(1)
+  expect(w.notices[0]).toContain('连续 8 个执行请求')
 })
 
 test('session.end clears the streak', async ($, on) => {

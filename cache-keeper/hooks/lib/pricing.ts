@@ -21,12 +21,26 @@ export type Price = {
 }
 
 // USD per million tokens, platform.claude.com/docs/en/about-claude/pricing as
-// read on 2026-10-08. The API's prices: never a subscription's quota weights.
+// read on 2026-11-10. The API's prices: never a subscription's quota weights.
+// Rows match in order, so the more specific generation comes first: fable-5-2,
+// then fable-5-1, then fable-5, whose row also takes dated ids such as
+// claude-fable-5-20260101; opus-5 and sonnet-5 likewise follow their 5-5 rows.
 // A third element is a prompt length the row only applies above: Haiku 5.5 is
 // priced by prompt length, so its long-prompt row comes first.
 const PRICES: readonly (readonly [RegExp, Price, number?])[] = [
+  [
+    /fable-5-2(?!\d)|mythos-5-2(?!\d)/,
+    { input: 8, write5m: 10, write1h: 16, read: 0.2, output: 40 },
+  ],
+  [
+    /fable-5-1(?!\d)|mythos-5-1(?!\d)/,
+    { input: 10, write5m: 12.5, write1h: 20, read: 0.25, output: 50 },
+  ],
+  [/fable-5|mythos-5/, { input: 10, write5m: 12.5, write1h: 20, read: 1, output: 50 }],
   [/opus-5-5/, { input: 4, write5m: 5, write1h: 8, read: 0.2, output: 20 }],
+  [/opus-5/, { input: 5, write5m: 6.25, write1h: 10, read: 0.5, output: 25 }],
   [/sonnet-5-5/, { input: 2, write5m: 2.5, write1h: 4, read: 0.1, output: 10 }],
+  [/sonnet-5/, { input: 2, write5m: 2.5, write1h: 4, read: 0.2, output: 10 }],
   [/haiku-5-5/, { input: 0.5, write5m: 0.625, write1h: 1, read: 0.05, output: 2.5 }, 100_000],
   [/haiku-5-5/, { input: 0.1, write5m: 0.125, write1h: 0.2, read: 0.01, output: 0.5 }],
   [/haiku-4-5/, { input: 1, write5m: 1.25, write1h: 2, read: 0.1, output: 5 }],

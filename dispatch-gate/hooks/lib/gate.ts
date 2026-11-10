@@ -30,6 +30,8 @@ export type Config = {
   grace: number
   /** Minutes one L2 refusal keeps the next stretch from refusing; 0 means no cooldown. */
   denyCooldownMinutes: number
+  /** What a request made only of read-only uses adds to the streak (0 to 1). */
+  readOnlyWeight: number
 }
 
 export const DEFAULTS: Config = {
@@ -39,6 +41,7 @@ export const DEFAULTS: Config = {
   agentPerHour: 3,
   grace: 3,
   denyCooldownMinutes: 15,
+  readOnlyWeight: 0.5,
 }
 
 /** The rolling window of the Claude-subagent limit. */
@@ -67,6 +70,27 @@ const EXEC = new Set([
 
 /** Reading the work back after a dispatch: free while the acceptance grace lasts. */
 const READ_ONLY = new Set(['Read', 'Grep', 'Glob'])
+
+/** The tools that only read, so a request made of them is read-only. */
+const READ_ONLY_TOOLS = new Set(['Read', 'Grep', 'Glob', 'BashOutput'])
+
+/** The first word of a command that only looks. */
+const READ_ONLY_COMMANDS = new Set([
+  'ls', 'dir', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'find', 'stat', 'file', 'du', 'df', 'pwd', 'echo',
+  'printf', 'sort', 'uniq', 'cut', 'tr', 'awk', 'sed', 'diff', 'cmp', 'which', 'where', 'type', 'test', '[',
+  'true', 'cd', 'basename', 'dirname', 'date', 'jq', 'tree',
+])
+
+/** Words that mean the command writes, runs something arbitrary, or reaches out: never read-only. */
+const WRITES = /\b(?:xargs|sudo|rm|mv|cp|tee|dd|chmod|chown|touch|mkdir|ln|kill|install|curl|wget)\b/
+
+/** The git subcommands that only look; `branch` and `remote` have extra conditions below. */
+const READ_ONLY_GIT = new Set([
+  'status', 'diff', 'log', 'show', 'ls-files', 'blame', 'rev-parse', 'branch', 'remote', 'describe', 'shortlog',
+])
+
+/** The run_code calls that write or run something; anything else in the code is a read-only probe. */
+const WRITING_CODE = /\b(?:tools\s*\.\s*(?:write|edit|replace|batch|bash|parallel|job)|ref\s*\.\s*store)\s*\(/
 
 /** The tools that start or resume a Claude subagent. */
 const CLAUDE_AGENT = new Set(['Agent', 'Task'])
@@ -123,6 +147,77 @@ export const isMainOnly = (use: Use): boolean => {
 /** Whether this tool use is work the main session does itself. */
 export const isExec = (use: Use): boolean => EXEC.has(use.tool) && !isMainOnly(use)
 
+/** Whether a `git` command only looks, from its words after `git`. */
+const isReadOnlyGit = (words: readonly string[]): boolean => {
+  const sub = words[1]
+  if (sub === undefined || !READ_ONLY_GIT.has(sub)) return false
+  if (
+    sub === 'branch' &&
+    words.some(
+      word => /^-[A-Za-z]*[dDm]$/.test(word) || word === '--delete' || word === '--move' || word === '--copy',
+    )
+  ) {
+    return false
+  }
+  if (sub === 'remote' && !words.includes('-v')) return false
+
+  return true
+}
+
+/** Whether one segment of a shell command only looks. Anything unsure is not read-only. */
+const isReadOnlySegment = (segment: string): boolean => {
+  if (segment.includes('$(') || segment.includes('`')) return false
+  // `2>&1` and `>/dev/null` write nowhere; every other `>` is an output.
+  const redirect = segment.replace(/2>&1/g, ' ').replace(/(?:^|\s)(?:1|2)?>\s*\/dev\/null/g, ' ')
+  if (redirect.includes('>')) return false
+  // `&&` was already split; any remaining `&` backgrounds or separates.
+  const cleaned = redirect.replace(/&&/g, ' ')
+  if (cleaned.includes('&')) return false
+  if (WRITES.test(cleaned)) return false
+
+  const words = cleaned.trim().split(/\s+/).filter(word => word !== '')
+  const first = words[0]
+  if (first === undefined) return false
+  if (first === 'git') return isReadOnlyGit(words)
+  if (!READ_ONLY_COMMANDS.has(first)) return false
+  if (first === 'find' && words.some(word => word === '-delete' || word === '-exec' || word === '-ok')) return false
+  if (first === 'sed' && /--in-place\b|(?:^|\s)-[A-Za-z]*i[A-Za-z]*(?=\s|$)/.test(cleaned)) return false
+
+  return true
+}
+
+/** Whether every segment of a shell command only looks. */
+const isReadOnlyCommand = (command: string): boolean => {
+  const segments = command
+    .split(/&&|\|\||;|\||\r?\n/)
+    .map(segment => segment.trim())
+    .filter(segment => segment !== '')
+  if (segments.length === 0) return false
+
+  return segments.every(segment => isReadOnlySegment(segment))
+}
+
+/**
+ * Whether one tool use only looks: it does not write, run a program or reach
+ * out. Tests, builds and anything unsure are not read-only: that is work a
+ * subagent can take.
+ */
+export const isReadOnlyUse = (use: Use): boolean => {
+  if (READ_ONLY_TOOLS.has(use.tool)) return true
+  if (use.tool === 'Bash' || use.tool === 'PowerShell') {
+    const command = use.input['command']
+
+    return typeof command === 'string' && isReadOnlyCommand(command)
+  }
+  if (use.tool === 'mcp__ptc-run__run_code') {
+    const code = use.input['code']
+
+    return typeof code === 'string' && code.trim() !== '' && !WRITING_CODE.test(code)
+  }
+
+  return false
+}
+
 /** The class of one request, from the tool uses the model answered with. */
 export const classify = (uses: readonly Use[]): Kind => {
   if (uses.some(use => isDispatchTool(use.tool))) return 'dispatch'
@@ -155,6 +250,8 @@ export const usesOf = (result: unknown): Use[] => {
 export type State = {
   /** Consecutive execution requests the main session did itself. */
   streak: number
+  /** Consecutive execution requests, one per request however much each weighs. */
+  requests: number
   /** Read-only acceptance requests left free after the last dispatch. */
   grace: number
   /** The reminder was given in this streak. */
@@ -175,6 +272,7 @@ export type State = {
 
 export const createState = (): State => ({
   streak: 0,
+  requests: 0,
   grace: 0,
   reminded: false,
   denied: false,
@@ -188,6 +286,7 @@ export const createState = (): State => ({
 /** A dispatch, or a person's own message: the streak starts over, with fresh grace. */
 export const resetStreak = (state: State, config: Config): void => {
   state.streak = 0
+  state.requests = 0
   state.reminded = false
   state.denied = false
   state.armed = false
@@ -205,6 +304,15 @@ export const coolingDown = (state: State, config: Config, now: number): boolean 
 
   return now - state.lastDenyAt < window
 }
+
+const weightOf = (value: unknown): number => {
+  const n = numberOf(value, DEFAULTS.readOnlyWeight)
+
+  return Math.min(1, Math.max(0, n))
+}
+
+/** The weight a read-only request carries, clamped to 0–1. */
+export const readOnlyWeightOf = (config: Config): number => weightOf(config.readOnlyWeight)
 
 export type Outcome = {
   kind: Kind
@@ -244,7 +352,8 @@ export const observeRequest = (
     return { kind, remind: false }
   }
   state.grace = 0
-  state.streak += 1
+  state.requests += 1
+  state.streak += uses.every(use => !isExec(use) || isReadOnlyUse(use)) ? readOnlyWeightOf(config) : 1
 
   let remind = false
   if (config.mode !== 'off' && state.streak >= config.remindAt && !state.reminded) {
@@ -309,7 +418,7 @@ export const judge = (
     state.armed = false
     state.lastDenyAt = now
 
-    return { deny: denyText(state.streak, Math.max(0, Math.floor(config.denyCooldownMinutes))) }
+    return { deny: denyText(state.requests, Math.max(0, Math.floor(config.denyCooldownMinutes))) }
   }
 
   return {}
@@ -331,12 +440,12 @@ const judgeAgentWindow = (state: State, config: Config, now: number): string | u
 }
 
 /** L1: the reminder injected once per streak, after the batch that earned it. */
-export const remindText = (streak: number): string =>
-  `dispatch-gate：主会话已连续 ${streak} 个执行请求，没有派发。接下来把剩下的工作按文件集合打包，交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件；主会话只做派发和验收。探针、浏览器、交互式调试这类只能自己做的，继续即可。`
+export const remindText = (requests: number): string =>
+  `dispatch-gate：主会话已连续 ${requests} 个执行请求，没有派发。接下来把剩下的工作按文件集合打包，交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件；主会话只做派发和验收。探针、浏览器、交互式调试这类只能自己做的，继续即可。`
 
 /** L2: the one refusal per streak, given at the tool call that would keep going. */
-export const denyText = (streak: number, cooldownMinutes: number): string =>
-  `dispatch-gate（软拦截，可直接重试）：主会话已连续 ${streak} 个执行请求没有派发。如果剩下的工作能按文件集合打成 1–2 个工作包，建议交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件。如果改法已定、交接比自己做更费事，或者只能主会话做，重新调用同一个工具即可放行。${cooldownMinutes > 0 ? `放行后 ${cooldownMinutes} 分钟内不会再拦，期间最多只有提醒。` : '放行后这一段不会再拦。'}`
+export const denyText = (requests: number, cooldownMinutes: number): string =>
+  `dispatch-gate（软拦截，可直接重试）：主会话已连续 ${requests} 个执行请求没有派发。如果剩下的工作能按文件集合打成 1–2 个工作包，建议交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件。如果改法已定、交接比自己做更费事，或者只能主会话做，重新调用同一个工具即可放行。${cooldownMinutes > 0 ? `放行后 ${cooldownMinutes} 分钟内不会再拦，期间最多只有提醒。` : '放行后这一段不会再拦。'}`
 
 /** The refusal of a Claude subagent dispatched past the hourly limit. */
 export const agentDenyText = (count: number): string =>
@@ -368,6 +477,7 @@ export const readConfig = (options: Readonly<Record<string, unknown>> | undefine
       0,
       Math.floor(numberOf(held['denyCooldownMinutes'], DEFAULTS.denyCooldownMinutes)),
     ),
+    readOnlyWeight: weightOf(held['readOnlyWeight']),
   }
 }
 

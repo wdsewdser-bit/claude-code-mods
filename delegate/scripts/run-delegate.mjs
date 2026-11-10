@@ -2,8 +2,9 @@
 // A job that carries jobId (the plugin's own calls do) also gets a directory of
 // its own under ~/.claude/delegate/jobs/<jobId>/: status.json (pid, childPid,
 // sessionId, phase, turns, lastTool, lastText) rewritten as the stream comes in,
-// events.jsonl (the raw stream, rotated by size), result.json at the end. Two
-// files go the other way: cancel stops the child tree, inbox/*.json are messages
+// events.jsonl (the raw stream, rotated by size), result.json at the end, and
+// errors.log (only when a status/result/event write fails). Two files go the other way:
+// cancel stops the child tree, inbox/*.json are messages
 // queued into the child's stdin while it runs (stream: true).
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -11,6 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRootsEnv, readRootsOf, readRootsPromptArg } from './read-roots.mjs'
+import { createErrorNote } from './error-note.mjs'
 import { createOutputTracker } from './stream-usage.mjs'
 import { startKeepaliveProxy } from './keepalive-proxy.mjs'
 import { spawnDaemon as spawnKeepaliveDaemon } from './keepalive.mjs'
@@ -310,6 +312,10 @@ const createProcWatch = () => {
 }
 
 
+// 状态/日志写入失败的诊断通道：作业目录里的 errors.log；没有作业目录（无 jobId）时什么也不做。
+// 它自身失败一律静默——runner 抛异常会让整个作业挂掉。
+let noteError = () => 0
+
 // A job the plugin tracks: status.json / events.jsonl / result.json out, cancel and inbox in.
 // Every write is best effort: losing a status line must never fail the job itself.
 const createControl = (jobId, job) => {
@@ -321,7 +327,9 @@ const createControl = (jobId, job) => {
     result: path.join(dir, 'result.json'),
     inbox: path.join(dir, 'inbox'),
     cancel: path.join(dir, 'cancel'),
+    errors: path.join(dir, 'errors.log'),
   }
+  noteError = createErrorNote(files.errors)
   try { fs.mkdirSync(files.inbox, { recursive: true }) } catch {}
   let bytes = 0
   try { bytes = fs.statSync(files.events).size } catch {}
@@ -353,14 +361,24 @@ const createControl = (jobId, job) => {
     outputTokens: 0,
     // 最近一次请求的真实输入（来自 message_delta；assistant 行里的是 CPA 的预估，偏大）。
     contextTokens: 0,
+    // 整次运行的输入分项 + 输出（每日 token 用量用）；还没收到 usage 时是 null，不能当成 0。
+    usage: null,
   }
   let lastWrite = 0
+  let statusWriteErrors = 0
+  let lastStatusError = null
   const write = force => {
     const now = Date.now()
     if (!force && now - lastWrite < STATUS_EVERY_MS) return
     lastWrite = now
     state.updatedAt = now
-    try { fs.writeFileSync(files.status, JSON.stringify(state)) } catch {}
+    // 写失败过一次之后，下一次成功写入的 state 带上累计次数，面板据此知道这段时间的状态是旧的。
+    if (statusWriteErrors > 0) state.statusWriteErrors = statusWriteErrors
+    try { fs.writeFileSync(files.status, JSON.stringify(state)) } catch (e) {
+      lastStatusError = e
+      statusWriteErrors += 1
+      noteError('status', lastStatusError)
+    }
   }
   const append = line => {
     try {
@@ -370,13 +388,30 @@ const createControl = (jobId, job) => {
       }
       fs.appendFileSync(files.events, line + '\n')
       bytes += Buffer.byteLength(line) + 1
-    } catch {}
+    } catch (e) {
+      noteError('events', e)
+    }
   }
   // 运行中的输出：stream_event 只用来数 token，不进 events.jsonl（逐 token 的增量会把有用事件挤掉）。
   const output = createOutputTracker()
+  // 只有分项真的变了才写状态：逐 token 的 stream_event 很密。
+  const syncUsage = () => {
+    const parts = output.parts
+    const prev = state.usage
+    if (
+      prev !== null &&
+      prev.input === parts.input &&
+      prev.cacheRead === parts.cacheRead &&
+      prev.cacheWrite === parts.cacheWrite &&
+      prev.output === parts.output
+    ) return false
+    state.usage = parts
+    return true
+  }
   const track = event => {
     const total = output.onEvent(event)
-    if (total !== state.outputTokens || output.context !== state.contextTokens) {
+    const partsChanged = syncUsage()
+    if (total !== state.outputTokens || output.context !== state.contextTokens || partsChanged) {
       state.outputTokens = total
       state.contextTokens = output.context
       write(false) // 和 assistant/user 行同一个节流频率
@@ -411,6 +446,7 @@ const createControl = (jobId, job) => {
       // result.usage.output_tokens 是整次运行的真实总数，覆盖运行中数出来的值。
       const total = output.final(o.usage)
       if (total > state.outputTokens) state.outputTokens = total
+      syncUsage()
       write(true)
     }
   }
@@ -439,7 +475,9 @@ const createControl = (jobId, job) => {
     const endedAt = Date.now()
     try {
       fs.writeFileSync(files.result, JSON.stringify({ ...value, jobId, endedAt }))
-    } catch {}
+    } catch (e) {
+      noteError('result', e)
+    }
     state.phase = value.error === 'cancelled' ? 'cancelled' : value.ok ? 'done' : 'failed'
     state.endedAt = endedAt
     if (typeof value.sessionId === 'string' && value.sessionId !== '') state.sessionId = value.sessionId
@@ -447,6 +485,7 @@ const createControl = (jobId, job) => {
     if (typeof value.text === 'string' && value.text !== '') state.lastText = value.text.slice(0, 600)
     const used = Number(value.usage?.output_tokens)
     if (Number.isFinite(used) && used > state.outputTokens) state.outputTokens = used
+    syncUsage()
     write(true)
   }
   const heartbeat = setInterval(() => write(true), HEARTBEAT_MS)
@@ -592,8 +631,10 @@ const main = async () => {
         out = { ...value, leftover: left, text }
       }
     } catch {}
-    try { control?.finish(out) } catch {}
-    try { control?.stop() } catch {}
+    // 主会话按 reply.usageParts 记每日用量；没有 usage 时不带这个字段（未知，不是 0）。
+    if (control !== null && control.state.usage !== null) out = { ...out, usageParts: control.state.usage }
+    try { control?.finish(out) } catch (e) { noteError('finish', e) }
+    try { control?.stop() } catch (e) { noteError('stop', e) }
     finish(out, code)
   }
   // gpt: CPA supplies the url and the key, so the job carries only the model and the task.
@@ -787,7 +828,7 @@ const main = async () => {
       try {
         o = JSON.parse(line)
       } catch {
-        try { control?.append(line) } catch {}
+        try { control?.append(line) } catch (e) { noteError('append:raw', e) }
         return
       }
       if (control) control.onEvent(line, o)
@@ -838,7 +879,7 @@ const main = async () => {
     // DELEGATE_STREAM_LOG=<file> keeps the raw stream-json of one run (debugging: which model answered, why it stopped).
     if (process.env.DELEGATE_STREAM_LOG) {
       child.on('close', () => {
-        try { fs.writeFileSync(process.env.DELEGATE_STREAM_LOG, out) } catch {}
+        try { fs.writeFileSync(process.env.DELEGATE_STREAM_LOG, out) } catch (e) { noteError('stream-log', e) }
       })
     }
     // The control loop: inbox messages into the child, the cancel file out to the child tree, and stdin
@@ -851,9 +892,9 @@ const main = async () => {
           if (writeUser(text)) {
             wrote = true
             pendingClose = false
-            try { control.append(JSON.stringify({ type: 'sent', at: Date.now(), text: text.slice(0, 500) })) } catch {}
+            try { control.append(JSON.stringify({ type: 'sent', at: Date.now(), text: text.slice(0, 500) })) } catch (e) { noteError('append:sent', e) }
           } else {
-            try { control.append(JSON.stringify({ type: 'dropped', at: Date.now(), reason: 'job is not in stream mode' })) } catch {}
+            try { control.append(JSON.stringify({ type: 'dropped', at: Date.now(), reason: 'job is not in stream mode' })) } catch (e) { noteError('append:dropped', e) }
           }
         }
         // 回复送到了：宽限回到 2 秒，阶段回到 working；ask 留着（主会话靠 seq 去重）。
@@ -876,7 +917,7 @@ const main = async () => {
         if (askPending) {
           askPending = false
           askTimedOut = true
-          try { control?.append(JSON.stringify({ type: 'ask_timeout', at: Date.now(), seq: askSeq })) } catch {}
+          try { control?.append(JSON.stringify({ type: 'ask_timeout', at: Date.now(), seq: askSeq })) } catch (e) { noteError('append:ask_timeout', e) }
           if (control) {
             control.state.phase = 'finishing'
             control.write(true)

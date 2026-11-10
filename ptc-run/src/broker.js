@@ -53,8 +53,24 @@ if (input.root !== undefined) {
   if (!bases.some((b) => within(want, path.resolve(b)) && within(real(want), real(b)))) { fail("[POLICY_DENIED] read-only root must be inside the session cwd or one of the extra read directories: " + input.root); return; }
   cwd = want;
 }
-// rg comes from the broker's own input, never from a request
-const RG = typeof input.rg === "string" && input.rg && fs.existsSync(input.rg) ? input.rg : null;
+// rg never comes from a request. Resolved here, for the broker only: PTC_RUN_RG, then the value the hook passed,
+// then the installed bundle (~/.claude/skills/ptc-run/bin/rg.exe), then PATH. The hook no longer embeds an absolute
+// path, so the same order as src/runner.js keeps the normal and the read-only path equally portable.
+const resolveRg = () => {
+  const names = process.platform === "win32" ? ["rg.exe"] : ["rg"];
+  const cands = [];
+  const env = String(process.env.PTC_RUN_RG || "").trim();
+  if (env) cands.push(env);
+  if (typeof input.rg === "string" && input.rg) cands.push(input.rg);
+  try { cands.push(path.join(os.homedir(), ".claude", "skills", "ptc-run", "bin", names[0])); } catch {}
+  for (const p of cands) { try { if (fs.statSync(p).isFile()) return p; } catch {} }
+  for (const d of String(process.env.PATH || process.env.Path || "").split(path.delimiter)) {
+    if (!d) continue;
+    for (const n of names) { const p = path.join(d, n); try { if (fs.statSync(p).isFile()) return p; } catch {} }
+  }
+  return null;
+};
+const RG = resolveRg();
 
 // ---------- state dirs ----------
 const scope = (String(input.scope || "default").replace(/[^A-Za-z0-9_.-]/g, "_").replace(/^\.+/, "_").slice(0, 80)) || "default";

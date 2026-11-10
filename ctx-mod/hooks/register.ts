@@ -11,7 +11,8 @@ import { cwdSlug, pickPastedImages } from './lib/images.ts'
 import { createSession, isHandoffText, looksLikePerson, stripInjected } from './lib/session.ts'
 import type { AgentNote, Env, HeldAttachment, ImportedMessage, Io, Session } from './lib/session.ts'
 import { describeFill, isCold, limitOf, shouldContinue } from './lib/usage.ts'
-import type { LedgerSnapshot } from './lib/types.ts'
+import { changedText, ENV, enabledOf, readConfig, switchOf } from './lib/config.ts'
+import type { LedgerSnapshot, Config } from './lib/types.ts'
 import { DEFAULTS, OWN_TOOL_PREFIX } from './lib/types.ts'
 
 /** The section of the system prompt, the same all session long. */
@@ -33,8 +34,12 @@ const CALLS_KEPT = 200
 /** A content block, structurally the engine's ApiContentBlock (which `claude-code` does not export). */
 type Block = { type: string; [field: string]: unknown }
 
-/** Whether the module acts at all: `CTX_MOD=1`, read at `session.start`. */
+/** Whether the module acts at all: `CTX_MOD=1` or the `enabled` option, read at `session.start`. */
 let enabled = false
+/** Whether the environment's own switch turned it on, rather than the option. */
+let enabledByEnv = false
+/** What this session runs with: the options and the environment, read once at `session.start`. */
+let config: Config = DEFAULTS
 
 /**
  * Why a window switch is under way, while one is: `'model'` (the model asked),
@@ -88,6 +93,22 @@ const logError = ($: EngineInterface, where: string, problem: unknown): void => 
   } catch {
     // A log that fails must not become the failure.
   }
+}
+
+/** Every variable the configuration reads, once per session; a failed read is absent. */
+const configEnv = async ($: EngineInterface): Promise<Record<string, string | undefined>> => {
+  const env: Record<string, string | undefined> = {}
+  env[ENV.enabled] = await attempt(async () => await $.env.get('CTX_MOD'), undefined)
+  env[ENV.compactWindow] = await attempt(async () => await $.env.get('CTX_MOD_COMPACT_WINDOW'), undefined)
+  env[ENV.boundaryTokens] = await attempt(async () => await $.env.get('CTX_MOD_BOUNDARY_TOKENS'), undefined)
+  env[ENV.softTokens] = await attempt(async () => await $.env.get('CTX_MOD_SOFT_TOKENS'), undefined)
+  env[ENV.urgentTokens] = await attempt(async () => await $.env.get('CTX_MOD_URGENT_TOKENS'), undefined)
+  env[ENV.cooldownRequests] = await attempt(async () => await $.env.get('CTX_MOD_COOLDOWN_REQUESTS'), undefined)
+  env[ENV.maxSwitchesPerHour] = await attempt(async () => await $.env.get('CTX_MOD_MAX_SWITCHES_PER_HOUR'), undefined)
+  env[ENV.coldMinTokens] = await attempt(async () => await $.env.get('CTX_MOD_COLD_MIN_TOKENS'), undefined)
+  env[ENV.gateMinTokens] = await attempt(async () => await $.env.get('CTX_MOD_GATE_MIN_TOKENS'), undefined)
+
+  return env
 }
 
 const idOf = async ($: EngineInterface): Promise<string | undefined> =>
@@ -396,7 +417,7 @@ const openSession = async ($: EngineInterface, id: string): Promise<Session> => 
     directories: async path => (await $.fs.list(path)).filter(entry => entry.kind === 'dir').map(entry => entry.name),
     onWriteError: (path, error) => logError($, `write ${path}`, error),
   }
-  const session = createSession(dir, io, DEFAULTS)
+  const session = createSession(dir, io, config)
   sessions.set(id, session)
   // The window, the ledger's freshness and the pending switch are read
   // synchronously: nobody gets the session before its state is off the disk.
@@ -415,7 +436,7 @@ const limitFor = async ($: EngineInterface, id: string): Promise<number | undefi
       await attempt(async () => {
         const usage = await $.session.usage({ breakdown: 'summary' })
 
-        return limitOf(usage.context.breakdown?.autoCompactThreshold, DEFAULTS)
+        return limitOf(usage.context.breakdown?.autoCompactThreshold, config)
       }, undefined),
     )
   }
@@ -437,7 +458,7 @@ const envOf = async ($: EngineInterface, id: string): Promise<Env> => {
 
   return {
     tokens,
-    limit: (await limitFor($, id)) ?? limitOf(undefined, DEFAULTS),
+    limit: (await limitFor($, id)) ?? limitOf(undefined, config),
     cache,
     fiveHourPercent,
   }
@@ -1139,7 +1160,10 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     try {
-      enabled = (await $.env.get('CTX_MOD')) === '1'
+      const env = await configEnv($)
+      enabled = enabledOf(options, env)
+      enabledByEnv = switchOf(env) === true
+      config = readConfig(options, env, text => logError($, 'config', text))
       if (enabled) {
         await loadAttachments($, e.cwd).catch(error => logError($, 'attachments', error))
         await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
@@ -1165,7 +1189,7 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: COMMAND }, async ($, e, next) => {
     if (!enabled) {
-      return { text: 'ctx-mod 未启用：用环境变量 CTX_MOD=1 启动 Claude Code 后生效（例如 `CTX_MOD=1 claude`）。' }
+      return { text: 'ctx-mod 未启用：用环境变量 CTX_MOD=1 启动 Claude Code，或把插件配置的 enabled 设为 true。' }
     }
     try {
       const session = await sessionOf($)
@@ -1175,9 +1199,11 @@ export const register: Register = (on, options) => {
       if (typeof e.args === 'string' && e.args.trim() === 'switch') return manualSwitch($, session)
       const id = await idOf($)
       const env = id === undefined ? undefined : await envOf($, id)
-      const head = 'ctx-mod 已启用（CTX_MOD=1）。'
+      const head = enabledByEnv ? 'ctx-mod 已启用（CTX_MOD=1）。' : 'ctx-mod 已启用（插件配置 enabled=true）。'
+      const note = changedText(config)
+      const status = env === undefined ? head : `${head}\n${session.status(env)}`
 
-      return { text: env === undefined ? head : `${head}\n${session.status(env)}` }
+      return { text: `${status}${note}` }
     } catch (error) {
       logError($, 'command.run', error)
 
@@ -1643,7 +1669,7 @@ export const register: Register = (on, options) => {
         continueAfterTurn = false
         if (e.reason === 'answer' && id !== undefined) {
           const env = await envOf($, id)
-          if (shouldContinue(env.fiveHourPercent, env.cache, DEFAULTS)) {
+          if (shouldContinue(env.fiveHourPercent, env.cache, config)) {
             await $.prompt.submit({ text: CONTINUE_TEXT })
           }
         }
@@ -1666,7 +1692,7 @@ export const register: Register = (on, options) => {
             session.clearPending()
           } else if (id !== undefined) {
             const env = await envOf($, id)
-            if (shouldContinue(env.fiveHourPercent, env.cache, DEFAULTS)) {
+            if (shouldContinue(env.fiveHourPercent, env.cache, config)) {
               await $.prompt.submit({ text: CONTINUE_TEXT })
             }
           }
@@ -1782,8 +1808,8 @@ export const register: Register = (on, options) => {
           const size = env.tokens ?? env.cache?.cachedPrefixTokens
           wants =
             size !== undefined &&
-            size >= DEFAULTS.coldMinTokens &&
-            isCold({ now: Date.now(), cache: env.cache, lastRequestAt: session.lastRequestAt() }, DEFAULTS)
+            size >= config.coldMinTokens &&
+            isCold({ now: Date.now(), cache: env.cache, lastRequestAt: session.lastRequestAt() }, config)
           isExpired = wants
         }
         // A message is held whether or not it carries attachments: the engine names an

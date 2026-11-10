@@ -8,6 +8,7 @@ import {
   resolveTier,
   setGptHidePrefix,
   setGptSource,
+  setDsDailyLimit,
   SEED,
   migrationPlan,
   isEffort,
@@ -42,6 +43,20 @@ import {
 import { createDrawGate, liveEvents, readEventView, resetEventCache, tokensOf, usageOf } from '../hooks/lib/jobs.ts'
 import type { JobRecord } from '../hooks/lib/jobs.ts'
 import { barOf, normalizeQuota, resetIn, usedColor } from '../hooks/lib/quota.ts'
+import {
+  cutoffDate,
+  entryOf,
+  formatTokens,
+  localDate,
+  normalizeEntry,
+  parseTokenLimit,
+  pruneLedger,
+  summaryOf,
+  upsertEntry,
+  usageLabel,
+  usageWarning,
+} from '../hooks/lib/ds-usage.ts'
+import type { UsageLedger } from '../hooks/lib/ds-usage.ts'
 import { addModel, terminalOf } from '../hooks/lib/terminal.ts'
 
 const withKey = () => normalize(undefined)
@@ -353,6 +368,40 @@ describe('delegate tool', () => {
     const ran = await call($ as never, { task: 'find x', tier: 'flash' })
     expect(JSON.stringify(ran)).toContain('found it')
     expect(jobs[0]).toMatchObject({ model: 'command/deepseek/deepseek-v4.1-flash', mode: 'read' })
+  })
+
+  test('DS usage is accumulated per job, warns at 80% and lists the day total', { timeoutMs: 10_000 }, async ($, on) => {
+    const usage = { input: 700_000_000, cacheRead: 99_000_000, cacheWrite: 0, output: 1_000_000 }
+    const t = jobSetup(on as never, { ok: true, text: 'done', sessionId: 'sid-u', turns: 1, ms: 1, usageParts: usage })
+    t.store.set('cfg', { ...normalize(undefined), dsDailyLimit: 1_000_000_000 })
+    await startSession($ as never)
+    const ran = text(await jobCall($ as never, 'mcp__delegate__delegate_flash', { task: 'use tokens' }))
+    expect(ran).toContain('DS 今日已用 8亿 / 10亿（80%）')
+    expect(ran).toContain('接近每日上限')
+    const id = String(t.runs[0]?.jobId)
+    // 一条作业一个 key，四项都留着；同一作业再写一次只覆盖，不会翻倍。
+    expect(t.store.get(`usage:${id}`)).toMatchObject({ ...usage, jobId: id })
+    const listed = text(await jobCall($ as never, 'mcp__delegate__delegate_list', {}))
+    expect(listed).toContain('DS 今日 8亿/10亿 80%')
+    // 把上限调到 5亿：今日已用 16亿，100% 以上提醒更强，但作业照常返回（不拦截）。
+    t.store.set('cfg', { ...normalize(undefined), dsDailyLimit: 500_000_000 })
+    const more = text(await jobCall($ as never, 'mcp__delegate__delegate_pro', { task: 'keep going' }))
+    expect(more).toContain('done')
+    expect(more).toContain('已超出每日上限')
+    expect(more).toContain('仍可继续派发')
+  })
+
+  test('no limit and no usage: no DS reminder and no bar/list line', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = jobSetup(on as never, { ok: true, text: 'plain', sessionId: 'sid-u3', turns: 1, ms: 1 })
+    await startSession($ as never)
+    const ran = text(await jobCall($ as never, 'mcp__delegate__delegate_flash', { task: 'no usage' }))
+    expect(ran).toContain('plain')
+    expect(ran).not.toContain('DS 今日')
+    const id = String(t.runs[0]?.jobId)
+    // 没有 usage 就记未知，不写四项 0。
+    expect(t.store.get(`usage:${id}`)).toMatchObject({ missing: true })
+    const listed = text(await jobCall($ as never, 'mcp__delegate__delegate_list', {}))
+    expect(listed).not.toContain('DS 今日')
   })
 
   test('defaults to flash and takes pro when asked', { timeoutMs: 10_000 }, async ($, on) => {
@@ -1284,6 +1333,93 @@ describe('live pane cache', () => {
     clock = 20_000
     expect(stuck.request()).toBe(true)
     expect(stuck.end()).toBe(false)
+  })
+})
+
+// DS 每日用量：日期分桶、以作业为单位不重复计数、30 天裁剪、上限简写、80%/100% 提醒。
+describe('ds daily usage', () => {
+  const at = (y: number, m: number, d: number): number => new Date(y, m - 1, d, 12, 0, 0).getTime()
+
+  test('buckets by the local start date, so a job crossing midnight stays on its start day', () => {
+    const start = at(2026, 3, 1)
+    const end = at(2026, 3, 2)
+    expect(localDate(start)).toBe('2026-03-01')
+    expect(localDate(end)).toBe('2026-03-02')
+    // entryOf 只看作业开始时间：跨零点结束也记在 3-01。
+    expect(entryOf('bg-1', start, { input: 1, cacheRead: 2, cacheWrite: 3, output: 4 }).date).toBe('2026-03-01')
+  })
+
+  test('the same job updated again replaces its entry instead of adding twice', () => {
+    let ledger: UsageLedger = {}
+    ledger = upsertEntry(ledger, entryOf('bg-1', at(2026, 3, 1), { input: 100, cacheRead: 0, cacheWrite: 0, output: 10 }))
+    ledger = upsertEntry(ledger, entryOf('bg-1', at(2026, 3, 1), { input: 300, cacheRead: 200, cacheWrite: 5, output: 40 }))
+    ledger = upsertEntry(ledger, entryOf('bg-2', at(2026, 3, 1), { input: 50, cacheRead: 0, cacheWrite: 0, output: 5 }))
+    const sum = summaryOf(ledger, '2026-03-01')
+    expect(sum.jobs).toBe(2)
+    expect(sum.parts).toEqual({ input: 350, cacheRead: 200, cacheWrite: 5, output: 45 })
+    expect(sum.total).toBe(600)
+    expect(sum.missing).toBe(0)
+  })
+
+  test('a job without usage is marked missing, not counted as zero', () => {
+    const ledger = {
+      ...upsertEntry({}, entryOf('bg-1', at(2026, 3, 1), { input: 10, cacheRead: 0, cacheWrite: 0, output: 1 })),
+      ...upsertEntry({}, entryOf('bg-2', at(2026, 3, 1), undefined)),
+    }
+    const sum = summaryOf(ledger, '2026-03-01')
+    expect(sum.total).toBe(11)
+    expect(sum.missing).toBe(1)
+    expect(usageLabel(sum.total, 0, sum.missing)).toBe('DS 今日 11（1 个作业无用量数据）')
+  })
+
+  test('keeps the last 30 days and drops older entries', () => {
+    const now = Date.now()
+    const today = localDate(now)
+    const daysAgo = (n: number): string => localDate(now - n * 86_400_000)
+    expect(cutoffDate(today)).toBe(daysAgo(29))
+    const ledger: UsageLedger = {}
+    for (const [id, date] of [['a', today], ['b', daysAgo(29)], ['c', daysAgo(30)], ['d', daysAgo(90)]]) {
+      ledger[id] = entryOf(id, at(2026, 3, 1), { input: 1, cacheRead: 0, cacheWrite: 0, output: 0 })
+      ledger[id].date = date
+    }
+    const kept = pruneLedger(ledger, today)
+    expect(Object.keys(kept).sort()).toEqual(['a', 'b'])
+    // 读回来的一条坏数据当没有
+    expect(normalizeEntry({ jobId: 'x', date: 'not-a-date' })).toBeUndefined()
+    expect(normalizeEntry({ jobId: 'x', date: today, input: 5 })?.input).toBe(5)
+  })
+
+  test('parses 800000000 / 8亿 / 800M / 0.8B and 0 means no limit', () => {
+    for (const text of ['800000000', '8亿', '800M', '0.8B', '800,000,000']) {
+      expect(parseTokenLimit(text)).toEqual({ limit: 800_000_000 })
+    }
+    expect(parseTokenLimit('80万')).toEqual({ limit: 800_000 })
+    expect(parseTokenLimit('')).toEqual({ limit: 0 })
+    expect(parseTokenLimit('0')).toEqual({ limit: 0 })
+    expect('error' in parseTokenLimit('abc')).toBe(true)
+    expect('error' in parseTokenLimit('-1')).toBe(true)
+    expect(setDsDailyLimit(normalize(undefined), 800_000_000).config.dsDailyLimit).toBe(800_000_000)
+    expect(normalize({ providers: [], slots: {}, dsDailyLimit: -5 }).dsDailyLimit).toBe(0)
+  })
+
+  test('warns at 80% and 100%, and says nothing without a limit', () => {
+    expect(usageWarning(799, 1000)).toBe('')
+    expect(usageWarning(800, 1000)).toContain('接近每日上限')
+    expect(usageWarning(800, 1000)).toContain('80%')
+    expect(usageWarning(1000, 1000)).toContain('已超出每日上限')
+    expect(usageWarning(1200, 1000)).toContain('120%')
+    expect(usageWarning(999_999, 0)).toBe('')
+  })
+
+  test('shows nothing when today has no usage and no limit', () => {
+    expect(usageLabel(0, 0)).toBe('')
+    expect(usageLabel(0, 0, 3)).toBe('')
+    expect(usageLabel(0, 800_000_000)).toBe('DS 今日 0/8亿 0%')
+    expect(usageLabel(120_000_000, 0)).toBe('DS 今日 1.2亿')
+    expect(usageLabel(120_000_000, 800_000_000)).toBe('DS 今日 1.2亿/8亿 15%')
+    expect(formatTokens(800_000_000)).toBe('8亿')
+    expect(formatTokens(80_000_000)).toBe('8000万')
+    expect(formatTokens(8000)).toBe('8000')
   })
 })
 

@@ -5,6 +5,10 @@
   },
   "plugins": [
     {
+      "name": "away-autopilot",
+      "source": "./away-autopilot"
+    },
+    {
       "name": "cache-keeper",
       "source": "./cache-keeper"
     },
@@ -27,6 +31,10 @@
     {
       "name": "dispatch-gate",
       "source": "./dispatch-gate"
+    },
+    {
+      "name": "effort-auto",
+      "source": "./effort-auto"
     },
     {
       "name": "ptc-run",

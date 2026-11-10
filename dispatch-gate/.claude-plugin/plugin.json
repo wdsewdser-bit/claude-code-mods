@@ -1,6 +1,6 @@
 {
   "name": "dispatch-gate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A soft gate on the main session: reminds it, then refuses once per stretch, to hand work to a subagent; and refuses one Claude subagent per hour past three.",
   "author": {
     "name": "yadaz"
@@ -41,6 +41,12 @@
       "title": "Acceptance requests after a dispatch",
       "description": "Requests after a dispatch whose tools are only Read, Grep or Glob: reading the work back is free and does not count.",
       "default": 3
+    },
+    "readOnlyWeight": {
+      "type": "number",
+      "title": "Weight of a read-only request",
+      "description": "What a request whose execution tools are all read-only adds to the consecutive-execution count. 0 to 1, clamped; 1 counts every request as one, as before.",
+      "default": 0.5
     }
   }
 }

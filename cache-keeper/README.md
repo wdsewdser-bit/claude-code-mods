@@ -29,7 +29,7 @@ Claude Code mod（function hooks 插件）：观察 prompt cache、在同一进�
 保活默认开启，只在全部成立时发一次 `$.model.fork({ prompt: 'Reply with OK only.' })`：没有被 `stop`；没有 turn 在跑；最近一次主线程请求的缓存前缀（read + write）≥ `minCacheReadTokens`；距该请求**开始**已到阈值（5m：245 s，1h：3120 s）但未超过 TTL；meter 未到 `maxRateLimitPercent`；没有处于"待重建基线"。
 
 - TTL 已过就不再发：那只会是一次整段重写，等下一次真实请求。
-- 一段 idle 内的保活次数有上限 `maxIdleKeepalives`，默认 3（1h TTL 下约覆盖 4 小时闲置），之后任缓存过期；设 0 = 按 API 单价的 break-even（Opus 5.5：5m 24 次、1h 39 次；Sonnet 5.5：5m 24 次）。这是 API 口径的启发式，不是套餐额度结论。
+- 一段 idle 内的保活次数有上限 `maxIdleKeepalives`，默认 3（1h TTL 下约覆盖 4 小时闲置），之后任缓存过期；设 0 = 按 API 单价的 break-even（数值由价格表算出：Fable 5.2：5m 49 次、1h 79 次；Opus 5.5：5m 24 次、1h 39 次；Sonnet 5.5：5m 24 次）。这是 API 口径的启发式，不是套餐额度结论。
 - 连续 `maxConsecutiveProbeFailures` 次 miss / 失败，或 5 小时额度超阈值：自动停止并提示。周额度不参与：它没用完时停保活只会换来一次整段重写，用完后请求失败，按失败次数停。
 - 模型或 effort 变化、compact 之后：暂停，直到下一次真实请求再次命中缓存。`/clear` 后等待新基线。
 - 不启动第二个 `claude --resume` 进程，不碰认证 token，不调用私有接口。
@@ -99,7 +99,7 @@ session 内先 `/cache-keeper experiment preflight`，再跑一个 plan：
     run-<实验>-<ttl>-r<n>-<session>.json
 ```
 
-报告把两种成本分开：API 等价成本按官方单价（2026-10-08 核对，含 Haiku 5.5 按 prompt 长度的两档）由日志算；套餐额度只看 `$.session.usage().rateLimits` 的百分比增量。meter 判定要求每侧至少 3 次干净重复、且增量至少 2 个百分点，否则写"无法判断"。
+报告把两种成本分开：API 等价成本按官方单价（2026-11-10 核对，覆盖 Fable 5.2 / 5.1 / 5、Mythos 5.2 / 5.1 / 5、Opus 5 / 5.5、Sonnet 5 / 5.5，含 Haiku 5.5 按 prompt 长度的两档）由日志算；套餐额度只看 `$.session.usage().rateLimits` 的百分比增量。meter 判定要求每侧至少 3 次干净重复、且增量至少 2 个百分点，否则写"无法判断"。
 
 离线工具（Node 24+，只读 transcript）：
 
@@ -143,7 +143,7 @@ node scripts/keepalive-net.ts --events ~/.claude/cache-keeper   # 附带影子�
 node scripts/keepalive-net.ts --prices '[["opus-5-5",{"input":4,"write5m":5,"write1h":8,"read":0.2,"output":20}]]'
 ```
 
-对每一对相邻请求：间隔超过 TTL、前缀 ≥ `--min-prefix`（默认 40000）才计入；按 keeper 的阈值（5m 245 s / 1h 3120 s）模拟最多 `--max-idle` 次保活。省下的钱 = 下一次请求实际写入的 `cache_creation_input_tokens` ×（写价 − 读价），且只在下一次请求没有命中缓存时计；成本 = 每次保活按读价读整段前缀 + 少量输入/输出。价格是 API 等价 USD / 百万 token，默认值在脚本顶部，来源 platform.claude.com/docs/en/about-claude/pricing（2026-10-08 读取），可用 `--prices` 覆盖。
+对每一对相邻请求：间隔超过 TTL、前缀 ≥ `--min-prefix`（默认 40000）才计入；按 keeper 的阈值（5m 245 s / 1h 3120 s）模拟最多 `--max-idle` 次保活。省下的钱 = 下一次请求实际写入的 `cache_creation_input_tokens` ×（写价 − 读价），且只在下一次请求没有命中缓存时计；成本 = 每次保活按读价读整段前缀 + 少量输入/输出。价格是 API 等价 USD / 百万 token，默认值在脚本顶部，来源 platform.claude.com/docs/en/about-claude/pricing（2026-11-10 读取，与 `hooks/lib/pricing.ts` 同一张表），可用 `--prices` 覆盖。
 
 大转录默认按 `--max-bytes`（12 MB）和 `--max-total-bytes`（200 MB）跳过，跳过的数量会打印出来；要覆盖更多就调大这两个值。`--ttl auto` 用线程里最后一次可见的 5m/1h 拆分，mixed 按 1h；没有拆分时按 5m，并在输出里给出 `ttlDefaultedGaps`。
 

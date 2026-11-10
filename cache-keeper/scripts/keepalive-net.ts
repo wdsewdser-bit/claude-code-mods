@@ -22,9 +22,11 @@
 // The estimate is API-equivalent USD, not subscription quota.
 //
 // PRICES: USD per million tokens, from
-// https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-08),
-// the same table as hooks/lib/pricing.ts. Override with --prices '<json>',
-// either an array of [regex, price] pairs or an object of the same.
+// https://platform.claude.com/docs/en/about-claude/pricing (read 2026-11-10),
+// the same table as hooks/lib/pricing.ts, in the same order: the more specific
+// generation first, so fable-5-2 and fable-5-1 precede fable-5, whose row also
+// takes dated ids. Override with --prices '<json>', either an array of
+// [regex, price] pairs or an object of the same.
 // Haiku 5.5 is priced by prompt length; this script uses its short-prompt row.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -45,8 +47,13 @@ type Price = {
 }
 
 const DEFAULT_PRICES: readonly (readonly [RegExp, Price])[] = [
+  [/fable-5-2(?!\d)|mythos-5-2(?!\d)/, { input: 8, write5m: 10, write1h: 16, read: 0.2, output: 40 }],
+  [/fable-5-1(?!\d)|mythos-5-1(?!\d)/, { input: 10, write5m: 12.5, write1h: 20, read: 0.25, output: 50 }],
+  [/fable-5|mythos-5/, { input: 10, write5m: 12.5, write1h: 20, read: 1, output: 50 }],
   [/opus-5-5/, { input: 4, write5m: 5, write1h: 8, read: 0.2, output: 20 }],
+  [/opus-5/, { input: 5, write5m: 6.25, write1h: 10, read: 0.5, output: 25 }],
   [/sonnet-5-5/, { input: 2, write5m: 2.5, write1h: 4, read: 0.1, output: 10 }],
+  [/sonnet-5/, { input: 2, write5m: 2.5, write1h: 4, read: 0.2, output: 10 }],
   [/haiku-5-5/, { input: 0.1, write5m: 0.125, write1h: 0.2, read: 0.01, output: 0.5 }],
   [/haiku-4-5/, { input: 1, write5m: 1.25, write1h: 2, read: 0.1, output: 5 }],
 ]

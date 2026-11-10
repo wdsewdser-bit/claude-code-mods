@@ -10,6 +10,7 @@ export type Draft = {
   proModel: string
   flashEffort: string
   proEffort: string
+  dsLimit: string
 }
 
 declare module 'claude-code' {

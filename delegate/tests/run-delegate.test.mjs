@@ -6,10 +6,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRootsEnv, readRootsOf, readRootsPromptArg } from '../scripts/read-roots.mjs'
 import { createOutputTracker } from '../scripts/stream-usage.mjs'
+import { createErrorNote } from '../scripts/error-note.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const src = fs.readFileSync(path.join(here, '../scripts/run-delegate.mjs'), 'utf8')
@@ -74,6 +76,79 @@ test('the result line overrides what the stream counted, and never lowers it', (
   assert.equal(u.final(undefined), 80)
   // 比数到的还小也不回退
   assert.equal(u.final({ output_tokens: 5 }), 80)
+})
+
+// 状态/日志写入失败的诊断：写一行、限流、目录不在时静默（绝不能把作业弄挂）。
+test('noteError appends one line with the where and the message', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delegate-note-'))
+  try {
+    const file = path.join(dir, 'errors.log')
+    const note = createErrorNote(file)
+    assert.equal(note('status', new Error('EBUSY: resource busy or locked')), 1)
+    const lines = fs.readFileSync(file, 'utf8').trim().split('\n')
+    assert.equal(lines.length, 1)
+    assert.match(lines[0], /^\d{4}-\d\d-\d\dT[\d:.]+Z status: EBUSY: resource busy or locked$/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('noteError throttles one where after the limit and only counts the rest', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delegate-note-'))
+  try {
+    const file = path.join(dir, 'errors.log')
+    const note = createErrorNote(file, { limit: 3 })
+    for (let i = 0; i < 8; i += 1) note('status', new Error('EPERM: operation not permitted'))
+    assert.equal(note.countOf('status'), 8)
+    const lines = fs.readFileSync(file, 'utf8').trim().split('\n')
+    assert.equal(lines.length, 4) // 3 条错误 + 1 条限流说明
+    assert.match(lines[3], /status: 同类错误已达 3 次，之后只计数（累计 4 次）$/)
+    // 别的 where 不受影响
+    assert.equal(note('events', new Error('ENOSPC')), 1)
+    assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').length, 5)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('noteError stays silent when the log directory is missing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delegate-note-'))
+  try {
+    const note = createErrorNote(path.join(dir, 'missing', 'errors.log'))
+    assert.doesNotThrow(() => note('status', new Error('x')))
+    assert.equal(note.countOf('status'), 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// DS 每日用量需要整次运行的输入分项：每次请求的 input + 缓存读 + 缓存写都算，同一条消息不重复加。
+test('parts sum every message input and cache read/write, and final output covers the run', () => {
+  const t = createOutputTracker()
+  t.onEvent({ type: 'message_start', message: { usage: { input_tokens: 100, cache_read_input_tokens: 9000, cache_creation_input_tokens: 50, output_tokens: 0 } } })
+  t.onEvent({ type: 'message_delta', usage: { input_tokens: 100, cache_read_input_tokens: 9000, cache_creation_input_tokens: 50, output_tokens: 10 } })
+  t.onEvent({ type: 'message_delta', usage: { input_tokens: 100, cache_read_input_tokens: 9000, cache_creation_input_tokens: 50, output_tokens: 20 } })
+  t.onEvent({ type: 'message_start', message: { usage: { input_tokens: 150, cache_read_input_tokens: 9500, cache_creation_input_tokens: 0, output_tokens: 0 } } })
+  t.onEvent({ type: 'message_delta', usage: { input_tokens: 150, cache_read_input_tokens: 9500, cache_creation_input_tokens: 0, output_tokens: 5 } })
+  assert.deepEqual(t.parts, { input: 250, cacheRead: 18_500, cacheWrite: 50, output: 25 })
+  assert.equal(t.final({ input_tokens: 999, cache_read_input_tokens: 999, output_tokens: 40 }), 40)
+  // result 行的输入只代表最后一次请求，不能覆盖流里累加出来的分项。
+  assert.deepEqual(t.parts, { input: 250, cacheRead: 18_500, cacheWrite: 50, output: 40 })
+})
+
+test('the real message_delta input replaces the larger message_start estimate', () => {
+  const t = createOutputTracker()
+  t.onEvent({ type: 'message_start', message: { usage: { input_tokens: 1400, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0, output_tokens: 0 } } })
+  t.onEvent({ type: 'message_delta', usage: { input_tokens: 1000, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0, output_tokens: 2 } })
+  assert.deepEqual(t.parts, { input: 1000, cacheRead: 1000, cacheWrite: 0, output: 2 })
+})
+
+test('parts fall back to the result usage when the stream reported no input at all', () => {
+  const t = createOutputTracker()
+  t.onEvent({ type: 'message_delta', usage: { output_tokens: 10 } })
+  assert.deepEqual(t.parts, { input: 0, cacheRead: 0, cacheWrite: 0, output: 10 })
+  t.final({ input_tokens: 7, cache_read_input_tokens: 3, output_tokens: 12 })
+  assert.deepEqual(t.parts, { input: 7, cacheRead: 3, cacheWrite: 0, output: 12 })
 })
 
 test('garbage events never throw and never invent output', () => {

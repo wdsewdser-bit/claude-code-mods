@@ -11,6 +11,7 @@ import {
   parseTier,
   removeProvider,
   resolveTier,
+  setDsDailyLimit,
   setGptHidePrefix,
   setGptSource,
   setSlot,
@@ -52,6 +53,21 @@ import {
 import { createDrawGate, readEventView, spanOf, tokensOf, usageOf } from './lib/jobs.ts'
 import type { Agent, JobRecord, JobStatusFile, LiveEvent, Mode, Ptc } from './lib/jobs.ts'
 import { barOf, normalizeQuota, resetIn, usedColor } from './lib/quota.ts'
+import {
+  entryOf,
+  formatTokens,
+  localDate,
+  normalizeEntry,
+  parseTokenLimit,
+  partsOf,
+  percentOf,
+  pruneLedger,
+  summaryOf,
+  upsertEntry,
+  usageLabel,
+  usageWarning,
+} from './lib/ds-usage.ts'
+import type { UsageLedger, UsageParts } from './lib/ds-usage.ts'
 import type { GptQuota } from './lib/quota.ts'
 
 const COMMAND = 'delegate'
@@ -87,7 +103,21 @@ const EMPTY: Draft = {
   proModel: '',
   flashEffort: '',
   proEffort: '',
+  dsLimit: '',
 }
+
+// DS 每日 token 用量：每条作业一个 usage:<jobId> key（与 job:<id> 一样的并发模型），
+// 日总量 = 当天各作业总量之和。按钮栏/面板只读这里的内存值，渲染时不碰 store。
+const USAGE_PREFIX = 'usage:'
+const USAGE_TTL_MS = 3_000
+const USAGE_PERSIST_MS = 30_000
+let dsLedger: UsageLedger = {}
+let dsToday = summaryOf({}, localDate(Date.now()))
+let dsLimit = 0
+let dsLoadedAt = 0
+let dsPending: Promise<void> | undefined
+let dsPersistAt = new Map<string, number>()
+let dsPruneAt = 0
 
 const draftAtom = atom({ plugin: 'delegate', key: 'draft' } as const, EMPTY)
 const flashAtom = atom({ plugin: 'delegate', key: 'flash' } as const, '')
@@ -112,8 +142,17 @@ let migrationPending: Promise<Config> | undefined
 const loadConfig = async ($: EngineInterface): Promise<Config> => {
   if (migrationPending) return migrationPending
   let raw: unknown
-  try { raw = await $.store.get(STORE_KEY) } catch { return normalize(undefined) }
+  try {
+    raw = await $.store.get(STORE_KEY)
+  } catch {
+    const seed = normalize(undefined)
+    dsLimit = seed.dsDailyLimit ?? 0
+
+    return seed
+  }
   const plan = migrationPlan(raw)
+  // 每日上限跟着配置走：面板和派发返回都用这个内存值，渲染时不重读 store。
+  dsLimit = plan.config.dsDailyLimit ?? 0
   if (!plan.providers.length) return plan.config
   migrationPending = (async () => {
     const existing = (await admin($, 'providers')).providers || []
@@ -270,6 +309,7 @@ const gptPrefixToStrip = (config: Config): string => {
 
 const saveConfig = async ($: EngineInterface, config: Config): Promise<void> => {
   await $.store.set(STORE_KEY, config)
+  dsLimit = config.dsDailyLimit ?? 0
   await describeTool($, config)
   await update($, versionAtom, n => n + 1)
 }
@@ -281,6 +321,8 @@ type JobReply = {
   sessionId?: string | null
   turns?: number | null
   ms?: number
+  // DS 作业整次运行的输入分项 + 输出；没拿到就是 null/缺省（未知，不是 0）
+  usageParts?: UsageParts | null
   // 实际作答的模型（按出现顺序去重）；一个都没看到就是 null
   models?: string[] | null
   // 任务自己写的 TASK_TERMINAL（completed / blocked / failed）；没写就是 null
@@ -484,6 +526,22 @@ const changeAction = async (
   ok: string,
 ): Promise<void> => {
   await applyResult($, make(await loadConfig($)), ok, {})
+}
+
+const dsLimitAction = async ($: EngineInterface): Promise<void> => {
+  const text = (await read($, draftAtom)).dsLimit
+  const parsed = parseTokenLimit(text)
+  if ('error' in parsed) {
+    await setFlash($, parsed.error)
+
+    return
+  }
+  await changeAction(
+    $,
+    c => setDsDailyLimit(c, parsed.limit),
+    parsed.limit === 0 ? 'DS 每日上限已取消（只统计，不提醒）' : `DS 每日上限：${formatTokens(parsed.limit)} token`,
+  )
+  await setDraftField($, 'dsLimit', '')
 }
 
 const testAction = async ($: EngineInterface, target: Agent): Promise<void> => {
@@ -805,6 +863,119 @@ const readStoreFile = async (
     return obj
   }
   return undefined
+}
+
+
+// ── DS 每日 token 用量：store 里每条作业一个 usage:<jobId>（与 job:<id> 同一思路，两个会话不会互相覆盖）──
+const usageKey = (jobId: string): string => `${USAGE_PREFIX}${jobId}`
+
+const loadUsageLedger = async ($: EngineInterface): Promise<UsageLedger> => {
+  let keys: string[] = []
+  try {
+    keys = await $.store.keys()
+  } catch {
+    return dsLedger // 读不到就沿用内存里的，别把已有读数清成 0
+  }
+  const usageKeys = keys.filter(key => key.startsWith(USAGE_PREFIX))
+  if (usageKeys.length === 0) return {}
+  const ledger: UsageLedger = {}
+  // 和 listJobs 一样：keys() 之后只读一次落盘文件，替掉每条一次 store.get（宿主每次 get 都重读整份文件）。
+  const file = await readStoreFile($, keys)
+  if (file !== undefined) {
+    for (const key of usageKeys) {
+      const entry = normalizeEntry(file[key], key.slice(USAGE_PREFIX.length))
+      if (entry !== undefined) ledger[entry.jobId] = entry
+    }
+    return ledger
+  }
+  for (const key of usageKeys) {
+    try {
+      const entry = normalizeEntry(await $.store.get(key), key.slice(USAGE_PREFIX.length))
+      if (entry !== undefined) ledger[entry.jobId] = entry
+    } catch {}
+  }
+  return ledger
+}
+
+/** 只保留最近 30 天：内存里先剪，store 里的旧 key 最多一分钟删一次。 */
+const pruneUsage = async ($: EngineInterface, ledger: UsageLedger, today: string): Promise<UsageLedger> => {
+  const kept = pruneLedger(ledger, today)
+  const dead = Object.keys(ledger).filter(jobId => kept[jobId] === undefined)
+  if (dead.length === 0 || Date.now() - dsPruneAt < 60_000) return kept
+  dsPruneAt = Date.now()
+  for (const jobId of dead) {
+    try {
+      await $.store.delete(usageKey(jobId))
+    } catch {}
+    dsPersistAt.delete(jobId)
+  }
+  return kept
+}
+
+/** 重读所有会话写下的日账本（按 TTL，最多 3 秒一次），刷新按钮栏/面板用的内存值。 */
+const refreshDsUsage = async ($: EngineInterface, force = false): Promise<void> => {
+  if (dsPending !== undefined) {
+    await dsPending
+    return
+  }
+  if (!force && Date.now() - dsLoadedAt < USAGE_TTL_MS) return
+  dsPending = (async () => {
+    const today = localDate(Date.now())
+    dsLedger = await pruneUsage($, await loadUsageLedger($), today)
+    dsToday = summaryOf(dsLedger, today)
+    dsLoadedAt = Date.now()
+  })()
+  try {
+    await dsPending
+  } finally {
+    dsPending = undefined
+  }
+}
+
+/** 记一条作业到目前为止的总量：同一 jobId 只替换自己那一条，反复更新不会重复加。 */
+const noteDsUsage = async (
+  $: EngineInterface,
+  rec: JobRecord,
+  parts: UsageParts | undefined,
+  force: boolean,
+): Promise<void> => {
+  if (rec.tier === 'gpt') return
+  const entry = entryOf(rec.jobId, rec.at, parts)
+  dsLedger = upsertEntry(dsLedger, entry)
+  const today = localDate(Date.now())
+  if (entry.date === today) dsToday = summaryOf(dsLedger, today)
+  const now = Date.now()
+  if (!force && now - (dsPersistAt.get(rec.jobId) ?? 0) < USAGE_PERSIST_MS) return
+  try {
+    await $.store.set(usageKey(rec.jobId), entry)
+    dsPersistAt.set(rec.jobId, now)
+  } catch (error) {
+    $.ui.log(`delegate: DS 用量没写进 store（${rec.jobId}）：${messageOf(error)}`, { to: 'debug' })
+  }
+}
+
+/** 按钮栏/面板/列表的一行；今日 0 用量且没设上限时是空串（什么都不显示）。 */
+const dsTodayLine = (): string => usageLabel(dsToday.total, dsLimit, dsToday.missing)
+
+/** 重启后把今天（以及还在跑的）DS 作业的 usage 从 result / status 补记进账本。 */
+const syncDsUsage = async ($: EngineInterface): Promise<void> => {
+  // 先把已有账本读进内存，已记过的作业就不必再写一遍。
+  await refreshDsUsage($, true)
+  const records = await listJobs($)
+  const today = localDate(Date.now())
+  const root = await rootOf($)
+  for (const rec of records) {
+    if (rec.tier === 'gpt') continue
+    if (localDate(rec.at) !== today && rec.status !== 'running') continue
+    if (dsLedger[rec.jobId] !== undefined) continue
+    let parts: UsageParts | undefined
+    const dir = root === undefined ? undefined : jobDir(root, rec.jobId)
+    if (dir !== undefined) {
+      parts = partsOf((await readResult($, dir))?.usageParts)
+      if (parts === undefined) parts = partsOf((await readStatus($, dir))?.usage)
+    }
+    await noteDsUsage($, rec, parts, true)
+  }
 }
 
 // 第一条消息之前 $.session.id() 可能迟迟不返回；按钮栏的绘制等它就会整条不出来，所以限时 300ms。
@@ -1201,6 +1372,15 @@ const settle = async (
   const config = await loadConfig($).catch(() => undefined)
   const note = runnerNote(reply, record.tier === 'gpt' && config !== undefined ? gptPrefixToStrip(config) : '')
   const tail = note === '' ? '' : `\n${note}`
+  // DS 每日用量：结束时把这条作业的总量覆盖进账本（反复更新不会重复加）；跨零点仍记在开始那天。
+  let usageNote = ''
+  if (record.tier !== 'gpt') {
+    try {
+      await refreshDsUsage($, true)
+      await noteDsUsage($, record, partsOf(reply.usageParts), true)
+      usageNote = usageWarning(dsToday.total, dsLimit)
+    } catch {}
+  }
   // 作业结束后还在跑的子进程：成功分支 runner 已经把它写进 text，失败分支的 text 不显示，这里补一句。
   const left = Array.isArray(reply.leftover) ? reply.leftover : []
   const leftoverNote =
@@ -1208,14 +1388,14 @@ const settle = async (
       ? ''
       : `\n⚠ 有 ${left.length} 个子进程在作业结束后还在运行：${left.map(p => `${p.pid} ${p.name} ${p.cmd}`.trim()).join('，')}，确认没用了就 taskkill //PID <pid> //F`
   if (!reply.ok) {
-    return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${tail}${leftoverNote}`, isError: true }
+    return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${tail}${leftoverNote}${usageNote === '' ? '' : `\n${usageNote}`}`, isError: true }
   }
   const text = reply.text ?? ''
   // 请示没等到回复就结束了：通知里点明，别当成正常完成。
   const askNote = reply.askTimeout === true ? '请示未获回复，作业已按请示内容结束；要接着做就 resume。\n' : ''
 
   return {
-    result: `${head}\n${askNote}${text.length > MAX_REPLY ? `${text.slice(0, MAX_REPLY)}\n…（已截断）` : text}${tail}`,
+    result: `${head}\n${askNote}${text.length > MAX_REPLY ? `${text.slice(0, MAX_REPLY)}\n…（已截断）` : text}${tail}${usageNote === '' ? '' : `\n${usageNote}`}`,
   }
 }
 
@@ -1344,8 +1524,12 @@ const listAction = async (
     if (status !== undefined) live[rec.jobId] = status
   }
   const shown = filter === '' || filter === 'all' ? all : all.filter(rec => rec.status === filter)
+  const listed = formatList(shown, { now: Date.now(), limit, filter: filter === 'all' ? '' : filter, live })
+  // 末尾附一行 DS 今日用量（没有用量又没设上限时是空串，旧输出不变）。
+  await refreshDsUsage($, true).catch(() => undefined)
+  const dsLine = dsTodayLine()
 
-  return { result: formatList(shown, { now: Date.now(), limit, filter: filter === 'all' ? '' : filter, live }) }
+  return { result: dsLine === '' ? listed : `${listed}\n${dsLine}` }
 }
 
 const statusAction = async (
@@ -1768,6 +1952,12 @@ const ensureLiveTimer = ($: EngineInterface): void => {
           const st = root === undefined ? undefined : await readStatus($, jobDir(root, r.jobId))
           if (st !== undefined) statuses[r.jobId] = st
         }
+        // DS 今日用量：先按 TTL 合并别的会话的账本，再把运行中作业的最新总量覆盖进去（同一作业不会重复加）。
+        await refreshDsUsage($)
+        for (const r of running) {
+          const parts = r.tier === 'gpt' ? undefined : partsOf(statuses[r.jobId]?.usage)
+          if (parts !== undefined) await noteDsUsage($, r, parts, false)
+        }
         // 请示要播报给主会话，和面板开没开无关，所以放在下面的面板判断之前。
         // 只播报本会话派的作业：别的会话的请示由那边自己的计时器播报。
         if (!stopped) {
@@ -1881,6 +2071,8 @@ export const register: Register = on => {
       await describeJobTools($)
       // 重启后：补发没发出去的后台通知，把进程没了的 running 标成 orphaned（仍可 resume）。
       await recoverJobs($)
+      // 重启后把今天（和还在跑的）DS 作业的 usage 从 result / status 补进日账本。
+      await syncDsUsage($)
       ensureLiveTimer($)
       await redraw($) // 会话就绪后补画一次按钮栏
     } catch (error) {
@@ -2133,10 +2325,23 @@ export const register: Register = on => {
       </Box>
     )
 
+    // DS 今日用量：与 GPT 额度并排一块；今天没有用量又没设上限时不画（旧面板不变）。
+    const dsLine = dsTodayLine()
+    const dsBox = dsLine === '' ? undefined : (
+      <Box borderStyle="round" borderDimColor paddingX={2}>
+        {dsLimit > 0 ? (
+          <Text color={usedColor(percentOf(dsToday.total, dsLimit))}>{dsLine}</Text>
+        ) : (
+          <Text dimColor>{dsLine}</Text>
+        )}
+      </Box>
+    )
+
     if (jobs.length === 0) {
       return ok(
         <Box flexDirection="column" gap={1}>
           {quotaBox}
+          {dsBox}
           <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1}>
             <Text weight="semibold">{showAll ? '还没有委派任务' : '本会话还没有委派任务'}</Text>
             <Text dimColor>派出 delegate_flash / pro / gpt 后，这里会实时显示它们在做什么。</Text>
@@ -2381,6 +2586,7 @@ export const register: Register = on => {
     return ok(
       <Box flexDirection="column" gap={1} overflow="hidden">
         {quotaBox}
+        {dsBox}
         <Box flexWrap="wrap" gap={1} alignItems="flex-start" overflow="hidden">
           {list}
           {detail}
@@ -2419,6 +2625,8 @@ export const register: Register = on => {
     const nRunning = (await listJobs($)).filter(r => r.status === 'running' && mine(r, me)).length
     // 额度只在已有的计时器（ensureLiveTimer 每 2 秒）里刷新：绘制路径里不许 update，绘制中 state.set 会被拒。
     const five = quota?.ok === true ? quota.windows.find(w => w.label === '5 小时') : undefined
+    // DS 今日用量：读内存值（计时器随作业事件更新），绘制路径不读盘。
+    const dsLine = dsTodayLine()
     // Button 只收字符串和 Text：条件部分先拼好，不留 false。
     const parts = [
       <Text key="d" color={nRunning > 0 ? 'suggestion' : 'inactive'}>
@@ -2437,6 +2645,15 @@ export const register: Register = on => {
         <Text key="gp" color={usedColor(five.used)}>
           {`${Math.round(five.used)}%`}
         </Text>,
+      )
+    }
+    if (dsLine !== '') {
+      parts.push(
+        dsLimit > 0 ? (
+          <Text key="ds" color={usedColor(percentOf(dsToday.total, dsLimit))}>{` · ${dsLine}`}</Text>
+        ) : (
+          <Text key="ds" dimColor>{` · ${dsLine}`}</Text>
+        ),
       )
     }
     parts.push(
@@ -2598,6 +2815,12 @@ export const register: Register = on => {
         {sourceRows}
         {gptSource === '' ? undefined : keepaliveRow}
         <Select key="gpt-prefix" label="隐藏供应商前缀" options={[{ label: '开 · 只显示 gpt-6.1-sol', value: 'on' }, { label: '关 · 显示 mypool-resp/gpt-6.1-sol', value: 'off' }]} value={config.gptHidePrefix === false ? 'off' : 'on'} onSelect={(v: string) => changeAction($, c => setGptHidePrefix(c, v === 'on'), v === 'on' ? 'GPT 模型名只显示裸名' : 'GPT 模型名显示完整前缀')} />
+      </Box>)}
+      {card('ds', 'DS 每日用量', <Box flexDirection="column" overflow="hidden" gap={1}>
+        <Text wrap="truncate-end">{dsTodayLine() === '' ? '今天还没有 DS 用量' : dsTodayLine()}</Text>
+        <Text dimColor>{'当前上限：' + (config.dsDailyLimit !== undefined && config.dsDailyLimit > 0 ? formatTokens(config.dsDailyLimit) : '不限（只统计，不提醒）')}</Text>
+        <Input key="ds-limit" label="DS 每日上限（token，0=不限，可写 8亿 / 800M）" value={draft.dsLimit !== '' ? draft.dsLimit : config.dsDailyLimit !== undefined && config.dsDailyLimit > 0 ? formatTokens(config.dsDailyLimit) : ''} onInput={v => setDraftField($, 'dsLimit', v)} onSubmit={() => paneAction($, () => dsLimitAction($))} />
+        <Text dimColor>只统计 delegate_flash / delegate_pro，不含 delegate_gpt；按本机日期每天重新计，超了也照常派发。</Text>
       </Box>)}
       <Text dimColor>供应商密钥仅保存在本机 CPA 配置中。</Text>
     </Box>
