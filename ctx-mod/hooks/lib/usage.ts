@@ -151,6 +151,8 @@ export const gateSwitch = (
     judgement: Judgement | null
     /** A switch the gate asked for in front of a load: it skips the cooldown and the payoff, like urgent. */
     isForLoad?: boolean
+    /** Current context fill; at or above `boundaryTokens` the cooldown no longer applies (the payoff check still does). */
+    tokens?: number
     /** Why the ledger is not fresh, when the caller knows better than the fixed sentence. */
     staleReason?: string
   },
@@ -164,10 +166,11 @@ export const gateSwitch = (
     }
   }
   const skipsPayoff = input.level === 'urgent' || input.isForLoad === true
-  if (input.requestsSinceSwitch < config.cooldownRequests && !skipsPayoff) {
+  const isFull = input.tokens !== undefined && input.tokens >= config.boundaryTokens
+  if (input.requestsSinceSwitch < config.cooldownRequests && !skipsPayoff && !isFull) {
     return {
       isAllowed: false,
-      reason: `距上次换窗口只过了 ${input.requestsSinceSwitch} 次请求，未到冷却门槛 ${config.cooldownRequests} 次（当前级别 ${input.level}，只有 urgent 能越过冷却）。`,
+      reason: `距上次换窗口只过了 ${input.requestsSinceSwitch} 次请求，未到冷却门槛 ${config.cooldownRequests} 次（当前级别 ${input.level}，只有 urgent 或上下文到 ${config.boundaryTokens} token 才能越过冷却）。`,
     }
   }
   if (!input.hasFreshLedger) {
