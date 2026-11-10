@@ -2575,6 +2575,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
         ...(staleReason === undefined ? {} : { staleReason }),
         level: env.tokens === undefined ? 'none' : levelOf(env.tokens, env.limit, config),
         judgement,
+        ...(env.tokens === undefined ? {} : { tokens: env.tokens }),
         // A switch made in front of a held-back load may skip the cooldown and the payoff.
         isForLoad: state.gateWanted.length > 0,
       },

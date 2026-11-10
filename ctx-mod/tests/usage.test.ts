@@ -179,6 +179,8 @@ describe('gateSwitch', () => {
     expect(gateSwitch(gateInput({ requestsSinceSwitch: 29 }), DEFAULTS).isAllowed).toBe(false)
     expect(gateSwitch(gateInput({ requestsSinceSwitch: 30 }), DEFAULTS).isAllowed).toBe(true)
     expect(gateSwitch(gateInput({ requestsSinceSwitch: 0, level: 'urgent' }), DEFAULTS).isAllowed).toBe(true)
+    expect(gateSwitch(gateInput({ requestsSinceSwitch: 5, tokens: 199_999 }), DEFAULTS).isAllowed).toBe(false)
+    expect(gateSwitch(gateInput({ requestsSinceSwitch: 5, tokens: 200_000 }), DEFAULTS).isAllowed).toBe(true)
   })
 
   test('a stale ledger stops it, urgent included', () => {
