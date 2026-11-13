@@ -1,1 +1,22 @@
-{ "name": "ptc-run", "version": "0.2.0", "description": "Programmatic tool calling: run_code runs a JS program that calls read/glob/grep/edit/bash in a sandbox and returns only the final value; large results spill to refs.", "author": { "name": "yadaz" } }
+{
+  "name": "ptc-run",
+  "version": "0.2.0",
+  "description": "Programmatic tool calling: run_code runs a JS program that calls read/glob/grep/edit/bash in a sandbox and returns only the final value; large results spill to refs.",
+  "author": {
+    "name": "yadaz"
+  },
+  "userConfig": {
+    "nudgeAfter": {
+      "type": "number",
+      "title": "Remind after (consecutive single-step requests)",
+      "description": "Main session requests that each sent exactly one Bash/Read/Grep/Glob call, with no run_code and no dispatch, before one reminder line is injected. 0 turns the reminder off. PTC_RUN_NUDGE overrides it.",
+      "default": 2
+    },
+    "bashMaxChars": {
+      "type": "number",
+      "title": "Bash output cap (characters)",
+      "description": "A Bash result over this keeps the first 60% and the last 30%; the middle becomes one marker line naming the file that holds the whole text under ~/.claude/ptc-run/overflow/. 0 turns it off. PTC_RUN_BASH_MAX overrides it.",
+      "default": 8000
+    }
+  }
+}
