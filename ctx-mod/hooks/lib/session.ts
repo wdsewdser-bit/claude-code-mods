@@ -74,6 +74,7 @@ import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
 import { extractDecisions, renderDecisions } from './decisions.ts'
+import { isBackfillPending, PENDING_FILE, withBackfillPrefix } from './backfill.ts'
 import { cursorOf, notedFromLines, renderNoted } from './noter.ts'
 import type { NotedDecision } from './noter.ts'
 import { detectLineage, lineageFrom } from './lineage.ts'
@@ -120,6 +121,9 @@ export type Env = {
 }
 
 export type ToolResult = { result: string; isError?: true }
+
+/** What one merge of a pending backfill did: the seqs it booked, and what it refused to book. */
+export type BackfillMerge = { added: number[]; dropped: { task_id: string; reason: string }[] }
 
 /** A switch the model asked for and the gate stood behind, until the turn ends. */
 /** `requests` and `seq` are the request count and history seq at approval: calls of the approving step are let through. */
@@ -445,6 +449,12 @@ export type Session = {
   noteRequest: () => void
   reminder: (env: Env) => string | null
   ledgerAppend: (input: unknown, env: Env) => Promise<ToolResult>
+  /**
+   * Folds the pending backfill a note-taker run left in backfill-pending.json into the
+   * page, allocating its seqs here — the child never writes ledger.jsonl and never picks a
+   * number. A no-op when there is nothing pending. `await ready()` first.
+   */
+  mergeBackfill: () => Promise<BackfillMerge>
   /**
    * Books cache-keeper's snapshot of the still-open tasks, once per snapshot: the entries
    * that pass the ledger's check, as a count. Never throws, so a switch goes on regardless.
@@ -1998,6 +2008,117 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     return { result }
   }
 
+  /**
+   * Books what the note-taker's backfill left behind. The child could not append to
+   * ledger.jsonl itself: the main process holds the page in memory and rewrites the file
+   * whole, so a line added from outside would be lost by the next write, and a seq picked
+   * there would collide with the one this process is about to hand out. So it leaves a
+   * pending file; here the records join the page, get their numbers from this process's
+   * own counter, and go out through the same queue as every other ledger write.
+   *
+   * Two records of the same shape never both land, so a merge that has to run twice (a
+   * claim that could not be removed, a hook that was replayed) books nothing twice. A
+   * record for a task that ended since the round ran is dropped, never written: an
+   * `in_progress` line after a `done` one would reopen finished work.
+   */
+  const doMergeBackfill = async (): Promise<BackfillMerge> => {
+    await ensureLoaded()
+    const path = pathIn(PENDING_FILE)
+    const text = await readText(path)
+    // A host without delete leaves an empty file behind: that is "nothing pending", not a fault.
+    if (text === null || text.trim() === '') return { added: [], dropped: [] }
+    // Claimed before it is read: a second merge must not find the same records again.
+    if (io.remove === undefined) await queue.push(path, '')
+    else await io.remove(path).catch(() => undefined)
+    let raw: unknown
+    try {
+      raw = JSON.parse(text)
+    } catch {
+      return { added: [], dropped: [{ task_id: '', reason: '待并入的补记不是合法 JSON' }] }
+    }
+    if (!isBackfillPending(raw)) {
+      return { added: [], dropped: [{ task_id: '', reason: '待并入的补记格式不对' }] }
+    }
+    const referenced: number[] = [raw.round]
+    for (const item of raw.entries) if (item.evidence !== undefined) referenced.push(...item.evidence)
+    await ensureHistory(referenced)
+    const tasks = tasksOf(state.page)
+    const latestPersonSeq = latestPersonRow()?.seq ?? null
+    const latestRelaySeq = latestRelayRow()?.seq ?? null
+    const added: number[] = []
+    const dropped: { task_id: string; reason: string }[] = []
+    for (const item of raw.entries) {
+      const task = tasks.find(found => found.taskId === item.task_id)
+      if (task !== undefined && (task.status === 'done' || task.status === 'superseded')) {
+        dropped.push({ task_id: item.task_id, reason: `已经结束（${task.status}），补记会把它重新打开` })
+        continue
+      }
+      const body = withBackfillPrefix(item.text)
+      const seen = state.page.some(
+        entry => entry.task_id === item.task_id && entry.text === body && entry.request_ref === raw.round,
+      )
+      if (seen) {
+        dropped.push({ task_id: item.task_id, reason: '同样的记录已经在账本里' })
+        continue
+      }
+      const input: LedgerInput = {
+        task_id: item.task_id,
+        title: item.title,
+        status: item.status,
+        text: body,
+        request_ref: raw.round,
+      }
+      if (item.evidence !== undefined) input.evidence = item.evidence
+      if (item.next_step !== undefined) input.next_step = item.next_step
+      // The ledger's own check, minus the one rule a backfill must not satisfy: a record
+      // that carries no next step is exactly what "leave the task's own step alone" means.
+      const problems = validate(input, {
+        entries: state.page,
+        history: seq => bySeq(seq),
+        latestPersonSeq,
+        latestRelaySeq,
+        checkAnchor: () => 'missing-file',
+        config,
+      }).filter(problem => !problem.startsWith('status 是 in_progress'))
+      if (problems.length > 0) {
+        dropped.push({ task_id: item.task_id, reason: problems.join('；') })
+        continue
+      }
+      const seq = state.ledgerSeq + 1
+      // Stamped with the round's own window and time, never with this moment: a record of
+      // an older round must not make the ledger look fresh for the window that is running.
+      const entry = stamp(input, {
+        seq,
+        ts: raw.ts,
+        window: raw.window,
+        latestPersonSeq,
+        latestRelaySeq,
+        through: raw.through,
+      })
+      entry.source = 'backfill'
+      state.ledgerSeq = seq
+      state.page.push(entry)
+      added.push(seq)
+    }
+    if (added.length > 0) {
+      await queue.push(pathIn('ledger.jsonl'), toJsonl(state.page))
+      saveMeta()
+    }
+
+    return { added, dropped }
+  }
+  /** One merge at a time: two hooks in the same process must not each book the same file. */
+  let merging: Promise<BackfillMerge> | null = null
+  const mergeBackfill = (): Promise<BackfillMerge> => {
+    if (merging !== null) return merging
+    const running = doMergeBackfill().finally(() => {
+      merging = null
+    })
+    merging = running
+
+    return running
+  }
+
   /** The longest a snapshot's own text may run, so the entry passes the ledger's length check. */
   const SNAPSHOT_TEXT_CHARS = 600
 
@@ -2928,6 +3049,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     noteRequest,
     reminder,
     ledgerAppend,
+    mergeBackfill,
     ledgerSnapshot,
     ledgerRead,
     decisionRevoke,

@@ -80,6 +80,7 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 | `coldMinTokens` | `CTX_MOD_COLD_MIN_TOKENS` | `80000` | 缓存已过期时，上下文超过多少 token 才扣下消息、先换窗 |
 | `gateMinTokens` | `CTX_MOD_GATE_MIN_TOKENS` | `120000` | 上下文超过多少 token 时，加载会重建缓存的工具组之前先换窗 |
 | `noter` | `CTX_MOD_NOTER` | `false` | 是否让一个 Haiku 小模型读用户消息、把已定决策存进会话目录（见下一节）。关时不调模型，决策仍由规则提取 |
+| — | `CTX_MOD_LEDGER_BACKFILL` | `false` | 值为 `1` 且笔记员也开着时，才在同一个后台运行里给“这一轮主模型没记账”的上一轮补一条记录（见“账本补记”） |
 
 - 配置只在会话启动时读一次。取值必须是有限正数（`cooldownRequests`、`maxSwitchesPerHour` 可以是 `0`）；读不到或数值非法时回退默认值，不会报错。
 - 三档提醒必须满足 `boundaryTokens ≤ softTokens ≤ urgentTokens`；不满足时三档整组回退默认值，并在调试日志里记一条。
@@ -96,6 +97,16 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 - 回退：把 `noter` 设回 `false`（或删掉环境变量 `CTX_MOD_NOTER`）即恢复纯规则提取，已有的 `noted.jsonl` 会被忽略；想彻底清掉就删掉这三个文件。手动补跑一次：`node scripts/noter.mjs <会话目录> [--max-batches N]`。
 - 代价：每批一次模型调用（默认每次最多 4 批），实测一批约 4 万字符输入、数美分以内。觉得贵就把开关关掉。
 
+## 账本补记（实验，默认关）
+
+主模型有时在一轮里改了不少东西却没记一笔账，换窗口时那一轮就只留在历史里。打开 `CTX_MOD_LEDGER_BACKFILL=1`（必须同时开着笔记员）后，收到新的用户消息时，同一个后台运行会看上一轮（从上一条用户亲口消息到这条之前）：那一轮没调用过 `ledger_append`、除账本工具外至少 3 个工具调用、还没补记过，就让小模型补一条进展记录，最多一次模型请求。
+
+- 只写进展：状态只能是 `in_progress` 或 `blocked`（模型说 done/superseded 一律按 in_progress 记），evidence 只留该轮动作里真实出现过的编号，一轮最多 2 条，text 截到 200 字，新起任务 id 一轮最多一个。已有的 `next_step`、`anchors`、`done_when`、`dead_ends` 一律沿用，不改。某个任务在这一轮之前就已经 done/superseded 时，这条记录被丢弃，不会把它重新打开。
+- 落盘方式：子进程不碰 `ledger.jsonl`（那个文件由主进程整页重写），只把记录写进 `backfill-pending.json`；钩子进程在下一次用户消息或工具调用之后把它并进账本，编号由主进程分配，所以和主模型自己记账不会重号。
+- 记录带 `"source": "backfill"`，文字以“〔补记〕”开头，交接首页和 `ledger_read` 里都能看出来；窗口号和时间取那一轮自己的，所以不会让账本在别人眼里显得“刚更新过”。
+- 同一轮只处理一次，失败最多重试一次（`backfill-state.json` 记着每轮的尝试次数）。
+- 试跑（不写盘、不落日志，只打印将要写入的记录和实际用量）：`node scripts/noter.mjs <会话目录> --backfill-round <轮次编号> --dry-run`；列出可试跑的轮次：`node scripts/noter.mjs <会话目录> --list-backfill-rounds`。
+
 ## 数据放在哪
 
 每个会话一个目录：`~/.claude/ctx-mod/<session-id>/`。跨会话的 `~/.claude/ctx-mod/costly.json` 记录哪些工具组加载后会重建缓存，写入时用 `costly.json.lock` 加锁。
@@ -111,6 +122,7 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 | `meta.json` | 编号、窗口号、文件活动、派发名单、重建记录等状态 |
 | `held.json` | 缓存过期时扣下、还没提交的用户消息 |
 | `noted.jsonl` / `noter-cursor.json` / `noter.log` | 笔记员记下的决策、它读到哪儿、每次运行的日志（开关打开时才有） |
+| `backfill-pending.json` / `backfill-state.json` | 补记等着并进账本的记录、哪些轮次已经试过（补记开关打开时才有） |
 
 这些文件含有会话的全部内容，包括工具输出。mod 不会把它们发到任何地方。
 
