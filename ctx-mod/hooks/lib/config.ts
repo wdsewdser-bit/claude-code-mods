@@ -9,6 +9,7 @@ import type { Config } from './types.ts'
 export const ENV = {
   enabled: 'CTX_MOD',
   noter: 'CTX_MOD_NOTER',
+  backfill: 'CTX_MOD_LEDGER_BACKFILL',
   compactWindow: 'CTX_MOD_COMPACT_WINDOW',
   boundaryTokens: 'CTX_MOD_BOUNDARY_TOKENS',
   softTokens: 'CTX_MOD_SOFT_TOKENS',
@@ -97,6 +98,16 @@ export const noterOf = (
 }
 
 /**
+ * Whether the ledger backfill runs: its own switch must say `1` (no option is offered for
+ * it), and it only runs beside the note-taker — it is that same background run that
+ * books the round, so with the note-taker off there is nothing to hang it on.
+ */
+export const backfillOf = (
+  options: Raw | undefined,
+  env: Readonly<Record<string, string | undefined>> = {},
+): boolean => env[ENV.backfill]?.trim() === '1' && noterOf(options, env)
+
+/**
  * What this session runs with: DEFAULTS with the tunable fields as configured. The
  * three fills must climb, or the whole group falls back (a lower fill later than a
  * higher one would make the earlier reminder unreachable).
@@ -118,7 +129,7 @@ export const readConfig = (
     tuned.urgentTokens = DEFAULTS.urgentTokens
   }
 
-  return { ...DEFAULTS, ...tuned, noter: noterOf(held, env) }
+  return { ...DEFAULTS, ...tuned, noter: noterOf(held, env), backfill: backfillOf(held, env) }
 }
 
 /** The environment's own switch: true for `1`, false for `0`, undefined when it leaves the choice to the option. */

@@ -41,6 +41,12 @@ export type Config = {
    * with it off the decisions section is rendered by the rules alone, as before.
    */
   noter: boolean
+  /**
+   * Whether a round the main model left unbooked is booked by one record from the note-
+   * taker's model, folded into the ledger on the next prompt. Needs `noter` on as well,
+   * and its own environment switch (CTX_MOD_LEDGER_BACKFILL=1). Off by default.
+   */
+  backfill: boolean
   snippetTokens: number
   /**
    * An open task whose last real change (a record that was no keepalive snapshot, or one
@@ -99,6 +105,7 @@ export const DEFAULTS: Config = {
   handoffTokens: 15_000,
   decisionChars: 3_000,
   noter: false,
+  backfill: false,
   snippetTokens: 6_000,
   // A task untouched for three windows running, or three days, is where a new window has
   // read old work as current before: early enough to warn, late enough not to nag a task
@@ -297,6 +304,12 @@ export type LedgerEntry = Omit<LedgerInput, 'request_ref'> & {
   request_ref: number
   /** The seq of the last history row when this entry was written; older entries lack it. */
   through?: number
+  /**
+   * Who wrote the record, when it was not the main model itself: `backfill` is the
+   * note-taker's model booking a round the main model left unbooked. Its text also
+   * opens with 〔补记〕, which is what a reader actually sees.
+   */
+  source?: 'backfill'
 }
 
 export type FileOp = 'read' | 'edit' | 'write' | 'search'

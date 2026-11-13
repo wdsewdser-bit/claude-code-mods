@@ -17,6 +17,8 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { ENV } from '../hooks/lib/config.ts'
+import { tasksOf } from '../hooks/lib/ledger.ts'
+import { parseJsonl } from '../hooks/lib/types.ts'
 import {
   applyNoter,
   buildNoterBatch,
@@ -26,6 +28,27 @@ import {
   NOTER_SYSTEM,
   parseNoterOutput,
 } from '../hooks/lib/noter.ts'
+import {
+  backfillRoundOf,
+  BACKFILL_SYSTEM,
+  fitBackfillInput,
+  hasLedgerAppend,
+  ledgerBefore,
+  mergeLedgerRows,
+  mayTry,
+  MIN_ACTIONS,
+  noteAttempt,
+  parseBackfillOutput,
+  PENDING_FILE,
+  pendingOf,
+  roundBySeq,
+  roundsOf,
+  stateOf,
+  STATE_FILE,
+  stateText,
+  taskLinesOf,
+  workActionsOf,
+} from '../hooks/lib/backfill.ts'
 
 const NOTED = 'noted.jsonl'
 const CURSOR = 'noter-cursor.json'
@@ -52,6 +75,9 @@ const SCALE_UP = 1.1
 
 /** The model that does the reading; overridable so a test never needs the real one. */
 const MODEL = process.env['CTX_MOD_NOTER_MODEL'] ?? 'claude-haiku-5-5'
+
+/** Whether the same run also books one round the main model left unbooked. Off unless its own switch says 1. */
+const backfillOn = () => process.env[ENV.backfill] === '1'
 
 const messageOf = (problem) => (problem instanceof Error ? problem.message : String(problem))
 
@@ -284,8 +310,18 @@ const askModel = async (systemFile, input) => {
     '--output-format',
     'json',
   ]
+  // A test seam with a real use: CTX_MOD_MODEL_CALLS names a file that gets one line per
+  // call actually made, so a trial run's spend is counted by the code, not by the person.
+  const calls = process.env['CTX_MOD_MODEL_CALLS']
+  if (calls !== undefined && calls.trim() !== '') {
+    await fs.appendFile(calls, `${new Date().toISOString()} ${argv[3] ?? ''}\n`, 'utf8').catch(() => undefined)
+  }
   const { code, stdout, stderr } = await runChild(argv, input)
-  if (code !== 0) throw new Error(`模型命令退出码 ${code}：${stderr.trim().slice(-300)}`)
+  if (code !== 0) {
+    // A CLI that answers an error as a JSON envelope on stdout leaves stderr empty, so both are said.
+    const said = stderr.trim() === '' ? stdout.trim().slice(0, 300) : stderr.trim().slice(-300)
+    throw new Error(`模型命令退出码 ${code}：${said}`)
+  }
   let envelope
   try {
     envelope = JSON.parse(stdout)
@@ -306,6 +342,7 @@ const askModel = async (systemFile, input) => {
     cost: typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : undefined,
     durationMs: typeof envelope.duration_ms === 'number' ? envelope.duration_ms : undefined,
     measured: measuredOf(envelope.usage),
+    usage: typeof envelope.usage === 'object' && envelope.usage !== null ? envelope.usage : undefined,
   }
 }
 
@@ -367,14 +404,190 @@ const run = async (dir, maxBatches) => {
         `批次 #${from}..#${to}（${batch.batchRows.length} 条）新增 ${parsed.add.length} 撤销 ${parsed.revoke.length} 丢弃 ${parsed.rejected.length} 耗时 ${Date.now() - started}ms 费用 ${cost} 估算输入 ${estimated} 实际 ${tokens}${warning}`,
       )
     }
+    // The same run, off the turn: one model call for the round the main model left unbooked.
+    // Its failure is logged, never thrown: the notes already written must stand.
+    if (backfillOn()) {
+      const was = scale
+      scale = (await runBackfill(dir, { scale })).scale
+      if (scale !== was) await writeCursor(dir, cursor, scale)
+    }
   } finally {
     await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined)
   }
 }
 
+/**
+ * The ledger rows the directory holds: the archive pages and the current page, oldest
+ * first. Read only: ledger.jsonl belongs to the main process, which rewrites it whole
+ * from memory, so nothing here ever writes it.
+ */
+const readLedger = async dir => {
+  let names
+  try {
+    names = (await fs.readdir(dir))
+      .filter(name => name === 'ledger.jsonl' || /^archive-.*\.jsonl$/.test(name))
+      .sort()
+  } catch {
+    return []
+  }
+  const files = []
+  for (const name of names) {
+    const text = await readText(path.join(dir, name))
+    if (text !== null) files.push(parseJsonl(text))
+  }
+
+  return mergeLedgerRows(files)
+}
+
+/** A file written in one step: a reader either sees the whole of it or the one before. */
+const writeAtomic = async (file, text) => {
+  const temp = `${file}.${process.pid}.tmp`
+  await fs.writeFile(temp, text, 'utf8')
+  await fs.rename(temp, file)
+}
+
+/**
+ * Books one round the main model left unbooked: the round that ended when the newest
+ * person message arrived, or the one a dry run names. One model call at most, no tools;
+ * what it says is checked here and the result left in backfill-pending.json for the hook
+ * process to fold into ledger.jsonl with its own seqs.
+ *
+ * A round already tried is not tried again (see `mayTry`), so a failing round costs one
+ * retry and no more. An estimate over the budget shrinks the action list exactly as the
+ * reference replay does, and a call that measures over 90k lowers the shared multiplier
+ * the note-taker keeps in noter-cursor.json.
+ */
+const runBackfill = async (dir, options) => {
+  const dryRun = options.dryRun === true
+  const scaleIn = typeof options.scale === 'number' ? options.scale : 1
+  const rows = await readRows(dir)
+  const check = options.roundSeq === undefined ? backfillRoundOf(rows) : roundBySeq(rows, options.roundSeq)
+  if (check.round === undefined) {
+    if (dryRun) return { skipped: check.reason }
+
+    return { scale: scaleIn }
+  }
+  const round = check.round
+  if (!dryRun && options.roundSeq === undefined) {
+    const state = stateOf(await readText(path.join(dir, STATE_FILE)))
+    if (!mayTry(state, round.seq)) return { scale: scaleIn }
+  }
+  const before = ledgerBefore(await readLedger(dir), round)
+  const fit = fitBackfillInput(round, taskLinesOf(before))
+  if (fit === undefined) {
+    await appendLog(dir, `补记跳过：#${round.seq} 的输入压到最短仍超出预算`)
+    if (!dryRun) {
+      const state = stateOf(await readText(path.join(dir, STATE_FILE)))
+      await writeAtomic(path.join(dir, STATE_FILE), stateText(noteAttempt(state, round.seq, 'failed'))).catch(() => undefined)
+    }
+
+    return { scale: scaleIn }
+  }
+  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'ctx-mod-backfill-'))
+  let scale = scaleIn
+  try {
+    const systemFile = path.join(scratch, 'system.txt')
+    await fs.writeFile(systemFile, BACKFILL_SYSTEM, 'utf8')
+    const started = Date.now()
+    let answer
+    try {
+      answer = await askModel(systemFile, fit.text)
+    } catch (problem) {
+      const reason = messageOf(problem)
+      if (!dryRun) {
+        await appendLog(dir, `补记失败：#${round.seq} ${reason}`)
+        const state = stateOf(await readText(path.join(dir, STATE_FILE)))
+        await writeAtomic(path.join(dir, STATE_FILE), stateText(noteAttempt(state, round.seq, 'failed'))).catch(() => undefined)
+      }
+
+      return { scale, error: reason }
+    }
+    const measured = answer.measured
+    let warning = ''
+    if (measured !== undefined && measured > OVER_TOKENS) {
+      warning = ' 警告：接近 10 万上限'
+      scale = Math.max(MIN_SCALE, scale * SCALE_DOWN)
+    } else if (measured !== undefined && measured <= UNDER_TOKENS && scale < 1) {
+      scale = Math.min(1, scale * SCALE_UP)
+    }
+    let parsed
+    try {
+      parsed = parseBackfillOutput(answer.text, {
+        tasks: tasksOf(before),
+        actionSeqs: fit.actionSeqs,
+      })
+    } catch (problem) {
+      const reason = messageOf(problem)
+      if (!dryRun) {
+        await appendLog(dir, `补记失败：#${round.seq} ${reason}`)
+        const state = stateOf(await readText(path.join(dir, STATE_FILE)))
+        await writeAtomic(path.join(dir, STATE_FILE), stateText(noteAttempt(state, round.seq, 'failed'))).catch(() => undefined)
+      }
+
+      return { scale, error: reason }
+    }
+    const pending = pendingOf(round, parsed.entries)
+    if (dryRun) {
+      return {
+        report: {
+          round: round.seq,
+          window: pending.window,
+          actions: fit.actionCount,
+          actionTier: fit.tier,
+          estimateTokens: fit.estimate,
+          wouldWrite: pending,
+          rejected: parsed.rejected,
+          coerced: parsed.coerced,
+          measured,
+          usage: answer.usage,
+          costUsd: answer.cost,
+          durationMs: Date.now() - started,
+        },
+      }
+    }
+    if (pending.entries.length > 0) await writeAtomic(path.join(dir, PENDING_FILE), `${JSON.stringify(pending)}\n`)
+    const cost = answer.cost === undefined ? '?' : `$${answer.cost.toFixed(4)}`
+    const tokens = measured === undefined ? '?' : String(measured)
+    await appendLog(
+      dir,
+      `补记 #${round.seq}（${fit.actionCount} 个动作，写 ${parsed.entries.length} 条，状态改写 ${parsed.coerced} 条，丢弃 ${parsed.rejected.length} 条）耗时 ${Date.now() - started}ms 费用 ${cost} 估算输入 ${fit.estimate} 实际 ${tokens}${warning}`,
+    )
+    const state = stateOf(await readText(path.join(dir, STATE_FILE)))
+    await writeAtomic(path.join(dir, STATE_FILE), stateText(noteAttempt(state, round.seq, 'ok'))).catch(() => undefined)
+
+    return { scale }
+  } finally {
+    await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined)
+  }
+}
+
+/** The rounds a trial could name: no ledger_append in them, at least three calls of work, and no ledger row pointing at them. */
+const listBackfillRounds = async dir => {
+  const rows = await readRows(dir)
+  const ledger = await readLedger(dir)
+  const out = []
+  for (const round of roundsOf(rows)) {
+    if (hasLedgerAppend(round)) continue
+    if (workActionsOf(round).length < MIN_ACTIONS) continue
+    if (ledger.some(entry => entry.request_ref === round.seq)) continue
+    out.push({ round: round.seq, window: round.window, actions: workActionsOf(round).length })
+  }
+
+  return out
+}
+
+const USAGE = [
+  '用法：node scripts/noter.mjs <会话目录> [--max-batches N]',
+  '      node scripts/noter.mjs <会话目录> --list-backfill-rounds   列出可试跑的轮次（不调模型、不写盘）',
+  '      node scripts/noter.mjs <会话目录> --backfill-round N --dry-run   只打印将要写入的记录和实际用量，不写盘',
+].join('\n')
+
 const parseArgs = argv => {
   let dir
   let maxBatches = DEFAULT_MAX_BATCHES
+  let roundSeq
+  let dryRun = false
+  let list = false
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--max-batches') {
@@ -384,13 +597,29 @@ const parseArgs = argv => {
       index += 1
       continue
     }
+    if (arg === '--backfill-round') {
+      const value = Number(argv[index + 1])
+      if (!Number.isInteger(value) || value < 1) throw new Error('--backfill-round 必须是轮次的起始编号（正整数）')
+      roundSeq = value
+      index += 1
+      continue
+    }
+    if (arg === '--dry-run') {
+      dryRun = true
+      continue
+    }
+    if (arg === '--list-backfill-rounds') {
+      list = true
+      continue
+    }
     if (arg.startsWith('--')) throw new Error(`不认识的参数 ${arg}`)
     if (dir !== undefined) throw new Error('只接受一个会话目录')
     dir = arg
   }
-  if (dir === undefined) throw new Error('用法：node scripts/noter.mjs <会话目录> [--max-batches N]')
+  if (dir === undefined) throw new Error(USAGE)
+  if (dryRun && list) throw new Error('--dry-run 和 --list-backfill-rounds 不能一起用')
 
-  return { dir: path.resolve(dir), maxBatches }
+  return { dir: path.resolve(dir), maxBatches, roundSeq, dryRun, list }
 }
 
 const main = async () => {
@@ -406,6 +635,35 @@ const main = async () => {
   if (!(await exists(args.dir))) {
     console.error(`会话目录不存在：${args.dir}`)
     process.exitCode = 2
+
+    return
+  }
+  // A preview writes nothing at all, not even the lock: it must be safe to run against a
+  // live session directory while the person is working in it.
+  if (args.list) {
+    try {
+      console.log(JSON.stringify(await listBackfillRounds(args.dir), null, 1))
+    } catch (problem) {
+      console.error(messageOf(problem))
+      process.exitCode = 1
+    }
+
+    return
+  }
+  if (args.dryRun) {
+    try {
+      const preview = await runBackfill(args.dir, { roundSeq: args.roundSeq, dryRun: true })
+      if (preview.report === undefined) {
+        console.error(`补记跳过：${preview.skipped ?? preview.error ?? '没有可补记的轮次'}`)
+        process.exitCode = 2
+
+        return
+      }
+      console.log(JSON.stringify(preview.report, null, 1))
+    } catch (problem) {
+      console.error(messageOf(problem))
+      process.exitCode = 1
+    }
 
     return
   }

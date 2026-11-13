@@ -102,6 +102,7 @@ const configEnv = async ($: EngineInterface): Promise<Record<string, string | un
   const env: Record<string, string | undefined> = {}
   env[ENV.enabled] = await attempt(async () => await $.env.get('CTX_MOD'), undefined)
   env[ENV.noter] = await attempt(async () => await $.env.get('CTX_MOD_NOTER'), undefined)
+  env[ENV.backfill] = await attempt(async () => await $.env.get('CTX_MOD_LEDGER_BACKFILL'), undefined)
   env[ENV.compactWindow] = await attempt(async () => await $.env.get('CTX_MOD_COMPACT_WINDOW'), undefined)
   env[ENV.boundaryTokens] = await attempt(async () => await $.env.get('CTX_MOD_BOUNDARY_TOKENS'), undefined)
   env[ENV.softTokens] = await attempt(async () => await $.env.get('CTX_MOD_SOFT_TOKENS'), undefined)
@@ -450,7 +451,9 @@ const startNoter = async ($: EngineInterface): Promise<void> => {
       const child = $.process.spawn({
         argv: ['node', script, dir],
         // The child starts a nested `claude`; with this mod off there, no session of its own is opened.
-        env: { [ENV.enabled]: '0' },
+        // The backfill switch is handed over as this session resolved it, so a manifest
+        // option and the environment cannot disagree with the run the hook just made.
+        env: { [ENV.enabled]: '0', [ENV.backfill]: config.backfill ? '1' : '0' },
       })
       for await (const piece of child) {
         if (piece.stream === 'stderr') logError($, 'noter', piece.text)
@@ -1438,6 +1441,9 @@ export const register: Register = (on, options) => {
       const session = await sessionOf($)
       const id = await idOf($)
       if (session !== undefined && id !== undefined) {
+        // A backfill the note-taker finished since the last event joins the ledger here,
+        // so a switch made later in this same turn already carries it.
+        await attempt(async () => await session.mergeBackfill(), { added: [], dropped: [] })
         const env = await envOf($, id)
         const text = session.reminder(env)
         if (text !== null) {
@@ -1485,6 +1491,10 @@ export const register: Register = (on, options) => {
           ...(isHandoffText(said) ? { door: 'compaction' } : {}),
           text: textOf(e.message.content),
         })
+        // What an earlier note-taker run left for the ledger joins the page here, before
+        // anything reads it: a prompt is the first moment after that run that this
+        // process is awake. Nothing to merge is one failed read, not a cost.
+        await attempt(async () => await session.mergeBackfill(), { added: [], dropped: [] })
         // The person's own words are on disk now: the note-taker may read them, off the turn.
         if (isPerson && config.noter) await startNoter($)
 
