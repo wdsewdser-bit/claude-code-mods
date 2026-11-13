@@ -35,6 +35,12 @@ export type Config = {
    * decisions are dropped and one line says how many: the newest still stand.
    */
   decisionChars: number
+  /**
+   * Whether a small model reads the person's messages as they arrive and keeps what
+   * they settled in noted.jsonl, beside the deterministic rules. Off by default:
+   * with it off the decisions section is rendered by the rules alone, as before.
+   */
+  noter: boolean
   snippetTokens: number
   /**
    * An open task whose last real change (a record that was no keepalive snapshot, or one
@@ -92,6 +98,7 @@ export const DEFAULTS: Config = {
   maxSwitchesPerHour: 4,
   handoffTokens: 15_000,
   decisionChars: 3_000,
+  noter: false,
   snippetTokens: 6_000,
   // A task untouched for three windows running, or three days, is where a new window has
   // read old work as current before: early enough to warn, late enough not to nag a task

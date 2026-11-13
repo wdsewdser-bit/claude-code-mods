@@ -79,11 +79,22 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 | `maxSwitchesPerHour` | `CTX_MOD_MAX_SWITCHES_PER_HOUR` | `4` | 每小时最多换几次窗；`0` 表示不再批准换窗 |
 | `coldMinTokens` | `CTX_MOD_COLD_MIN_TOKENS` | `80000` | 缓存已过期时，上下文超过多少 token 才扣下消息、先换窗 |
 | `gateMinTokens` | `CTX_MOD_GATE_MIN_TOKENS` | `120000` | 上下文超过多少 token 时，加载会重建缓存的工具组之前先换窗 |
+| `noter` | `CTX_MOD_NOTER` | `false` | 是否让一个 Haiku 小模型读用户消息、把已定决策存进会话目录（见下一节）。关时不调模型，决策仍由规则提取 |
 
 - 配置只在会话启动时读一次。取值必须是有限正数（`cooldownRequests`、`maxSwitchesPerHour` 可以是 `0`）；读不到或数值非法时回退默认值，不会报错。
 - 三档提醒必须满足 `boundaryTokens ≤ softTokens ≤ urgentTokens`；不满足时三档整组回退默认值，并在调试日志里记一条。
 - 想更早换窗（例如上下文到 16–20 万就换），把三档一起调低，比例和默认差不多：比如 `boundaryTokens=160000`、`softTokens=180000`、`urgentTokens=200000`。代价是换窗更频繁：每换一次都只带走账本里记下的东西和磁盘上的文件，没记账的中间结论会丢，缓存也要整段重建。调低之前先让账本保持新。
 - 其余阈值仍是 `hooks/lib/types.ts` 里 `DEFAULTS` 的内部常量，不对外开放。`/ctx-mod` 会把与默认值不同的配置列出来；全是默认时不多输出任何东西。
+
+## Haiku 笔记员（实验，默认关）
+
+规则提取只认标记和句式，一段没带标记的话里定下的事会漏掉。打开 `noter`（或 `CTX_MOD_NOTER=1`）后，每收到一条用户亲口说的消息，就在后台用 Haiku 读一遍游标之后的新消息，把其中的长期规则、方案选择和要记住的环境事实记下来，追加到会话目录的 `noted.jsonl`。交接里的“用户已定决策”一节因此变成两部分：笔记员读过的部分按笔记显示，游标之后的少数消息仍走原来的规则提取，合成同一节。它推翻了旧条目时会记一条撤销。
+
+- 默认关闭；开关关着时一个字节都不变，不启动任何子进程。
+- 模型调用在回合之外，用 `claude -p --model claude-haiku-5-5 --effort medium`，给子进程设了 `CTX_MOD=0`，不会递归触发本 mod；`noter.lock` 防止并发，超过 15 分钟视为过期。
+- 状态文件：`noted.jsonl`（每条决策一行，撤销行形如 `{"revoke":{"seq":3,"by":9}}`）、`noter-cursor.json`（`{"cursorSeq":N}`）、`noter.log`（每批一行：范围、新增、撤销、丢弃、耗时、费用；失败也记在这里）。任何一步失败都不动游标。
+- 回退：把 `noter` 设回 `false`（或删掉环境变量 `CTX_MOD_NOTER`）即恢复纯规则提取，已有的 `noted.jsonl` 会被忽略；想彻底清掉就删掉这三个文件。手动补跑一次：`node scripts/noter.mjs <会话目录> [--max-batches N]`。
+- 代价：每批一次模型调用（默认每次最多 4 批），实测一批约 4 万字符输入、数美分以内。觉得贵就把开关关掉。
 
 ## 数据放在哪
 
@@ -99,6 +110,7 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 | `events.jsonl` | 每次换窗的记录 |
 | `meta.json` | 编号、窗口号、文件活动、派发名单、重建记录等状态 |
 | `held.json` | 缓存过期时扣下、还没提交的用户消息 |
+| `noted.jsonl` / `noter-cursor.json` / `noter.log` | 笔记员记下的决策、它读到哪儿、每次运行的日志（开关打开时才有） |
 
 这些文件含有会话的全部内容，包括工具输出。mod 不会把它们发到任何地方。
 
