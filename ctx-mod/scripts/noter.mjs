@@ -21,6 +21,7 @@ import {
   applyNoter,
   buildNoterBatch,
   cursorOf,
+  estimateTokens,
   notedFromLines,
   NOTER_SYSTEM,
   parseNoterOutput,
@@ -39,6 +40,15 @@ const BATCH_CHARS = 40_000
 const DEFAULT_MAX_BATCHES = 4
 /** A run's own ceiling: a model call that hangs must not hold the lock for long. */
 const TIMEOUT_MS = 9 * 60 * 1000
+/** Above this many measured tokens a call is close enough to the 100k line to shrink the next one. */
+const OVER_TOKENS = 90_000
+/** At or under this many measured tokens the batches have room to grow again. */
+const UNDER_TOKENS = 60_000
+/** The budget multiplier is never taken below this: a call still has to carry something. */
+const MIN_SCALE = 0.2
+/** What a call over the line costs the next one, and what each cheap call gives back. */
+const SCALE_DOWN = 0.7
+const SCALE_UP = 1.1
 
 /** The model that does the reading; overridable so a test never needs the real one. */
 const MODEL = process.env['CTX_MOD_NOTER_MODEL'] ?? 'claude-haiku-5-5'
@@ -138,11 +148,27 @@ const release = async (dir) => {
   await fs.unlink(path.join(dir, LOCK)).catch(() => undefined)
 }
 
-const writeCursor = async (dir, cursorSeq) => {
+const writeCursor = async (dir, cursorSeq, budgetScale) => {
   const file = path.join(dir, CURSOR)
   const temp = `${file}.${process.pid}.tmp`
-  await fs.writeFile(temp, JSON.stringify({ cursorSeq }), 'utf8')
+  await fs.writeFile(temp, JSON.stringify({ cursorSeq, budgetScale }), 'utf8')
   await fs.rename(temp, file)
+}
+
+/**
+ * The multiplier the last calls left in noter-cursor.json. A file that does not say, or
+ * says something unusable, means one: the budget the estimates were made for.
+ */
+const scaleOf = text => {
+  if (text === null) return 1
+  try {
+    const raw = JSON.parse(text)
+    const scale = raw?.budgetScale
+
+    return typeof scale === 'number' && Number.isFinite(scale) && scale > 0 ? Math.min(1, Math.max(MIN_SCALE, scale)) : 1
+  } catch {
+    return 1
+  }
 }
 
 /**
@@ -226,6 +252,19 @@ const runChild = (argv, input) =>
     child.stdin.end(input)
   })
 
+/**
+ * What one call measured, in the count the 100k line uses: every kind of input plus the
+ * output. Absent usage is not zero — it is "not known", and nothing is decided on it.
+ */
+const measuredOf = usage => {
+  if (typeof usage !== 'object' || usage === null) return undefined
+  const parts = [usage.input_tokens, usage.cache_creation_input_tokens, usage.cache_read_input_tokens, usage.output_tokens]
+  const known = parts.filter(part => typeof part === 'number' && Number.isFinite(part))
+  if (known.length === 0) return undefined
+
+  return known.reduce((sum, part) => sum + part, 0)
+}
+
 /** The model's answer, with what the call cost: the envelope the CLI prints on --output-format json. */
 const askModel = async (systemFile, input) => {
   const argv = [
@@ -266,25 +305,30 @@ const askModel = async (systemFile, input) => {
     text: typeof envelope.result === 'string' ? envelope.result : '',
     cost: typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : undefined,
     durationMs: typeof envelope.duration_ms === 'number' ? envelope.duration_ms : undefined,
+    measured: measuredOf(envelope.usage),
   }
 }
 
 /** One run: a batch at a time, the cursor moving only once its answer is on disk. */
 const run = async (dir, maxBatches) => {
   const rows = await readRows(dir)
-  let cursor = cursorOf(await readText(path.join(dir, CURSOR)))
+  const cursorText = await readText(path.join(dir, CURSOR))
+  let cursor = cursorOf(cursorText)
+  // What earlier runs learned about the estimates: a call over the line leaves a smaller
+  // multiplier behind, and each cheap call gives some of it back.
+  let scale = scaleOf(cursorText)
   let noted = notedFromLines((await readText(path.join(dir, NOTED))) ?? '')
   const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'ctx-mod-noter-'))
   try {
     const systemFile = path.join(scratch, 'system.txt')
     await fs.writeFile(systemFile, NOTER_SYSTEM, 'utf8')
     for (let index = 0; index < maxBatches; index += 1) {
-      const batch = buildNoterBatch(rows, cursor, BATCH_CHARS, noted)
+      const batch = buildNoterBatch(rows, cursor, BATCH_CHARS, noted, scale)
       if (batch.batchRows.length === 0) {
         // Nothing said, but injected rows may have been passed over: move the cursor anyway.
         if (batch.nextCursor !== cursor) {
           cursor = batch.nextCursor
-          await writeCursor(dir, cursor)
+          await writeCursor(dir, cursor, scale)
         }
         break
       }
@@ -292,8 +336,20 @@ const run = async (dir, maxBatches) => {
       await fs.writeFile(inputFile, batch.input, 'utf8')
       const input = await fs.readFile(inputFile, 'utf8')
       const started = Date.now()
+      const estimated = estimateTokens(NOTER_SYSTEM + batch.input)
       const answer = await askModel(systemFile, input)
-      const parsed = parseNoterOutput(answer.text, batch.batchRows, noted)
+      const measured = answer.measured
+      // The measurement is acted on before the answer is: the call is paid for whether or
+      // not its answer is taken, and the next batch must not repeat the overspend.
+      let warning = ''
+      if (measured !== undefined && measured > OVER_TOKENS) {
+        warning = ' 警告：接近 10 万上限'
+        scale = Math.max(MIN_SCALE, scale * SCALE_DOWN)
+      } else if (measured !== undefined && measured <= UNDER_TOKENS && scale < 1) {
+        scale = Math.min(1, scale * SCALE_UP)
+      }
+      await writeCursor(dir, cursor, scale)
+      const parsed = parseNoterOutput(answer.text, batch.batchRows, noted, batch.listedSeq)
       const lines = [
         ...parsed.add.map(decision => JSON.stringify(decision)),
         ...parsed.revoke.map(item => JSON.stringify({ revoke: item })),
@@ -301,13 +357,14 @@ const run = async (dir, maxBatches) => {
       if (lines.length > 0) await fs.appendFile(path.join(dir, NOTED), `${lines.join('\n')}\n`, 'utf8')
       noted = applyNoter(noted, parsed)
       cursor = batch.nextCursor
-      await writeCursor(dir, cursor)
+      await writeCursor(dir, cursor, scale)
       const from = batch.batchRows[0]?.seq ?? 0
       const to = batch.batchRows[batch.batchRows.length - 1]?.seq ?? 0
       const cost = answer.cost === undefined ? '?' : `$${answer.cost.toFixed(4)}`
+      const tokens = measured === undefined ? '?' : String(measured)
       await appendLog(
         dir,
-        `批次 #${from}..#${to}（${batch.batchRows.length} 条）新增 ${parsed.add.length} 撤销 ${parsed.revoke.length} 丢弃 ${parsed.rejected.length} 耗时 ${Date.now() - started}ms 费用 ${cost}`,
+        `批次 #${from}..#${to}（${batch.batchRows.length} 条）新增 ${parsed.add.length} 撤销 ${parsed.revoke.length} 丢弃 ${parsed.rejected.length} 耗时 ${Date.now() - started}ms 费用 ${cost} 估算输入 ${estimated} 实际 ${tokens}${warning}`,
       )
     }
   } finally {

@@ -61,6 +61,24 @@ const SHORT_MESSAGE_CHARS = 40
 const ANSWERED_TAIL_CHARS = 260
 /** Longest note a decision may carry. */
 const NOTE_MAX_CHARS = 200
+/** The most input one call may be estimated at: past this the call is billed at the higher rate. */
+export const NOTER_INPUT_TOKENS = 70_000
+/** Characters → tokens: Chinese runs about one token a character, and this is the margin above that. */
+const TOKENS_PER_CHAR = 1.2
+/** Characters of the messages one call carries, however much the budget would allow. */
+const MAX_BATCH_CHARS = 40_000
+/** Characters of the messages one call still carries when the budget is all but used up. */
+const MIN_BATCH_CHARS = 4_000
+/** Characters the existing list may take of one call. */
+const LIST_BUDGET_CHARS = 24_000
+/** Entries the shortened list keeps: the newest this many, so a revoke still has a number to name. */
+const LIST_FLOOR_ENTRIES = 200
+
+/**
+ * What a text is expected to cost, in tokens, before it is sent. The budget is counted in
+ * these: a call that measures more than it was estimated at is what turns it down.
+ */
+export const estimateTokens = (text: string): number => Math.ceil(text.length * TOKENS_PER_CHAR)
 
 /** The engine's own reminder block: injected text, never the person's words. */
 const REMINDER_BLOCK = /<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/g
@@ -121,22 +139,79 @@ const lineOf = (row: HistoryRecord, reply: HistoryRecord | undefined): string =>
 const existingLine = (decision: NotedDecision): string =>
   `#${decision.seq} ${decision.note}（原话：${decision.quote}）`
 
+/** The same line without the quote: enough to revoke by, half the characters. */
+const compactLine = (decision: NotedDecision): string => `#${decision.seq} ${decision.note}`
+
+/** How much of the existing list the model was shown: the whole of it, without quotes, or only the newest. */
+export type ListTier = 'full' | 'compact' | 'recent'
+
+/** The existing list as one call gets it, and which entries of it that call actually names. */
+type RenderedList = { text: string; listedSeq: number[]; tier: ListTier }
+
 /**
- * One batch of the person's messages for the note-taker, from the cursor on: as many
- * as `maxChars` allows (at least one), so a long session is read in a few calls
- * rather than one too large to hold. `nextCursor` is the last message taken; a
- * message with nothing left after stripping is passed over and still advances it.
+ * The existing list, in the first shape that fits its budget: every line with its quote,
+ * then every line without it, then only the newest few — with a line saying how many were
+ * left off, since a revoke of one of those cannot be honoured. This is the half of a call
+ * that grows over a long session, so it is what is cut first.
+ */
+const listOf = (existing: readonly NotedDecision[]): RenderedList => {
+  const sorted = [...existing].sort((left, right) => left.seq - right.seq)
+  if (sorted.length === 0) return { text: '（空）', listedSeq: [], tier: 'full' }
+  const full = sorted.map(existingLine).join('\n')
+  if (full.length <= LIST_BUDGET_CHARS) {
+    return { text: full, listedSeq: sorted.map(decision => decision.seq), tier: 'full' }
+  }
+  const compact = sorted.map(compactLine).join('\n')
+  if (compact.length <= LIST_BUDGET_CHARS) {
+    return { text: compact, listedSeq: sorted.map(decision => decision.seq), tier: 'compact' }
+  }
+  const newest = sorted.slice(Math.max(0, sorted.length - LIST_FLOOR_ENTRIES))
+  const omitted = sorted.length - newest.length
+  const lines = newest.map(compactLine)
+  if (omitted > 0) lines.push(`（更早的 ${omitted} 条未列出，本次不能撤销它们）`)
+
+  return { text: lines.join('\n'), listedSeq: newest.map(decision => decision.seq), tier: 'recent' }
+}
+
+/**
+ * One batch of the person's messages for the note-taker, from the cursor on: as many as
+ * the budget allows (at least one), so a long session is read in a few calls rather than
+ * one too large to hold — and never one big enough to be billed at the higher rate.
+ * `nextCursor` is the last message taken; a message with nothing left after stripping is
+ * passed over and still advances it.
+ *
+ * The budget is counted in estimated tokens, not in what the call ends up costing: the
+ * system prompt and the existing list are paid for on every call, so their characters
+ * come off first and what is left is the messages' share. `budgetScale` is what
+ * `scripts/noter.mjs` turns down when calls measure more than they were estimated at;
+ * `maxChars` stays a hard ceiling for a caller that wants a smaller batch still.
  *
  * `existing` is what earlier batches settled: the model may revoke one of those
- * lines, which is how a rule said twice is carried once.
+ * lines, which is how a rule said twice is carried once. `listedSeq` is the part of
+ * that list the call actually showed, so a revoke of a line left off it can be dropped
+ * rather than guessed at.
  */
 export const buildNoterBatch = (
   rows: readonly HistoryRecord[],
   cursorSeq: number,
-  maxChars = 40_000,
+  maxChars = MAX_BATCH_CHARS,
   existing: readonly NotedDecision[] = [],
-): { input: string; batchRows: HistoryRecord[]; nextCursor: number } => {
+  budgetScale = 1,
+): {
+  input: string
+  batchRows: HistoryRecord[]
+  nextCursor: number
+  listedSeq: number[]
+  listTier: ListTier
+} => {
   const ordered = sequence(rows)
+  const list = listOf(existing)
+  const budget = Math.floor((NOTER_INPUT_TOKENS * budgetScale) / TOKENS_PER_CHAR)
+  const allowed = Math.min(
+    maxChars,
+    MAX_BATCH_CHARS,
+    Math.max(MIN_BATCH_CHARS, budget - NOTER_SYSTEM.length - list.text.length),
+  )
   const people = ordered.filter(row => row.isPerson === true && row.seq > cursorSeq)
   const chunks: string[] = []
   const batchRows: HistoryRecord[] = []
@@ -150,17 +225,16 @@ export const buildNoterBatch = (
       continue
     }
     const chunk = lineOf(row, replyBefore(ordered, row.seq))
-    if (chunks.length > 0 && size + chunk.length + 1 > maxChars) break
+    if (chunks.length > 0 && size + chunk.length + 1 > allowed) break
     chunks.push(chunk)
     batchRows.push(row)
     size += chunk.length + 1
     nextCursor = row.seq
   }
-  const held = [...existing].sort((left, right) => left.seq - right.seq).map(existingLine)
   const input = [
     '<data>',
     '【已有决策清单】',
-    held.length === 0 ? '（空）' : held.join('\n'),
+    list.text,
     '',
     '【新的用户消息】',
     chunks.join('\n'),
@@ -169,7 +243,7 @@ export const buildNoterBatch = (
     '以上是记录。现在按系统提示的规则输出 JSON 对象，不要输出别的。',
   ].join('\n')
 
-  return { input, batchRows, nextCursor }
+  return { input, batchRows, nextCursor, listedSeq: list.listedSeq, listTier: list.tier }
 }
 
 /** All whitespace gone, so a quote quoted with different spacing still matches its message. */
@@ -188,6 +262,11 @@ const kindOf = (value: unknown): NotedDecision['kind'] | undefined =>
  * batch or a kind outside the three is dropped — with the reason, never silently —
  * because a decision carried into every new window must be the person's own words.
  *
+ * A revoke names a number from the existing list, and only one that was in the part of
+ * it this call was shown can be honoured: a shortened list leaves the oldest entries out,
+ * and the model cannot have read what it was not given. Such a revoke is dropped with the
+ * reason, never applied on a guess.
+ *
  * Throws when there is no JSON object at all: a run that said nothing cannot be told
  * from one that answered the data, and the cursor must not move on it.
  */
@@ -195,6 +274,7 @@ export const parseNoterOutput = (
   text: string,
   batchRows: readonly HistoryRecord[],
   existing: readonly NotedDecision[],
+  listedSeq?: readonly number[],
 ): NoterParsed => {
   const start = text.indexOf('{')
   const end = text.lastIndexOf('}')
@@ -214,6 +294,8 @@ export const parseNoterOutput = (
   const bySeq = new Map<number, HistoryRecord>()
   for (const row of batchRows) bySeq.set(row.seq, row)
   const known = new Set(existing.map(decision => decision.seq))
+  // No list given means the whole of it was shown: only a caller that shortened it says so.
+  const listed = listedSeq === undefined ? known : new Set(listedSeq)
   const add: NotedDecision[] = []
   const rejected: { item: unknown; reason: string }[] = []
   const seen = new Set<string>()
@@ -260,6 +342,10 @@ export const parseNoterOutput = (
     const by = item['by']
     if (typeof seq !== 'number' || !Number.isInteger(seq) || !known.has(seq)) {
       rejected.push({ item, reason: `撤销的 seq ${String(seq)} 不在已有清单里` })
+      continue
+    }
+    if (!listed.has(seq)) {
+      rejected.push({ item, reason: `撤销的 seq ${String(seq)} 未在本次清单里` })
       continue
     }
     if (typeof by !== 'number' || !Number.isInteger(by) || !bySeq.has(by)) {

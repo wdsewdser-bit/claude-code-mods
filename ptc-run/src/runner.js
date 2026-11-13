@@ -860,6 +860,47 @@ tools.bash = (a) => {
   return { code: st.code, stdout, stderr };
 };
 
+// ---------- tools.sh / tools.peek: the short forms ----------
+// tools.sh: one command, the last `tail` lines of stdout+stderr. A cut head is not lost silently: the first line says
+// how many lines were dropped. Read-only mode refuses it exactly like tools.bash.
+tools.sh = (command, opts) => {
+  reqStr(command, "command");
+  const o = opts === undefined || opts === null ? {} : A(opts, "sh options");
+  const tail = optInt(o.tail, "tail", 60, 1, 100000);
+  const timeoutMs = optInt(o.timeoutMs, "timeoutMs", 120000, 1, 3600000);
+  let cd = cwd;
+  if (o.cwd !== undefined && o.cwd !== null) cd = abs(reqStr(o.cwd, "cwd"));
+  const r = tools.bash({ command, cwd: cd, timeoutMs, promote: false });
+  const out = typeof r.stdout === "string" ? r.stdout : "", err = typeof r.stderr === "string" ? r.stderr : "";
+  const merged = out + (err ? (out && !out.endsWith(NL) ? NL : "") + err : "");
+  const ls = merged.replace(/\r\n/g, NL).split(NL);
+  while (ls.length > 1 && ls[ls.length - 1] === "") ls.pop();
+  const text = ls.length > tail ? "…[省略前 " + (ls.length - tail) + " 行]…" + NL + ls.slice(-tail).join(NL) : ls.join(NL);
+  return { code: r.code === undefined ? null : r.code, text };
+};
+// tools.peek: the matching lines with context, numbered with the file's real 1-based line numbers; "--" separates
+// groups that are not adjacent. Pattern is a JS regular-expression string.
+tools.peek = (p, pattern, opts) => {
+  reqStr(p, "path"); reqStr(pattern, "pattern"); credGuard(p);
+  const o = opts === undefined || opts === null ? {} : A(opts, "peek options");
+  const ctx = optInt(o.context, "context", 2, 0, 50);
+  const limit = optInt(o.limit, "limit", 20, 1, 500);
+  let re;
+  try { re = new RegExp(pattern); } catch (e) { throw E("INVALID_ARGUMENT", "pattern is not a valid JS regular expression: " + String((e && e.message) || e), "Fix the pattern string; it is passed to new RegExp(pattern)."); }
+  const t = fs.readFileSync(abs(p), "utf8");
+  const ls = t.split(NL);
+  if (ls.length > 1 && ls[ls.length - 1] === "") ls.pop();
+  const hits = [];
+  for (let i = 0; i < ls.length && hits.length < limit; i++) if (re.test(ddStrip(ls[i]))) hits.push(i);
+  if (hits.length === 0) return "";
+  const want = new Set();
+  for (const i of hits) for (let j = Math.max(0, i - ctx); j <= Math.min(ls.length - 1, i + ctx); j++) want.add(j);
+  const out = [];
+  let prev = -1;
+  for (const j of [...want].sort((a, b) => a - b)) { if (prev >= 0 && j > prev + 1) out.push("--"); out.push((j + 1) + ": " + ddStrip(ls[j])); prev = j; }
+  return out.join(NL);
+};
+
 // tools.job: query a background bash started by tools.bash({background:true}); jobs live in the scope dir and
 // survive across run_code calls.
 tools.job = (a) => {
@@ -2049,10 +2090,133 @@ tools.test = dsh.test; // normal mode gets the same summary shape (same fields, 
 if (RO) { // read-only mode: everything that writes or runs a command is refused (legacy and DSH shapes alike)
   const roMsg = (k) => "[POLICY_DENIED] tools." + k + " is disabled in read-only mode";
   const roNext = "This run_code is read-only: use read, glob, grep and ref.*; report the change or command instead of making it.";
-  for (const k of ["write", "edit", "replace", "batch", "bash", "parallel", "job", "job_output", "test"]) tools[k] = () => { throw new PtcError("POLICY_DENIED", "tools." + k + " is disabled in read-only mode", roNext); };
+  for (const k of ["write", "edit", "replace", "batch", "bash", "sh", "parallel", "job", "job_output", "test"]) tools[k] = () => { throw new PtcError("POLICY_DENIED", "tools." + k + " is disabled in read-only mode", roNext); };
   for (const k of ["write", "edit", "bash", "job_output", "test"]) dsh[k] = async () => { const e = new ToolCallError(k, roMsg(k) + " (" + roNext + ")"); e.code = "POLICY_DENIED"; throw e; };
 }
 if (input.dsh) for (const k of ["read", "write", "edit", "glob", "grep", "bash", "job_output", "test"]) tools[k] = dsh[k];
+
+// ---------- the personal library: a global file and a session one ----------
+// Format (JSON, both files alike): {"version":1,"functions":{"<name>":{"source":"(tools, ...args) => { ... }","doc":"one line"}}}
+// The source is a function expression whose FIRST parameter is this program's tools object, so a library function has
+// exactly the tools the program has (read-only mode's refusals included). Loaded at every run: the global file first
+// (LIB_HOME/lib.js, LIB_HOME = ~/.claude/ptc-run, or the directory of PTC_RUN_LIB), then this session's own
+// LIB_HOME/sessions/<session id>/lib.js, which wins on a name both define. A session never sees another session's
+// library: the directory is named after the session the run_code call came from. A broken file, or one broken
+// function, only adds one warning line at the top of the output; the program still runs. lib.def writes one function
+// back into a file (atomic: temp file, then rename), which is why the format is JSON.
+const LIB_PATH = (() => { const v = String(process.env.PTC_RUN_LIB || "").trim(); return v || path.join(os.homedir(), ".claude", "ptc-run", "lib.js"); })();
+const LIB_HOME = path.dirname(LIB_PATH);
+const SESSIONS_DIR = path.join(LIB_HOME, "sessions");
+const SESSION_KEY = String(input.sessionId || "").replace(/[^A-Za-z0-9_.-]/g, "_").replace(/^\.+/, "_").slice(0, 80);
+const SESSION_DIR = SESSION_KEY ? path.join(SESSIONS_DIR, SESSION_KEY) : null;
+const LIB_SESSION = SESSION_DIR ? path.join(SESSION_DIR, "lib.js") : null;
+const SESSION_INDEX = SESSION_DIR ? path.join(SESSION_DIR, "index.json") : null;
+const LIB_FORMAT = '{"version":1,"functions":{"<name>":{"source":"(tools, ...args) => { ... }","doc":"one line"}}}';
+const libNotes = [];
+const libFuncs = new Map(); // name -> {fn, doc, scope, file}
+const libRead = (file) => { try { return fs.readFileSync(file, "utf8"); } catch (e) { if (e.code === "ENOENT" || e.code === "ENOTDIR") return null; throw e; } };
+const libCompile = (source) => { const fn = new Function("return (" + source + ")")(); return typeof fn === "function" ? fn : null; };
+const libWarn = (text) => { libNotes.push("[lib] " + text + "（程序照常运行）"); };
+// Session libraries of conversations nobody touched for 30 days go; at most one sweep a day, never a failure. Read-only
+// mode cannot delete anything, so it does not try.
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_SWEEP_MS = 24 * 60 * 60 * 1000;
+const SESSION_SWEEP_STAMP = path.join(SESSIONS_DIR, ".last-sweep");
+const sweepSessions = () => {
+  if (RO) return;
+  try { const t = Number(String(fs.readFileSync(SESSION_SWEEP_STAMP, "utf8")).trim()); if (Number.isFinite(t) && Date.now() - t < SESSION_SWEEP_MS) return; } catch {}
+  try {
+    const now = Date.now();
+    let names = [];
+    try { names = fs.readdirSync(SESSIONS_DIR); } catch {}
+    for (const n of names) {
+      const p = path.join(SESSIONS_DIR, n);
+      try { const st = fs.statSync(p); if (st.isDirectory() && now - st.mtimeMs >= SESSION_TTL_MS) fs.rmSync(p, { recursive: true, force: true }); } catch {}
+    }
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+    fs.writeFileSync(SESSION_SWEEP_STAMP, String(now));
+  } catch {}
+};
+const libLoad = (file, scope) => {
+  const label = scope === "global" ? "全局库" : "会话库";
+  let raw;
+  try { raw = libRead(file); } catch (e) { libWarn(label + " " + file + " 读取失败：" + String((e && e.message) || e).split(NL)[0].slice(0, 160)); return; }
+  if (raw === null) return; // no such file: that layer is simply empty
+  let data;
+  try { data = JSON.parse(raw); } catch { libWarn(label + " " + file + " 不是约定的 JSON 格式 " + LIB_FORMAT + "，已忽略"); return; }
+  const fns = data && typeof data === "object" && data.functions && typeof data.functions === "object" ? data.functions : null;
+  if (!fns) { libWarn(label + " " + file + " 缺少 functions 对象，已忽略"); return; }
+  for (const name of Object.keys(fns)) {
+    if (name === "help" || name === "def") continue;
+    const v = fns[name];
+    if (!v || typeof v !== "object" || typeof v.source !== "string") continue;
+    let fn;
+    try { fn = libCompile(v.source); } catch (e) { libWarn(label + "的函数 " + name + " 有语法错误，已跳过：" + String((e && e.message) || e).split(NL)[0].slice(0, 160)); continue; }
+    if (fn === null) { libWarn(label + "的函数 " + name + " 不是函数表达式，已跳过"); continue; }
+    libFuncs.set(name, { fn, doc: typeof v.doc === "string" ? v.doc : "", scope, file });
+  }
+};
+sweepSessions();
+libLoad(LIB_PATH, "global");
+if (LIB_SESSION) libLoad(LIB_SESSION, "session");
+const lib = {};
+const libAttach = (name) => {
+  const e = libFuncs.get(name);
+  const f = (...args) => e.fn(tools, ...args);
+  try { f.doc = e.doc; f.scope = e.scope; } catch {}
+  lib[name] = f;
+};
+for (const name of libFuncs.keys()) libAttach(name);
+lib.help = () => {
+  const names = [...libFuncs.keys()].sort();
+  if (names.length === 0) return "(lib 为空：没有全局库 " + LIB_PATH + (LIB_SESSION ? "，本会话也没有 " + LIB_SESSION : "，本次运行没有会话库") + ")";
+  return names.map((n) => { const e = libFuncs.get(n); return n + "（" + (e.scope === "global" ? "全局" : "本会话") + "）" + (e.doc ? " — " + e.doc : ""); }).join(NL);
+};
+// The session's function list as a file, for other mods to read: [{name, doc}], refreshed after every lib.def.
+const writeSessionIndex = () => {
+  if (!SESSION_INDEX || !SESSION_DIR) return;
+  try {
+    const rows = [];
+    for (const [n, e] of libFuncs) if (e.scope === "session") rows.push({ name: n, doc: e.doc });
+    rows.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+    atomicWrite(SESSION_INDEX, JSON.stringify(rows) + NL);
+  } catch {}
+};
+// lib.def(name, source, doc, {scope:'session'|'global'}): register a shortcut from inside a program. The source is
+// compiled with new Function first (a syntax error writes nothing), an existing name is replaced, and the file is
+// written atomically. Read-only mode refuses it like every other write.
+lib.def = (name, source, doc, opts) => {
+  if (RO) throw E("POLICY_DENIED", "lib.def is disabled in read-only mode", "This run_code is read-only: report the function instead of saving it.");
+  if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw E("INVALID_ARGUMENT", "name must be letters, digits and underscores (not starting with a digit)", "Pass a plain identifier, e.g. lib.def('mycheck', ...).");
+  if (name === "help" || name === "def") throw E("INVALID_ARGUMENT", "'" + name + "' is reserved by lib", "Pick another name.");
+  reqStr(source, "source");
+  if (doc !== undefined && doc !== null && typeof doc !== "string") throw E("INVALID_ARGUMENT", "doc must be a string", "Pass a one-line description, or leave it out.");
+  const o = opts === undefined || opts === null ? {} : A(opts, "def options");
+  const scope = o.scope === undefined || o.scope === null ? "session" : o.scope;
+  if (scope !== "session" && scope !== "global") throw E("INVALID_ARGUMENT", "scope must be 'session' or 'global'", "Pass {scope:'global'} to write the global library.");
+  let fn;
+  try { fn = libCompile(source); } catch (e) { throw E("INVALID_ARGUMENT", "source is not a valid function expression: " + String((e && e.message) || e).split(NL)[0].slice(0, 200) + " (nothing was written)", "Write it as \"(tools, ...args) => { ... }\" — the first parameter is tools."); }
+  if (fn === null) throw E("INVALID_ARGUMENT", "source must evaluate to a function (nothing was written)", "Write it as \"(tools, ...args) => { ... }\" — the first parameter is tools.");
+  const file = scope === "global" ? LIB_PATH : LIB_SESSION;
+  if (!file) throw E("INVALID_ARGUMENT", "this run has no session id, so there is no session library to write (nothing was written)", "Pass {scope:'global'} to save it to the global library instead.");
+  const nextDoc = typeof doc === "string" ? doc : "";
+  let data = { version: 1, functions: {} };
+  let raw;
+  try { raw = libRead(file); } catch (e) { throw sysErr(e); }
+  if (raw !== null && raw.trim() !== "") {
+    try { data = JSON.parse(raw); } catch { throw E("INVALID_ARGUMENT", "the " + scope + " library " + file + " is not in the agreed JSON format, nothing was written", "Fix the file by hand first: " + LIB_FORMAT); }
+    if (!data || typeof data !== "object") data = { version: 1, functions: {} };
+    if (!data.functions || typeof data.functions !== "object") data.functions = {};
+  }
+  data.functions[name] = { source, doc: nextDoc };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  atomicWrite(file, JSON.stringify(data, null, 2) + NL);
+  libFuncs.set(name, { fn, doc: nextDoc, scope, file });
+  libAttach(name);
+  if (scope === "session") writeSessionIndex();
+  return "已登记 " + name + "（" + (scope === "global" ? "全局" : "本会话") + "）";
+};
 
 // ---------- run user code ----------
 for (const k of Object.keys(tools)) if (k !== "dsh" && !(input.dsh && k in dsh)) tools[k] = guard(tools[k]);
@@ -2062,12 +2226,14 @@ const AF = Object.getPrototypeOf(async function () {}).constructor;
   let out, err;
   if (rootErr) err = rootErr;
   else {
-    try { out = await new AF("tools", "ref", "console", "ToolCallError", input.code)(tools, ref, cons, ToolCallError); } catch (e) { err = e; }
+    try { out = await new AF("tools", "ref", "console", "ToolCallError", "lib", input.code)(tools, ref, cons, ToolCallError, lib); } catch (e) { err = e; }
   }
   let body = lines.join(NL);
   if (out !== undefined) body += (body ? NL : "") + fmt(out);
   // Output-layer dedup: only the program's own output (console.log + returned value) is touched, never a tool result.
   body = ddApply(body);
+  // A library that only partly loaded still runs: one warning line first, then the program's own output.
+  if (libNotes.length) body = libNotes.join(NL) + (body ? NL + NL + body : "");
   let text = body;
   if (!err) { const w = multiText(); if (w) text = w + (body ? NL + NL + body : ""); }
   if (err) {

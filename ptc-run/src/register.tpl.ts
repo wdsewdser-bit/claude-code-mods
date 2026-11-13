@@ -117,14 +117,229 @@ const descRo = (roots: string[]): string =>
 const descShortRo = (roots: string[]): string =>
   'Run a JavaScript async-function body in a read-only sandbox (no file writes, no commands, reads only under the working directory and the extra readable directories, if any); the SDK bindings (tools.*) are declared in the system prompt. Only console.log output and the return value come back.' + rootsLine(roots)
 
-export const register: Register = on => {
+// ---------- options and the environment's own switches ----------
+type PtcConfig = { nudgeAfter: number; bashMaxChars: number }
+const DEFAULTS: PtcConfig = { nudgeAfter: 2, bashMaxChars: 8000 }
+const numOf = (v: unknown, fallback: number): number => {
+  if (typeof v === 'number' && Number.isFinite(v)) return Math.trunc(v)
+  if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Math.trunc(Number(v))
+  return fallback
+}
+/** PTC_RUN_NUDGE / PTC_RUN_BASH_MAX: a whole number (0 turns the feature off); anything else is ignored. */
+const envNum = (raw: string | undefined): number | undefined => {
+  const t = (raw ?? '').trim()
+  return /^\d+$/.test(t) ? Number(t) : undefined
+}
+const configOf = (options: Readonly<Record<string, unknown>>, nudge: string | undefined, bash: string | undefined): PtcConfig => {
+  const out: PtcConfig = {
+    nudgeAfter: Math.max(0, numOf(options['nudgeAfter'], DEFAULTS.nudgeAfter)),
+    bashMaxChars: Math.max(0, numOf(options['bashMaxChars'], DEFAULTS.bashMaxChars)),
+  }
+  const n = envNum(nudge)
+  if (n !== undefined) out.nudgeAfter = n
+  const b = envNum(bash)
+  if (b !== undefined) out.bashMaxChars = b
+  return out
+}
+
+// ---------- feature 1: the single-step reminder (main session only, per turn) ----------
+// One model request is one unit, however many tools it calls. A request counts as a single step when exactly one of
+// Bash/Read/Grep/Glob went out and no run_code and no dispatch did; side tools (ctx-mod, ccd_turn, effort-auto,
+// ToolSearch) neither count nor break the streak. run_code, a dispatch or two or more execution tools reset it.
+type NudgeUse = { tool: string }
+type NudgeState = { streak: number; lastAt: number; lastStep: string | null }
+const newNudgeState = (): NudgeState => ({ streak: 0, lastAt: 0, lastStep: null })
+const NUDGE_EXEC = new Set(['Bash', 'Read', 'Grep', 'Glob'])
+const RUN_CODE_NAME = 'mcp__ptc-run__run_code'
+const isDispatchTool = (tool: string): boolean =>
+  tool === 'Agent' || tool === 'Task' || tool === 'SendMessage' || tool.startsWith('mcp__delegate__')
+const nudgeText = (n: number): string =>
+  'ptc-run：已连续 ' + n + ' 次单步调用。把接下来能预见的步骤写进一个 run_code 程序（依赖上一步结果的用 if 判断），一次做完；重复出现的流程用 lib.def 登记。'
+const resetNudge = (s: NudgeState): void => {
+  s.streak = 0
+  s.lastAt = 0
+}
+/** One request's answer, after the fact: the reminder it earns, if any. */
+const observeNudge = (s: NudgeState, uses: readonly NudgeUse[], after: number, stepKey?: string): string | undefined => {
+  if (!(after > 0)) return undefined
+  if (stepKey !== undefined) {
+    if (s.lastStep === stepKey) return undefined
+    s.lastStep = stepKey
+  }
+  const names = uses.map(u => u.tool)
+  if (names.some(isDispatchTool) || names.includes(RUN_CODE_NAME)) {
+    resetNudge(s)
+    return undefined
+  }
+  const exec = names.filter(t => NUDGE_EXEC.has(t)).length
+  if (exec > 1) {
+    resetNudge(s)
+    return undefined
+  }
+  if (exec !== 1) return undefined // bookkeeping and everything else: neither counted nor cleared
+  s.streak += 1
+  if (s.streak >= after && (s.lastAt === 0 || s.streak - s.lastAt >= 4)) {
+    s.lastAt = s.streak
+    return nudgeText(s.streak)
+  }
+  return undefined
+}
+/** The tool uses of a turn.step result, however the engine spells them. */
+const usesOfResult = (result: unknown): NudgeUse[] => {
+  const held = (result as { toolUses?: unknown } | null | undefined)?.toolUses
+  if (!Array.isArray(held)) return []
+  const out: NudgeUse[] = []
+  for (const item of held) {
+    if (item === null || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const name = typeof row['tool'] === 'string' ? row['tool'] : typeof row['name'] === 'string' ? row['name'] : undefined
+    if (name !== undefined) out.push({ tool: name })
+  }
+  return out
+}
+
+// ---------- feature 3: the Bash output cap ----------
+// Over the cap the head (60% of it) and the tail (30%) stay, the middle becomes one marker line naming the file that
+// holds the whole text. Main session and subagents alike; a Bash result the host already spilled is left alone.
+type BashClip = { head: string; tail: string; omitted: number }
+const bashClip = (text: string, max: number): BashClip | undefined => {
+  if (!Number.isFinite(max) || max <= 0 || text.length <= max) return undefined
+  const headLen = Math.floor(max * 0.6)
+  const tailLen = Math.floor(max * 0.3)
+  return { head: text.slice(0, headLen), tail: text.slice(text.length - tailLen), omitted: text.length - headLen - tailLen }
+}
+const clipMarker = (omitted: number, file: string): string => '\n…[省略 ' + omitted + ' 字符，全文在 ' + file + ']…\n'
+const OVERFLOW_KEEP = 200
+const OVERFLOW_PRUNE = 'const fs=require("fs"),path=require("path");const a=JSON.parse(fs.readFileSync(0,"utf8"));' +
+  'let rows=[];try{for(const n of fs.readdirSync(a.dir)){if(!/^bash-.*\\.txt$/.test(n))continue;try{const s=fs.statSync(path.join(a.dir,n));if(s.isFile())rows.push([s.mtimeMs,n])}catch{}}}catch{}' +
+  'rows.sort((x,y)=>x[0]-y[0]);const cut=rows.length-a.keep;for(let i=0;i<cut;i++){try{fs.unlinkSync(path.join(a.dir,rows[i][1]))}catch{}}'
+/** The person's home directory, from the environment (the mod runtime has no os module). Undefined: no overflow dir. */
+const homeOf = async ($: unknown): Promise<string | undefined> => {
+  // A noun is called at the call site and never bound to a variable (the engine refuses that), so each lookup stands
+  // on its own here.
+  try {
+    const up = await ($ as { env: { get: (name: string) => Promise<string | undefined> } }).env.get('USERPROFILE')
+    if (typeof up === 'string' && up.trim() !== '') return up.trim().replace(/[\\/]+$/, '')
+  } catch {
+    // fall through to HOME
+  }
+  try {
+    const home = await ($ as { env: { get: (name: string) => Promise<string | undefined> } }).env.get('HOME')
+    if (typeof home === 'string' && home.trim() !== '') return home.trim().replace(/[\\/]+$/, '')
+  } catch {
+    // no env: no home directory, so no overflow file
+  }
+  return undefined
+}
+/** Writes one overflow file; undefined when it could not be written (the caller then leaves the result alone). */
+const writeOverflow = async ($: unknown, text: string): Promise<string | undefined> => {
+  const home = await homeOf($)
+  if (home === undefined) return undefined
+  const dir = home + '/.claude/ptc-run/overflow'
+  const file = dir + '/bash-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8) + '.txt'
+  await ($ as { fs: { write: (p: string, t: string) => Promise<void> } }).fs.write(file, text)
+  // Past 200 files the oldest go; $.fs has no delete, so a node child does that (only when the directory is that full).
+  try {
+    const entries = await ($ as { fs: { list: (p?: string) => Promise<readonly { name: string }[]> } }).fs.list(dir)
+    if (entries.length > OVERFLOW_KEEP) {
+      await ($ as { process: { run: (argv: string[], opts: { stdin: string; timeoutMs: number }) => Promise<unknown> } }).process.run(
+        ['node', '-e', OVERFLOW_PRUNE],
+        { stdin: JSON.stringify({ dir, keep: OVERFLOW_KEEP }), timeoutMs: 10000 },
+      )
+    }
+  } catch {
+    // pruning is best effort; the file itself is written
+  }
+  return file
+}
+
+// ---------- what the tool description ends with (appended, never rewritten: the rest is cache prefix) ----------
+const DESC_APPEND_MAX = 600
+const SHORT_HELP = ' Shorthand: tools.sh(command,{tail?=60,cwd?,timeoutMs?})->{code,text} (last lines of stdout+stderr); tools.peek(path,pattern,{context?=2,limit?=20})->matching lines with real line numbers.'
+const LIB_HINT = ' 重复用到的多步流程用 lib.def 登记成快捷函数，之后一次调用；lib.help() 看全部。'
+const LIB_REMAINDER = ' 其余用 lib.help()'
+type LibDoc = { name: string; doc: string }
+const descAppend = (entries: readonly LibDoc[]): string => {
+  const base = SHORT_HELP + LIB_HINT
+  if (entries.length === 0) return base
+  const room = Math.max(0, DESC_APPEND_MAX - base.length)
+  let listing = ' 全局库：'
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]
+    if (e === undefined) continue
+    const piece = (i > 0 ? '；' : '') + e.name + (e.doc ? ' — ' + e.doc : '')
+    const last = i === entries.length - 1
+    const budget = last ? room : room - LIB_REMAINDER.length
+    if (listing.length + piece.length <= budget) {
+      listing += piece
+      continue
+    }
+    const keep = Math.max(0, room - LIB_REMAINDER.length - listing.length)
+    if (keep > 0) listing += piece.slice(0, keep)
+    return base + listing + LIB_REMAINDER
+  }
+  return base + listing
+}
+/** The GLOBAL library's functions, read once when the tool is registered (the project one stays out of the prefix). */
+const readLibDocs = async ($: unknown): Promise<LibDoc[]> => {
+  try {
+    let file = ''
+    const custom = await ($ as { env: { get: (name: string) => Promise<string | undefined> } }).env.get('PTC_RUN_LIB')
+    if (typeof custom === 'string' && custom.trim() !== '') file = custom.trim()
+    else {
+      const home = await homeOf($)
+      if (home === undefined) return []
+      file = home + '/.claude/ptc-run/lib.js'
+    }
+    const raw = await ($ as { fs: { read: (p: string) => Promise<string | { base64: string }> } }).fs.read(file)
+    if (typeof raw !== 'string') return []
+    const data = JSON.parse(raw) as { functions?: Record<string, { doc?: unknown }> }
+    const fns = data.functions
+    if (fns === null || typeof fns !== 'object') return []
+    const out: LibDoc[] = []
+    for (const name of Object.keys(fns)) {
+      if (name === 'help' || name === 'def') continue
+      const row = fns[name]
+      out.push({ name, doc: row !== undefined && typeof row.doc === 'string' ? row.doc : '' })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+const messageOf = (problem: unknown): string => (problem instanceof Error ? problem.message : String(problem))
+/** A log that fails must never become the failure. */
+const debug = ($: unknown, text: string): void => {
+  try {
+    ;($ as { ui: { log: (t: string, o: { to: string }) => void } }).ui.log('ptc-run: ' + text, { to: 'debug' })
+  } catch {
+    // logging is best effort
+  }
+}
+
+/** The session's own settings: the plugin options, then the environment's switches. */
+let cfg: PtcConfig = DEFAULTS
+let nudgeState: NudgeState = newNudgeState()
+/** The reminder the last main-session request earned, waiting for its batch to end. */
+let pendingRemind: string | undefined
+
+export const register: Register = (on, options) => {
+  const opts = (options ?? {}) as Readonly<Record<string, unknown>>
   on('session.start', async ($, e, next) => {
     const sdkInPrompt = (await $.env.get('PTC_RUN_SDK_IN_PROMPT')) === '1'
     const ro = (await $.env.get('PTC_RUN_READONLY')) === '1'
     const roRoots = ro ? splitReadRoots((await $.env.get('PTC_RUN_READ_ROOTS')) || '') : []
+    cfg = configOf(opts, await $.env.get('PTC_RUN_NUDGE'), await $.env.get('PTC_RUN_BASH_MAX'))
+    nudgeState = newNudgeState()
+    pendingRemind = undefined
+    debug($, 'nudgeAfter=' + cfg.nudgeAfter + ' bashMaxChars=' + cfg.bashMaxChars)
+    // The global library's function list, read once here, is appended to the description; the rest of the
+    // description is untouched so the cache prefix every session shares stays what it was.
+    const baseDesc = ro ? (sdkInPrompt ? descShortRo(roRoots) : descRo(roRoots)) : sdkInPrompt ? DESC_SHORT : DESC
     await $.tool.register({
       name: 'run_code',
-      description: ro ? (sdkInPrompt ? descShortRo(roRoots) : descRo(roRoots)) : sdkInPrompt ? DESC_SHORT : DESC,
+      description: baseDesc + descAppend(await readLibDocs($)),
       isDeferred: false,
       inputSchema: {
         type: 'object',
@@ -152,6 +367,46 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // A person's own message starts a new turn: the single-step count is per turn, so it starts over here.
+  on('prompt.submit', async ($, e, next) => {
+    resetNudge(nudgeState)
+    pendingRemind = undefined
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // Feature 1: one model request, after its answer is known. Only the main session is counted: a subagent's steps are
+  // its own business. Nothing here can throw into the engine.
+  on('turn.step', async function* ($, e, next) {
+    const result = yield* next(e)
+    try {
+      if (e.agentId === undefined) {
+        const remind = observeNudge(nudgeState, usesOfResult(result), cfg.nudgeAfter, String(e.turnId) + ':' + String(e.index))
+        if (remind !== undefined) pendingRemind = remind
+      }
+    } catch (error) {
+      debug($, 'turn.step: ' + messageOf(error))
+    }
+    return result
+  })
+
+  // The reminder rides on the batch that ends the request: one line of context, nothing refused.
+  on('classic.PostToolBatch', async ($, e, next) => {
+    const main = e.agent_id === undefined
+    const inject = main ? pendingRemind : undefined
+    if (main) pendingRemind = undefined
+    const result = await next(e)
+    if (inject === undefined) return result
+    try {
+      const held = (result ?? {}) as { additionalContext?: readonly string[] }
+      const contexts = Array.isArray(held.additionalContext) ? held.additionalContext : []
+      debug($, 'remind streak=' + nudgeState.streak)
+      return { ...held, additionalContext: [...contexts, inject] }
+    } catch (error) {
+      debug($, 'PostToolBatch: ' + messageOf(error))
+      return result
+    }
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', { tool: NAME }, async ($, e) => {
     const input = e as unknown as { code: string; timeoutMs?: number; maxChars?: number; root?: string }
     const cwd = await $.session.cwd()
@@ -175,9 +430,15 @@ export const register: Register = on => {
     // The broker drops the ones that are missing or not absolute, so a stale entry never fails the run.
     const readRoots = ro ? splitReadRoots((await $.env.get('PTC_RUN_READ_ROOTS')) || '') : []
     let scope = 'default'
+    // The session id also names the session-level library the runner loads. Without one there is none: the runner then
+    // loads only the global library, and lib.def's default scope refuses with a hint to pass {scope:'global'}.
+    let sessionId: string | undefined
     try {
       const sid = await $.session.id()
-      if (typeof sid === 'string' && sid) scope = sid
+      if (typeof sid === 'string' && sid) {
+        scope = sid
+        sessionId = sid
+      }
     } catch {
       // keep the default scope
     }
@@ -246,7 +507,7 @@ export const register: Register = on => {
       // fall back to PTC_RUN_RG, the installed skills path and PATH -- the generated hook never bakes a path in.
       const pluginRoot = $.plugin.root
       const bundledRg = typeof pluginRoot === 'string' && pluginRoot !== '' ? pluginRoot.replace(/[\\/]+$/, '') + '/bin/rg.exe' : undefined
-      const payload = { cwd, code: input.code, ...(bundledRg ? { rg: bundledRg } : {}), scope, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, dedup: dedupOn, dedupTag, dedupReset: !dedupLive, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
+      const payload = { cwd, code: input.code, ...(bundledRg ? { rg: bundledRg } : {}), scope, sessionId, dsh, root: input.root, roRoots, readRoots, logName, dshReadLimit, dedup: dedupOn, dedupTag, dedupReset: !dedupLive, maxChars: input.maxChars ? Math.min(Math.max(Math.trunc(input.maxChars), 1000), 50000) : dsh ? 50000 : undefined }
       startedAt = Date.now()
       const r = await $.process.run(['node', '-e', BOOT], {
         cwd,
@@ -282,4 +543,54 @@ export const register: Register = on => {
   }).catch(async (_$, _e, next) => {
     return { result: [{ type: 'text', text: 'run_code hook failed: ' + String((next as { error?: unknown }).error ?? 'unknown error') + '\nThe program may or may not have started; inspect side effects before retrying.' }], isError: true } as never
   })
+
+  // Feature 3: a Bash result over the cap keeps head (60%) and tail (30%); the middle becomes one marker naming the
+  // file with the whole text, under ~/.claude/ptc-run/overflow/. Main session and subagents alike. Any failure leaves
+  // the result exactly as it was.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const r = await next(e)
+    try {
+      if (!(cfg.bashMaxChars > 0)) return r
+      if (r.deny !== undefined || r.isError === true) return r
+      const res = r.result as Record<string, unknown> | null
+      if (res === null || typeof res !== 'object') return r
+      if (res['isImage'] === true || res['interrupted'] === true) return r
+      if (res['persistedOutputPath'] !== undefined || res['rawOutputPath'] !== undefined) return r
+      const out = typeof res['stdout'] === 'string' ? res['stdout'] : ''
+      const err = typeof res['stderr'] === 'string' ? res['stderr'] : ''
+      const text = out + (err !== '' ? (out !== '' && !out.endsWith('\n') ? '\n' : '') + err : '')
+      const clip = bashClip(text, cfg.bashMaxChars)
+      if (clip === undefined) return r
+      const where = await writeOverflow($, text)
+      if (where === undefined) {
+        debug($, 'bash overflow: no home directory, the result was left alone')
+        return r
+      }
+      debug($, 'bash overflow: ' + text.length + ' chars -> ' + where)
+      // Only the result, never the object the hook got: `ref`/`text` on that one would make core reuse the messages
+      // it already made, and the model would read the untruncated text (read-dedup answers the same way).
+      return { result: { ...res, stdout: clip.head + clipMarker(clip.omitted, where) + clip.tail, stderr: '' }, context: r.context } as typeof r
+    } catch (error) {
+      debug($, 'tool.call Bash: ' + messageOf(error))
+      return r
+    }
+  }).catch(($, e, next) => next(e))
+}
+
+// What the tests drive directly: the hooks need an engine, these do not.
+export const __test = {
+  configOf,
+  newNudgeState,
+  observeNudge,
+  resetNudge,
+  nudgeText,
+  usesOfResult,
+  bashClip,
+  clipMarker,
+  descAppend,
+  DEFAULTS,
+  SHORT_HELP,
+  LIB_HINT,
+  LIB_REMAINDER,
+  DESC_APPEND_MAX,
 }

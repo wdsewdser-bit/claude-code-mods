@@ -7,7 +7,9 @@ import {
   applyNoter,
   buildNoterBatch,
   cursorOf,
+  estimateTokens,
   notedFromLines,
+  NOTER_INPUT_TOKENS,
   parseNoterOutput,
   renderNoted,
 } from '../hooks/lib/noter.ts'
@@ -95,6 +97,21 @@ describe('buildNoterBatch', () => {
     expect(batch.input).toContain('以后一律用 pnpm。')
     const kept = (batch.input.match(/y/g) ?? []).length
     expect(kept).toBe(800)
+  })
+
+  test('a longer existing list leaves fewer characters for the new messages', () => {
+    const rows = Array.from({ length: 60 }, (_unused, index) => person(index + 1, `消息${index}：${'内容'.repeat(600)}`))
+    const short = buildNoterBatch(rows, 0, 40_000, [noted(1, '原话一', '短清单里的一条')])
+    const long = buildNoterBatch(
+      rows,
+      0,
+      40_000,
+      Array.from({ length: 260 }, (_item, index) => noted(index + 1, '原话', `第${index}条决策${'说明'.repeat(90)}`)),
+    )
+    expect(short.batchRows.length).toBeGreaterThan(20)
+    expect(long.batchRows.length).toBeLessThan(short.batchRows.length)
+    // Even a list at its shortest leaves room for at least one message.
+    expect(long.batchRows.length).toBeGreaterThanOrEqual(1)
   })
 
   test('names the decisions already noted, so one can be revoked by its number', () => {
@@ -342,3 +359,68 @@ describe('the decisions section with the switch on', () => {
     expect(section).not.toContain('包管理器定为 pnpm')
   })
 })
+describe('the token budget', () => {
+  test('counts characters with the margin the measurements ask for', () => {
+    expect(estimateTokens('')).toBe(0)
+    expect(estimateTokens('abc')).toBe(4)
+    expect(estimateTokens('中文测试')).toBe(5)
+    expect(NOTER_INPUT_TOKENS).toBe(70_000)
+  })
+
+  test('a turned-down budget scale shrinks the batch', () => {
+    const rows = Array.from({ length: 60 }, (_unused, index) => person(index + 1, `消息${index}：${'内容'.repeat(600)}`))
+    const whole = buildNoterBatch(rows, 0, 40_000, [], 1)
+    const turnedDown = buildNoterBatch(rows, 0, 40_000, [], 0.5)
+    expect(whole.batchRows.length).toBeGreaterThan(20)
+    expect(turnedDown.batchRows.length).toBeLessThan(whole.batchRows.length)
+    expect(turnedDown.batchRows.length).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('the existing list has three shapes', () => {
+  /** `count` entries whose quote is `quoteChars` characters and whose note is `noteChars`. */
+  const many = (count: number, quoteChars: number, noteChars: number): NotedDecision[] =>
+    Array.from({ length: count }, (_unused, index) =>
+      noted(index + 1, '原'.repeat(quoteChars), `笔记${'字'.repeat(Math.max(0, noteChars - 2))}`),
+    )
+
+  test('full when it fits, compact without the quotes when it does not, newest only when even that is too long', () => {
+    const full = buildNoterBatch([person(400, '好的。')], 0, 40_000, many(5, 20, 20))
+    expect(full.listTier).toBe('full')
+    expect(full.input).toContain('（原话：')
+    expect(full.listedSeq).toEqual([1, 2, 3, 4, 5])
+
+    const compact = buildNoterBatch([person(400, '好的。')], 0, 40_000, many(20, 1_200, 20))
+    expect(compact.listTier).toBe('compact')
+    expect(compact.input).not.toContain('（原话：')
+    expect(compact.input).toContain('#20 笔记')
+    expect(compact.listedSeq).toHaveLength(20)
+
+    const recent = buildNoterBatch([person(400, '好的。')], 0, 40_000, many(300, 10, 200))
+    expect(recent.listTier).toBe('recent')
+    expect(recent.listedSeq).toHaveLength(200)
+    expect(recent.listedSeq[0]).toBe(101)
+    expect(recent.input).toContain('（更早的 100 条未列出，本次不能撤销它们）')
+    expect(recent.batchRows.map(row => row.seq)).toEqual([400])
+  })
+
+  test('a revoke of an entry the shortened list left out is dropped, not applied', () => {
+    const existing = [noted(2, '以前用 npm', '包管理器定为 npm'), noted(9, '以后用 pnpm', '包管理器定为 pnpm')]
+    const parsed = parseNoterOutput(
+      JSON.stringify({ add: [], revoke: [{ seq: 2, by: 20 }, { seq: 9, by: 20 }] }),
+      [person(20, '还是用 pnpm 吧。')],
+      existing,
+      [9],
+    )
+    expect(parsed.revoke).toEqual([{ seq: 9, by: 20 }])
+    expect(parsed.rejected.map(rejection => rejection.reason)).toEqual(['撤销的 seq 2 未在本次清单里'])
+    // Given the whole list, the same revoke is honoured.
+    const whole = parseNoterOutput(
+      JSON.stringify({ add: [], revoke: [{ seq: 2, by: 20 }] }),
+      [person(20, '还是用 pnpm 吧。')],
+      existing,
+    )
+    expect(whole.revoke).toEqual([{ seq: 2, by: 20 }])
+  })
+})
+

@@ -207,6 +207,13 @@ const addReadTree = (p) => { addRead(p); if (WINP && /^[A-Za-z]:/.test(p)) { add
 for (const p of [cwd, cwdReal]) addReadTree(p);
 for (const r of extraReadRoots) { addReadTree(r); addReadTree(realOf(r)); }
 addRead(stateDir); addRead(resDir);
+// The personal libraries are readable in read-only mode too, so lib.* works there: the global file, and this session's
+// own directory only (a session must never see another session's library). Their write and command calls still fail
+// (tools.* are refused and the permission model blocks the rest); lib.def is refused before it ever writes.
+const libFile = (() => { const v = String(process.env.PTC_RUN_LIB || "").trim(); return v || path.join(os.homedir(), ".claude", "ptc-run", "lib.js"); })();
+try { if (fs.statSync(libFile).isFile()) addRead(libFile); } catch {}
+const sessKey = String(input.sessionId || "").replace(/[^A-Za-z0-9_.-]/g, "_").replace(/^\.+/, "_").slice(0, 80);
+if (sessKey) { try { const d = path.join(path.dirname(libFile), "sessions", sessKey); if (fs.statSync(d).isDirectory()) addReadTree(d); } catch {} }
 const args = ["--permission", ...readRoots.map((p) => "--allow-fs-read=" + p), "--allow-fs-write=" + stateDir, "-e", boot];
 let child;
 try { child = cp.spawn(process.execPath, args, { cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }); }
