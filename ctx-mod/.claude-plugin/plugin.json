@@ -11,6 +11,12 @@
       "description": "Turn the plugin on without the CTX_MOD=1 environment variable. CTX_MOD wins when set: 1 turns it on, 0 turns it off. Off by default, so an unconfigured install behaves as before.",
       "default": false
     },
+    "noter": {
+      "type": "boolean",
+      "title": "Haiku note-taker",
+      "description": "Let a small model read the person's messages as they arrive and keep the decisions it finds in the session's noted.jsonl. Off by default; with it off the decisions section is built by the deterministic rules alone, exactly as before. CTX_MOD_NOTER=1 turns it on, 0 off.",
+      "default": false
+    },
     "compactWindow": {
       "type": "number",
       "title": "Assumed window (tokens)",

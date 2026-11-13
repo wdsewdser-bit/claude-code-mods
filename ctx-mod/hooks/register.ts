@@ -58,6 +58,8 @@ let lastStep: { turnId: string; index: number } | null = null
 
 /** One Session per session id, over the files under that session's own directory. */
 const sessions = new Map<string, Session>()
+/** The data directory of each open session, so a helper started for it is pointed at the same files. */
+const sessionDirs = new Map<string, string>()
 /** A first import must finish before any concurrent hook can allocate history numbers. */
 const openingSessions = new Map<string, Promise<Session>>()
 /** The compaction limit per session, computed once; a key present means it was asked for. */
@@ -99,6 +101,7 @@ const logError = ($: EngineInterface, where: string, problem: unknown): void => 
 const configEnv = async ($: EngineInterface): Promise<Record<string, string | undefined>> => {
   const env: Record<string, string | undefined> = {}
   env[ENV.enabled] = await attempt(async () => await $.env.get('CTX_MOD'), undefined)
+  env[ENV.noter] = await attempt(async () => await $.env.get('CTX_MOD_NOTER'), undefined)
   env[ENV.compactWindow] = await attempt(async () => await $.env.get('CTX_MOD_COMPACT_WINDOW'), undefined)
   env[ENV.boundaryTokens] = await attempt(async () => await $.env.get('CTX_MOD_BOUNDARY_TOKENS'), undefined)
   env[ENV.softTokens] = await attempt(async () => await $.env.get('CTX_MOD_SOFT_TOKENS'), undefined)
@@ -419,6 +422,7 @@ const openSession = async ($: EngineInterface, id: string): Promise<Session> => 
   }
   const session = createSession(dir, io, config)
   sessions.set(id, session)
+  sessionDirs.set(id, dir)
   // The window, the ledger's freshness and the pending switch are read
   // synchronously: nobody gets the session before its state is off the disk.
   await session.ready().catch(() => undefined)
@@ -426,6 +430,35 @@ const openSession = async ($: EngineInterface, id: string): Promise<Session> => 
   // seen every row through `session.append` already.
   await importOldConversation($, session)
   return session
+}
+
+/**
+ * Starts the note-taker for this session's directory and does not wait for it: it is a
+ * model call, so it runs off the turn. A lock in the directory means a run is already at
+ * work and a second one is not started; nothing here may throw into the hook.
+ */
+const startNoter = async ($: EngineInterface): Promise<void> => {
+  try {
+    const id = await idOf($)
+    const dir = id === undefined ? undefined : sessionDirs.get(id)
+    if (dir === undefined) return
+    // No lock check here: the script takes the lock itself and is the only place that
+    // knows a lock left by a crashed run is stale. A check here would block it forever.
+    const script = `${$.plugin.root}/scripts/noter.mjs`
+    // Detached: the loop owns the child, so it runs on after this hook returns.
+    void (async () => {
+      const child = $.process.spawn({
+        argv: ['node', script, dir],
+        // The child starts a nested `claude`; with this mod off there, no session of its own is opened.
+        env: { [ENV.enabled]: '0' },
+      })
+      for await (const piece of child) {
+        if (piece.stream === 'stderr') logError($, 'noter', piece.text)
+      }
+    })().catch(error => logError($, 'noter', error))
+  } catch (error) {
+    logError($, 'noter', error)
+  }
 }
 
 /** The compaction threshold the engine reports, computed once per session. */
@@ -1452,6 +1485,8 @@ export const register: Register = (on, options) => {
           ...(isHandoffText(said) ? { door: 'compaction' } : {}),
           text: textOf(e.message.content),
         })
+        // The person's own words are on disk now: the note-taker may read them, off the turn.
+        if (isPerson && config.noter) await startNoter($)
 
         return next(e)
       }

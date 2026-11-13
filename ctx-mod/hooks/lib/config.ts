@@ -8,6 +8,7 @@ import type { Config } from './types.ts'
 /** The environment variables that override the manifest's values. */
 export const ENV = {
   enabled: 'CTX_MOD',
+  noter: 'CTX_MOD_NOTER',
   compactWindow: 'CTX_MOD_COMPACT_WINDOW',
   boundaryTokens: 'CTX_MOD_BOUNDARY_TOKENS',
   softTokens: 'CTX_MOD_SOFT_TOKENS',
@@ -81,6 +82,21 @@ const fieldOf = (field: Tunable, options: Raw, env: Readonly<Record<string, stri
 }
 
 /**
+ * Whether the note-taker runs: the environment's own switch first (`1`/`0`), then the
+ * manifest's `noter`. A model call per prompt is opt-in, so anything else is off.
+ */
+export const noterOf = (
+  options: Raw | undefined,
+  env: Readonly<Record<string, string | undefined>> = {},
+): boolean => {
+  const flag = env[ENV.noter]?.trim()
+  if (flag === '1') return true
+  if (flag === '0') return false
+
+  return options?.['noter'] === true
+}
+
+/**
  * What this session runs with: DEFAULTS with the tunable fields as configured. The
  * three fills must climb, or the whole group falls back (a lower fill later than a
  * higher one would make the earlier reminder unreachable).
@@ -102,7 +118,7 @@ export const readConfig = (
     tuned.urgentTokens = DEFAULTS.urgentTokens
   }
 
-  return { ...DEFAULTS, ...tuned }
+  return { ...DEFAULTS, ...tuned, noter: noterOf(held, env) }
 }
 
 /** The environment's own switch: true for `1`, false for `0`, undefined when it leaves the choice to the option. */

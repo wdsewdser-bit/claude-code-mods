@@ -74,6 +74,8 @@ import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
 import { extractDecisions, renderDecisions } from './decisions.ts'
+import { cursorOf, notedFromLines, renderNoted } from './noter.ts'
+import type { NotedDecision } from './noter.ts'
 import { detectLineage, lineageFrom } from './lineage.ts'
 import type { Lineage } from './lineage.ts'
 import type { DecisionRevoke } from './decisions.ts'
@@ -283,6 +285,10 @@ const HELD_FILE = 'held.json'
 
 /** The decisions the person took back, kept beside the ledger so a new window still knows. */
 const DECISION_FILE = 'decisions.jsonl'
+/** What the note-taker under `scripts/` has settled, one record per line; only it writes here. */
+const NOTED_FILE = 'noted.jsonl'
+/** How far the note-taker has read: messages at or below this seq never go through the rules again. */
+const NOTER_CURSOR_FILE = 'noter-cursor.json'
 
 /**
  * A non-text item a held prompt carried, as the engine names it: the kind, and
@@ -1067,6 +1073,37 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     for (const shard of shards.values()) rows.push(...shard.rows)
 
     return rows.sort((left, right) => left.seq - right.seq)
+  }
+
+  /**
+   * The note-taker's list with the revokes it recorded itself folded in, and its
+   * cursor; null when the switch is off or no run has written a list yet. Read only:
+   * the script under `scripts/` owns both files.
+   */
+  const notedView = async (): Promise<{ decisions: NotedDecision[]; cursor: number } | null> => {
+    if (!config.noter) return null
+    const text = await readText(pathIn(NOTED_FILE))
+    if (text === null) return null
+
+    return { decisions: notedFromLines(text), cursor: cursorOf(await readText(pathIn(NOTER_CURSOR_FILE))) }
+  }
+
+  /**
+   * The decisions section. With the switch off this is the deterministic section,
+   * byte for byte. With it on, the messages the note-taker has already read are
+   * carried as its notes and only the messages after its cursor go through the
+   * rules; the two share one heading, since two would read as two different lists.
+   */
+  const decisionsSection = async (rows: readonly HistoryRecord[]): Promise<string> => {
+    const revoked = new Set(revokes.keys())
+    const noted = await notedView()
+    if (noted === null) {
+      return renderDecisions(extractDecisions(rows, revoked), config.decisionChars, state.window - 1)
+    }
+    const kept = noted.decisions.filter(decision => !revoked.has(decision.seq))
+    const tail = extractDecisions(rows.filter(row => row.seq > noted.cursor), revoked)
+
+    return renderNoted(kept, config.decisionChars, state.window - 1, tail)
   }
 
   const bySeq = (seq: number): HistoryRecord | undefined => {
@@ -2071,7 +2108,10 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     const reason = typeof raw.reason === 'string' && raw.reason.trim() !== '' ? raw.reason.trim() : undefined
     await ensureAllWindows()
     // Whether the number named a decision at all, said back so a typo is caught at once.
-    const wasDecision = extractDecisions(allRows(), new Set(revokes.keys())).some(decision => decision.seq === seq)
+    const noted = await notedView()
+    const wasDecision =
+      extractDecisions(allRows(), new Set(revokes.keys())).some(decision => decision.seq === seq) ||
+      (noted?.decisions.some(decision => decision.seq === seq) ?? false)
     revokes.set(seq, {
       seq,
       ts: io.now(),
@@ -2182,7 +2222,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     await ensureLoaded()
     await ensureAllWindows()
     const home = await localLedgerRead({})
-    const decisions = renderDecisions(extractDecisions(allRows(), new Set(revokes.keys())), config.decisionChars, state.window - 1)
+    const decisions = await decisionsSection(allRows())
     const older = await lineageSection()
     return [home.result, decisions, older].filter(Boolean).join('\n\n')
   }
@@ -2642,11 +2682,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     const rows = allRows()
     // The last two windows are the ones the model was just working in: their
     // decisions stay even when the section runs past its ceiling.
-    const decisions = renderDecisions(
-      extractDecisions(rows, new Set(revokes.keys())),
-      config.decisionChars,
-      state.window - 1,
-    )
+    const decisions = await decisionsSection(rows)
     const requests = displayRequests(personRequests(rows, config.recentRequests))
     const answered = repliesAnswered(rows, requests)
     const window = state.window + 1
