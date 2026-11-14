@@ -67,6 +67,8 @@ export type Digest = {
   cwd: string
   lastRecordType: string
   lastMessage: { role: string; kinds: string[] } | null
+  /** When the newest timestamped record was written (ms since epoch); 0 when none carries a time. */
+  lastTs: number
   backgroundBash: { id: string; detail: string }[]
   backgroundAgents: { id: string; detail: string; agentId?: string }[]
   delegateStarts: { id: string; detail: string }[]
@@ -116,12 +118,16 @@ function kindOf(block: any): string {
   return typeof block?.type === 'string' ? block.type : ''
 }
 
+/** A session silent for longer than this before the restart was not interrupted by it. */
+export const STALE_AFTER_MS = 30 * 60 * 1000
+
 /** Turns transcript lines (a tail, first line possibly cut) into what the judgement needs. */
 export function digestFromLines(lines: readonly string[]): Digest {
   const digest: Digest = {
     cwd: '',
     lastRecordType: '',
     lastMessage: null,
+    lastTs: 0,
     backgroundBash: [],
     backgroundAgents: [],
     delegateStarts: [],
@@ -150,6 +156,10 @@ export function digestFromLines(lines: readonly string[]): Digest {
     index++
     if (typeof record.cwd === 'string' && record.cwd) digest.cwd = record.cwd
     if (typeof record.type === 'string' && record.type) digest.lastRecordType = record.type
+    if (typeof record.timestamp === 'string') {
+      const ts = Date.parse(record.timestamp)
+      if (Number.isFinite(ts) && ts > digest.lastTs) digest.lastTs = ts
+    }
 
     const content = record.message?.content
     const blocks: any[] = Array.isArray(content) ? content : typeof content === 'string' ? [{ type: 'text', text: content }] : []
@@ -262,7 +272,10 @@ export function interruptedLabel(type: string): string {
  * (a) the turn has not ended; or (b) the turn ended but something started
  * before the restart is still waiting for a result. Otherwise idle.
  */
-export function judgeTranscript(digest: Digest): { state: 'working' | 'idle'; reason: string; interrupted: Interrupted[] } {
+export function judgeTranscript(
+  digest: Digest,
+  now?: number,
+): { state: 'working' | 'idle'; reason: string; interrupted: Interrupted[] } {
   const interrupted: Interrupted[] = []
   const add = (item: Interrupted) => {
     if (!interrupted.some(existing => existing.type === item.type && existing.id === item.id)) interrupted.push(item)
@@ -290,10 +303,14 @@ export function judgeTranscript(digest: Digest): { state: 'working' | 'idle'; re
     if (!digest.cronDeletes.includes(cron.id)) add({ type: 'cron', id: cron.id, detail: cron.detail })
   }
 
-  if (digest.lastRecordType === 'api-request') {
+  // A transcript nothing has written to for a long while was not cut off by this restart,
+  // whatever its last line looks like: a window switch after a finished turn leaves the
+  // handoff (a user message) as the last message for days.
+  const stale = typeof now === 'number' && digest.lastTs > 0 && now - digest.lastTs > STALE_AFTER_MS
+  if (!stale && digest.lastRecordType === 'api-request') {
     return { state: 'working', reason: '最后一条记录是 api-request（正在等模型返回）', interrupted }
   }
-  const last = digest.lastMessage
+  const last = stale ? null : digest.lastMessage
   if (last?.role === 'user') {
     return { state: 'working', reason: '最后一条消息是用户消息或工具结果，助理还没回复', interrupted }
   }
@@ -306,6 +323,10 @@ export function judgeTranscript(digest: Digest): { state: 'working' | 'idle'; re
       reason: `回合已结束，但还有未完成的后台任务：${interrupted.map(item => `${interruptedLabel(item.type)} ${item.id}`).join('、')}`,
       interrupted,
     }
+  }
+  if (stale) {
+    const minutes = Math.round((now! - digest.lastTs) / 60000)
+    return { state: 'idle', reason: `最后一次活动在 ${minutes} 分钟前，不是这次重启打断的，也没有未完成的后台任务`, interrupted: [] }
   }
   return { state: 'idle', reason: '最后一条消息是助理的结束回复，也没有未完成的后台任务', interrupted: [] }
 }
@@ -850,7 +871,7 @@ async function restartTool($: any, e: any): Promise<{ result: any; text: string 
           }
         }
         const digest = digestFromLines(tail.split(/\r?\n/))
-        const verdict = judgeTranscript(digest)
+        const verdict = judgeTranscript(digest, Date.now())
         discovered.push({
           sessionId: session.sessionId,
           localId: session.localId ? String(session.localId) : null,
