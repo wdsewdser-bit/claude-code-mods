@@ -42,7 +42,7 @@ const lib = (fns: Record<string, string>) =>
   JSON.stringify({ version: 1, functions: Object.fromEntries(Object.entries(fns).map(([k, v]) => [k, { source: '(tools) => 1', doc: v }])) })
 
 describe('the appended description', () => {
-  test('with no library it is only the short help, and stays under 600 characters', () => {
+  test('with no library it is only the short help, and stays under the cap', () => {
     const add = __test.descAppend([])
     expect(add).toBe(__test.SHORT_HELP + __test.LIB_HINT)
     expect(add).toContain('tools.sh')
@@ -68,15 +68,15 @@ describe('the appended description', () => {
 })
 
 describe('the description the tool is registered with', () => {
-  test('the base is untouched and the global list is at the very end', { timeoutMs: 20000 }, async () => {
+  test('the base is untouched and the global list leads, where the host does not cut it', { timeoutMs: 20000 }, async () => {
     const t = await startWith(lib({ check: '跑测试', ship: '提交并推送' }))
-    const i = t.desc.indexOf(' Shorthand: tools.sh')
-    expect(i).toBeGreaterThan(1000)
-    const base = t.desc.slice(0, i)
-    expect(base.startsWith('Run a JavaScript async-function body in a sandbox')).toBe(true)
-    expect(base.endsWith('that returns them')).toBe(true)
-    expect(t.desc.slice(i)).toContain('check — 跑测试')
-    expect(t.desc.length - i).toBeLessThanOrEqual(__test.DESC_APPEND_MAX)
+    expect(t.desc.startsWith('Shorthand: tools.sh')).toBe(true)
+    const i = t.desc.indexOf('Run a JavaScript async-function body in a sandbox')
+    expect(i).toBeGreaterThan(0)
+    expect(i).toBeLessThanOrEqual(__test.DESC_APPEND_MAX + 1)
+    expect(t.desc.slice(0, i)).toContain('check — 跑测试')
+    expect(t.desc.slice(0, i)).toContain('lib.def')
+    expect(t.desc.endsWith('that returns them')).toBe(true)
   })
 
   test('the global file is the one read, once', { timeoutMs: 20000 }, async () => {
@@ -92,13 +92,13 @@ describe('the description the tool is registered with', () => {
 
   test('a missing library adds no list and never fails', { timeoutMs: 20000 }, async () => {
     const t = await startWith(undefined)
-    expect(t.desc.endsWith(__test.SHORT_HELP + __test.LIB_HINT)).toBe(true)
+    expect(t.desc.startsWith((__test.SHORT_HELP + __test.LIB_HINT).trimStart() + ' Run a JavaScript')).toBe(true)
     expect(t.desc).not.toContain('全局库：')
   })
 
   test('a broken library adds no list either', { timeoutMs: 20000 }, async () => {
     const t = await startWith('not json at all')
-    expect(t.desc.endsWith(__test.SHORT_HELP + __test.LIB_HINT)).toBe(true)
+    expect(t.desc.startsWith((__test.SHORT_HELP + __test.LIB_HINT).trimStart() + ' Run a JavaScript')).toBe(true)
   })
 
   test('session-level names never reach the description', { timeoutMs: 20000 }, async () => {
