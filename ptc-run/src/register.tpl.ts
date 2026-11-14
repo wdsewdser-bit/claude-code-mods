@@ -253,8 +253,10 @@ const writeOverflow = async ($: unknown, text: string): Promise<string | undefin
   return file
 }
 
-// ---------- what the tool description ends with (appended, never rewritten: the rest is cache prefix) ----------
-const DESC_APPEND_MAX = 600
+// ---------- what the tool description starts with ----------
+// It leads rather than trails: the host shows the model only about the first 2000 characters of a
+// tool description, and at the end this part was cut off and never seen.
+const DESC_APPEND_MAX = 450
 const SHORT_HELP = ' Shorthand: tools.sh(command,{tail?=60,cwd?,timeoutMs?})->{code,text} (last lines of stdout+stderr); tools.peek(path,pattern,{context?=2,limit?=20})->matching lines with real line numbers.'
 const LIB_HINT = ' 重复用到的多步流程用 lib.def 登记成快捷函数，之后一次调用；lib.help() 看全部。'
 const LIB_REMAINDER = ' 其余用 lib.help()'
@@ -339,7 +341,7 @@ export const register: Register = (on, options) => {
     const baseDesc = ro ? (sdkInPrompt ? descShortRo(roRoots) : descRo(roRoots)) : sdkInPrompt ? DESC_SHORT : DESC
     await $.tool.register({
       name: 'run_code',
-      description: baseDesc + descAppend(await readLibDocs($)),
+      description: descAppend(await readLibDocs($)).trimStart() + ' ' + baseDesc,
       isDeferred: false,
       inputSchema: {
         type: 'object',
