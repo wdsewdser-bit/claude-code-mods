@@ -560,6 +560,16 @@ test('armed, ledger_read finds a word written only in dead_ends', async ($, on) 
   expect(answer).toContain('走不通的路：STOP-OLD-ROUTE')
 })
 
+test('armed, a tool call that comes before any session.start (a hot reload) still reads the config and answers', async ($, on) => {
+  world(on, 's-reload', { CTX_MOD: '1' })
+  const booked = await callTool(
+    $,
+    ledger({ tool_use_id: 'l-reload', task_id: 't1', title: '工作', status: 'in_progress', text: '热加载后第一次', next_step: '接着做' }),
+  )
+  expect(booked.isError).not.toBe(true)
+  expect(textOf(booked)).toContain('#L1')
+})
+
 test('armed, a subagent call of every tool is refused as main-thread only', async ($, on) => {
   const w = world(on, 's-agent', { CTX_MOD: '1' })
   await boot($)

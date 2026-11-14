@@ -2201,6 +2201,15 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
       await queue.push(pathIn('ledger.jsonl'), toJsonl(state.page))
       saveMeta()
     }
+    // 并入结果留一行记录：笔记员已写好的补记在这里仍可能被丢，原因不记就查不到。
+    try {
+      const logPath = pathIn('backfill-merge.log')
+      const old = (await readText(logPath)) ?? ''
+      const line = `${new Date().toISOString()} 并入 #${raw.round}：写入 ${added.length} 条${added.length ? '（#L' + added.join('、#L') + '）' : ''}，丢弃 ${dropped.length} 条${dropped.map(x => `｜${x.task_id || '?'}：${x.reason}`).join('')}`
+      await queue.push(logPath, [...old.split('\n').filter(Boolean).slice(-199), line].join('\n') + '\n')
+    } catch {
+      // 日志失败不影响并入。
+    }
 
     return { added, dropped }
   }

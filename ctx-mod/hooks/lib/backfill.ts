@@ -193,7 +193,7 @@ export const taskLinesOf = (entries: readonly LedgerEntry[]): string[] => {
     .filter(task => task.status === 'done' || task.status === 'superseded')
     .sort((left, right) => right.latest.seq - left.latest.seq)
   if (closed.length > 0) {
-    lines.push('（以下是最近已结束的任务，只列 id 和标题；本轮是它的后续时沿用它的 id）')
+    lines.push('（以下是最近已结束的任务，只列 id 和标题；本轮是它的后续时仍写它的 id，代码会自动改记到它的后续编号，不会重新打开它）')
     for (const task of closed.slice(0, CLOSED_SHOWN)) lines.push(`${task.taskId}｜${flat(task.title)}`)
   }
 
@@ -367,12 +367,31 @@ export const parseBackfillOutput = (
       rejected.push({ item, reason: `task_id「${taskId}」只能是字母、数字、下划线、点和短横线，长度 1-64` })
       continue
     }
-    const task = known.get(taskId)
+    let task = known.get(taskId)
+    let followupOf: TaskState | undefined
     if (task !== undefined && (task.status === 'done' || task.status === 'superseded')) {
-      rejected.push({ item, reason: `${taskId} 已经结束（${task.status}），补记不改它的状态` })
-      continue
+      // 已结束任务上又有新进展：不能写回原 id（会把它重新打开），改记到它的后续编号。
+      // 后续编号已存在且未结束就接着写它；也结束了就再往后编号。
+      followupOf = task
+      let next: string | undefined
+      for (let n = 1; n <= 20 && next === undefined; n += 1) {
+        const candidate = `${taskId.slice(0, 50)}-followup${n === 1 ? '' : '-' + n}`
+        const existing = known.get(candidate)
+        if (existing === undefined || (existing.status !== 'done' && existing.status !== 'superseded')) next = candidate
+      }
+      if (next === undefined) {
+        rejected.push({ item, reason: `${taskId} 已经结束（${task.status}），后续编号也都用完了` })
+        continue
+      }
+      task = known.get(next)
+      if (task === undefined && newIds >= 1) {
+        rejected.push({ item, reason: `${taskId} 已经结束，后续要新起编号，但一轮最多新起一个任务` })
+        continue
+      }
+      item['task_id'] = next
     }
-    if (task === undefined) {
+    const finalId = typeof item['task_id'] === 'string' ? item['task_id'].trim() : taskId
+    if (task === undefined && followupOf === undefined) {
       const relative = context.tasks.find(other => isFamily(other.taskId, taskId))
       if (relative !== undefined) {
         rejected.push({ item, reason: `${taskId} 与已有任务 ${relative.taskId} 同族，应沿用它的 id` })
@@ -389,7 +408,7 @@ export const parseBackfillOutput = (
       continue
     }
     const titleRaw = typeof item['title'] === 'string' ? item['title'].trim() : ''
-    const title = task !== undefined ? task.title : titleRaw
+    const title = task !== undefined ? task.title : followupOf !== undefined ? `${followupOf.title}（后续）` : titleRaw
     if (title === '') {
       rejected.push({ item, reason: '新任务必须给 title' })
       continue
@@ -404,12 +423,12 @@ export const parseBackfillOutput = (
       if (!shown.has(value) || evidence.includes(value)) continue
       evidence.push(value)
     }
-    const key = `${taskId}\u0000${text}`
+    const key = `${finalId}\u0000${text}`
     if (seen.has(key)) continue
     seen.add(key)
     if (task === undefined) newIds += 1
     const entry: BackfillEntry = {
-      task_id: taskId,
+      task_id: finalId,
       title: title.slice(0, MAX_TITLE_CHARS),
       status,
       text: text.slice(0, MAX_TEXT_CHARS),
