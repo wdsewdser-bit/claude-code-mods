@@ -71,15 +71,32 @@ const PARTIAL_READER = 'const fs=require("fs"),path=require("path"),os=require("
   'const rows=[...seen].map(([k,n])=>{const i=k.indexOf("\\u0000");return "- "+k.slice(0,i)+" "+k.slice(i+1)+(n>1?" ×"+n:"")});' +
   'process.stdout.write(JSON.stringify({out:clip(out),ops:rows.length?"本程序已生效的写操作：\\n"+rows.slice(0,50).join("\\n"):"本程序已生效的写操作：无"}))'
 
+// The host shows the model only about the first 4000 characters of a tool description, so these parts are compressed
+// to fit beside the 450-character library prefix (DESC_APPEND_MAX). Whatever was cut stays available in full from
+// inside a program: tools.help(topic) in src/runner.js carries the original text of each part.
 const DESC_PARTS = [
-  'Run a JavaScript async-function body in a sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch work (loops, grep+aggregate, edits). timeoutMs is the whole-program timeout (default 300000 ms, max 600000). root:"D:/abs/dir" makes relative paths, path-less glob/grep and cwd-less bash use that existing absolute directory (tools.root exposes it).',
-  'Paths: relative to cwd (or root). On big trees give glob/grep a path or specific pattern. Errors carry .code/.nextAction and "[CODE]" prefix: INVALID_ARGUMENT NOT_FOUND NOT_UNIQUE COUNT_MISMATCH STALE LOCKED EXISTS POLICY_DENIED BUSY OUTPUT_LIMIT RG_UNAVAILABLE RESULT_UNKNOWN.',
-  'tools.read({path,offset?,limit?,numbered?,fresh?}) (numbered:true -> "N: text" lines with real line numbers; it always returns the file text itself, dedup never changes what the program sees). Dedup happens on the program output: a read result printed back unchanged (at least 300 chars) whose content this conversation already showed comes back as a one-line [read-dedup] note, and a changed file as a diff; filtered/partial/transformed prints are never touched, and fresh:true on a read turns dedup off for that program output (PTC_RUN_READ_DEDUP=0 turns it off everywhere). tools.revision({path}) -> 16-hex sha256 prefix of the file content; pass it as expectedRevision to tools.edit (or as {path: revision} to tools.replace) to get STALE and write nothing if the content changed since (works across run_code calls). tools.write({path,content}) (write/edit/replace results are capped at 32 MiB per file: over it nothing is written and OUTPUT_LIMIT is thrown); tools.edit({path,old,new,all?,expect?,expectedRevision?}) -> {replaced,lines} (atomic; the mtime STALE check still applies only if this same program read the file first; expectedRevision adds a cross-call content check; revision-guarded writes also take a cross-process lock (one writer at a time; LOCKED after ~2 s, a lock left by a crash is taken over after 30 s); with all:true pass expect:<count you mean to change>, a different count writes nothing and throws COUNT_MISMATCH).',
-  'tools.glob({pattern?:string|string[],path?,sort?:"path"|"modified",details?,offset?,limit?=5000}) and tools.grep({pattern,path?,glob?,ignoreCase?,outputMode?:"content"|"files_with_matches"|"count",before?,after?,multiline?,offset?=0,limit?=500}) -> {items,total,complete,nextOffset} (ripgrep: .gitignore honoured; skips hidden, node_modules, target, .venv, files>2MB). glob items: path, or {path,size,mtime} with details. grep items: {file,line,text<=300} (+uncounted context:true rows), {file,count}, or paths.',
-  'tools.replace({pattern(JS regex; lookaround, \\1, named groups ok),replacement($1 ok),path?,glob?,flags?,dryRun?,maxReplacements?,expect?,expectedRevision?}) -> {files,matches,changed,items:[{file,count,lines}],dryRun} (expect: total matches you mean to change; a different count writes nothing and throws COUNT_MISMATCH). Any write that changed several places is listed at the top of the output with its line numbers: check each one was intended.',
-  'tools.batch({action:"plan"|"run"|"resume"|"list",operations:[{op:"copy"|"move"|"remove",path,to?}],protect?:string[],root?,toRoot?,id?}): root-relative "/" paths (to is relative to toRoot if given: another dir/drive), <=512 ops, no overwrite, destination parent must exist, no links, protect untouched; preflighted first. plan only journals; run needs operations; resume takes only id (unknown items: checked, not redone); list shows jobs. -> {id,status:"completed"|"partial"|"failed"|"planned",done,failed,unknown,total,detailsRef}.',
-  'tools.bash({command,cwd?,timeoutMs?,env?,background?,promote?})->{code,stdout,stderr}; a foreground command that reaches timeoutMs is not killed but promoted to a background job: the call returns {code:null,timedOut:true,promoted:true,jobId,stdout,stderr} (output so far) and tools.job({id:jobId,wait?}) returns the final result; promote:false kills it on timeout instead. background:true returns {id} immediately, then tools.job({id,wait?,tailChars?=4000})->{done,code,stdout,stderr} (jobs survive run_code calls; 2h cap). await tools.parallel([{command,cwd?,timeoutMs?,env?}],{concurrency?=4,<=16}) runs <=64 bash calls -> [{code,stdout,stderr,timedOut?}] in order. Child processes default to PYTHONUTF8=1 and PYTHONIOENCODING=utf-8; an explicit env wins. tools.test({command,workdir?,timeoutMs?=300000,maxFailures?=10}) runs a test command through the same bash path -> {status:"passed"|"failed"|"error"|"timeout"|"unknown",exitCode,counts?,failures,tail?,error?,outputPath} (pytest/vitest/jest/node --test parsed conservatively): print that summary instead of piping test output; when status is "error", read error and tail, and outputPath is the path to the full output (read it with tools.read).',
-  'ref.put(v)->id; ref.page(id,{offset,limit,fields,equals,maxBytes=16384})->{total,offset,items,nextOffset,complete,omitted} (OUTPUT_LIMIT if one row exceeds maxBytes; also reads detailsRef); ref.text(id,{from,to}) returns a slice of the saved text; ref.release(id). ref.store(key,value)->{key,bytes} / ref.load(key)->value|undefined: named JSON values kept per session for 24h, for results a later run_code needs (avoids reprinting or rerunning); key is 1-64 chars of [A-Za-z0-9_.-], value is JSON and at most 8 MB. Refs: per session, 24h. Output over ~8000 chars (or maxChars, <=50000) keeps about the first 70% and last 30% (cut on line boundaries); the marker names the omitted output lines and the exact ref.text(id,{from,to}) call that returns them',
+  // 0: what the tool is, and the shape of a program
+  'Run a JavaScript async-function body in a sandbox: tools.* are synchronous, only console.log output and the return value come back. Use for batch work (loops, grep+aggregate, edits). timeoutMs = whole-program timeout (default 300000, max 600000); root:"D:/abs/dir" is the base for relative paths, path-less glob/grep and cwd-less bash (tools.root). Details: tools.help(topic); tools.help() lists them.',
+  // 1: two examples the tests really run (tests/desc-examples.test.mjs)
+  '// Examples — locate, change, verify; print a summary:\nconst hit = tools.grep({pattern:"oldName", glob:"src/**/*.ts"});\nconst w = tools.replace({pattern:"oldName", replacement:"newName", glob:"src/**/*.ts"});\nconst t = tools.sh("npm test", {tail:15});\nconsole.log(hit.total, w.changed, t.code === 0 ? "ok" : t.text);\n// A flow used twice becomes a shortcut:\nlib.def("check", "(tools, dir) => tools.sh(\'npm test\', {cwd:dir, tail:15}).text", "跑测试看结尾");\nconsole.log(lib.check("."));',
+  // 2: paths and error codes
+  'Paths: relative to cwd/root; on big trees give glob/grep a path or pattern. Errors carry .code/.nextAction and a "[CODE]" prefix: INVALID_ARGUMENT NOT_FOUND NOT_UNIQUE COUNT_MISMATCH STALE LOCKED EXISTS POLICY_DENIED BUSY OUTPUT_LIMIT RG_UNAVAILABLE RESULT_UNKNOWN.',
+  // 3: read; dedup is only named here, the detail is tools.help("read")
+  'tools.read({path,offset?,limit?,numbered?,fresh?}) returns the real text (numbered:true -> "N: text", real line numbers). Dedup only touches printed output: a read result printed back unchanged that this conversation already showed becomes a one-line [read-dedup] note; fresh:true turns it off. tools.help("read").',
+  // 4: write and edit
+  'tools.write({path,content})->{bytes}; tools.edit({path,old,new,all?,expect?,expectedRevision?})->{replaced,lines} (atomic; all:true with expect:<places>, a different count throws COUNT_MISMATCH and writes nothing; expectedRevision from tools.revision({path}) makes a changed file STALE). tools.help("edit").',
+  // 5: glob
+  'tools.glob({pattern?,path?,sort?:"path"|"modified",details?,offset?,limit?=5000})->{items,total,complete,nextOffset}; items are paths, or {path,size,mtime} with details.',
+  // 6: grep
+  'tools.grep({pattern,path?,glob?,ignoreCase?,outputMode?:"content"|"files_with_matches"|"count",before?,after?,multiline?,offset?,limit?=500})->{items,total,complete,nextOffset}; content items {file,line,text<=300}, count items {file,count}; .gitignore honoured; hidden, node_modules, target, .venv, >2MB skipped.',
+  // 7: replace
+  'tools.replace({pattern(JS regex),replacement($1 ok),path?,glob?,flags?,dryRun?,expect?,expectedRevision?})->{files,matches,changed,items,dryRun}; expect:<total matches>. Each changed place is listed at the top with line numbers: check each one.',
+  // 8: batch
+  'tools.batch({action:"plan"|"run"|"resume"|"list",operations:[{op:"copy"|"move"|"remove",path,to?}],protect?,root?,toRoot?,id?})->{id,status,done,failed,total}: root-relative "/" paths, <=512 ops, no overwrite, preflighted; tools.help("batch").',
+  // 9: bash and background jobs; the timeout promotion is named, the detail is tools.help("bash")
+  'tools.bash({command,cwd?,timeoutMs?,env?,background?,promote?})->{code,stdout,stderr}; a foreground command reaching timeoutMs is promoted, not killed: {code:null,timedOut:true,promoted:true,jobId,...} and tools.job({id:jobId,wait?}) returns the result (promote:false kills it). background:true returns {id} at once; tools.job({id,wait?,tailChars?})->{done,code,stdout,stderr} (jobs outlive the call, 2h). tools.parallel/tools.test: see tools.help("bash").',
+  // 10: refs and the output cap
+  'ref.put(v)->id; ref.page(id,{offset,limit,maxBytes=16384})->{offset,items,nextOffset,complete}; ref.text(id,{from,to}) slices saved text; ref.release(id); ref.store(key,value)->{key,bytes} / ref.load(key)->value|undefined, 24h. Output >~8000 chars keeps head 70% + tail 30%; the marker names the ref.text call that returns them',
 ]
 const DESC = DESC_PARTS.join(' ')
 
@@ -107,12 +124,15 @@ const rootsLine = (roots: string[]): string =>
 // Read-only mode has no ref.store (it writes a file), so its ref sentence lists ref.load alone.
 const refLineRo = (s: string): string => s.replace('ref.store(key,value)->{key,bytes} / ', '')
 
-// Read-only mode descriptions: only the read-side bindings are advertised.
+// Read-only mode descriptions: only the read-side bindings are advertised, with the same compression rule as above;
+// its example reads only, and its ref sentence drops ref.store.
+const DESC_RO_INTRO = 'Run a JavaScript async-function body in a READ-ONLY sandbox: tools.* are synchronous, only console.log output and the return value come back. Use for batch reading, grep+aggregate and summaries. timeoutMs defaults to 300000 (max 600000); root:"D:/abs/dir" changes the base for relative paths and glob/grep. Details: tools.help(topic).'
+const DESC_RO_EXAMPLE = '// Example — locate and summarise:\nconst hit = tools.grep({pattern:"TODO", glob:"src/**/*.ts"});\nfor (const f of new Set(hit.items.map(i => i.file))) console.log(f, tools.read({path:f}).split("\n").filter(l => l.includes("TODO")).length);\nconsole.log(hit.total);'
 const descRo = (roots: string[]): string =>
   [
-    'Run a JavaScript async-function body in a READ-ONLY sandbox that calls tools synchronously; only console.log output and the return value come back. Use for batch reading, grep+aggregate and summaries. timeoutMs defaults to 300000 (max 600000); root:"D:/abs/dir" changes the base directory for relative paths and glob/grep.',
+    DESC_RO_INTRO,
     'Read-only mode: tools.write/edit/replace/batch/bash/parallel/job throw POLICY_DENIED, the program itself cannot write files or start processes (fs writes and child_process are blocked), and only files under the working directory and the extra readable directories (if any) can be read or searched; anything else fails with an access error.' + rootsLine(roots),
-    DESC_PARTS[1], DESC_PARTS[2].split('. tools.write')[0] + '.', DESC_PARTS[3], refLineRo(DESC_PARTS[7]),
+    DESC_RO_EXAMPLE, DESC_PARTS[2], DESC_PARTS[3], DESC_PARTS[5], DESC_PARTS[6], refLineRo(DESC_PARTS[10]),
   ].join(' ')
 const descShortRo = (roots: string[]): string =>
   'Run a JavaScript async-function body in a read-only sandbox (no file writes, no commands, reads only under the working directory and the extra readable directories, if any); the SDK bindings (tools.*) are declared in the system prompt. Only console.log output and the return value come back.' + rootsLine(roots)
@@ -595,4 +615,9 @@ export const __test = {
   LIB_HINT,
   LIB_REMAINDER,
   DESC_APPEND_MAX,
+  DESC,
+  DESC_PARTS,
+  DESC_SHORT,
+  descRo,
+  descShortRo,
 }

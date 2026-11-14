@@ -21,8 +21,18 @@
 - `ref.put / page / text / release`：输出超过 8000 字符（可用 `maxChars` 调整，最大 50000）时保留前约 70% 和后 30%，中段落盘成 ref，按需分页读取（`ref.page` 默认每页 50 条、单条上限 16384 字节）。ref 存在系统临时目录 `cc-ptc/` 下，保留 24 小时。
 - `ref.store(key,value)` / `ref.load(key)`：按名字存一个 JSON 值，供后面的 `run_code` 直接取用，不用重复打印或重跑。key 限 1–64 位 `[A-Za-z0-9_.-]`，值上限 8 MB；存在同一会话目录下的 `kv-<key>.json`，和 ref 一样保留 24 小时，同名覆盖（原子写）。`ref.store` 返回 `{key,bytes}`；`ref.load` 在不存在或已过期时返回 `undefined`，不抛错。只读模式下只有 `ref.load` 可用。
 - `run_code` 整程序默认超时 300000 ms（最大 600000 ms）；`root:"D:/abs/dir"` 可把相对路径、glob/grep 和 bash 的基准目录切到该目录。
+- `tools.help(topic?)`：说明里放不下的细节都在这里。`tools.help()` 返回主题列表（`paths`, `read`, `edit`, `grep`, `replace`, `batch`, `bash`, `ref`），`tools.help('bash')` 返回该主题压缩前的完整原文；未知名抛 `INVALID_ARGUMENT`。只读模式同样可用。
 
 错误带 `[CODE]` 前缀和 `nextAction` 提示。
+
+## 工具说明（description）
+
+宿主只给模型看说明的前 4000 字符左右，说明按这个预算压过：
+
+- 结构：最前面是 `descAppend`（不超过 `DESC_APPEND_MAX` = 450 字符：`tools.sh`/`tools.peek` 简写、`lib.def` 提示、全局库清单），空一格后接 `DESC`（`DESC_PARTS` 各段用空格连接）：总述（含 `tools.help` 提示）→ 两个可运行示例 → 路径与错误码 → read → write/edit → glob → grep → replace → batch → bash/后台作业 → ref。
+- 只读模式用 `descRo`：只读总述、只读限制（`PTC_RUN_READ_ROOTS`）、只读示例（grep + read）、路径错误码、read、glob、grep、ref（去掉 `ref.store`）；`PTC_RUN_SDK_IN_PROMPT=1` 时改用 `DESC_SHORT` / `descShortRo`。
+- 压缩不丢细节：read 去重和 bash 超时转后台各保留一句，完整原文放在 `src/runner.js` 的 `HELP` 表里，由 `tools.help(topic)` 取出（不是重写，是压缩前的原文）。
+- 测试守着它：`tests/desc.test.ts` 检查四种说明加最长前缀后都不超过 4000 字符、示例关键字、`read-dedup`/`jobId` 和错误码；`tests/desc-examples.test.mjs` 把说明里的两个示例原样跑一遍，并检查 `tools.help()` 的主题列表和 `bash` 主题的原文。
 
 ## 要知道的事
 
