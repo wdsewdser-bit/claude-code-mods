@@ -441,7 +441,7 @@ const judgeAgentWindow = (state: State, config: Config, now: number): string | u
 
 /** L1: the reminder injected once per streak, after the batch that earned it. */
 export const remindText = (requests: number): string =>
-  `dispatch-gate：主会话已连续 ${requests} 个执行请求，没有派发。接下来把剩下的工作按文件集合打包，交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件；主会话只做派发和验收。探针、浏览器、交互式调试这类只能自己做的，继续即可。`
+  `dispatch-gate：主会话已连续 ${requests} 个执行请求，没有派发。如果剩下的工作值得派（能并行、输出长、可以挪到 DS 省额度），按文件集合打包交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件。交代任务比自己做还长、结果马上要用于下一步判断、或只能主会话做的（探针、浏览器、交互式调试），继续自己做即可。`
 
 /** L2: the one refusal per streak, given at the tool call that would keep going. */
 export const denyText = (requests: number, cooldownMinutes: number): string =>
