@@ -134,8 +134,13 @@ type CpaAccount = { name: string; email?: string; disabled?: boolean; status?: s
 type AdminReply = { ok: boolean; error?: string; providers?: CpaProvider[]; models?: string[]; accounts?: CpaAccount[]; url?: string; state?: string; status?: string; usedCents?: number }
 const admin = async ($: EngineInterface, command: string, input: Record<string, unknown> = {}): Promise<AdminReply> => {
   const ran = await $.process.run(['node', `${$.plugin.root}/scripts/cpa-admin.mjs`, command], { stdin: JSON.stringify(input), timeoutMs: 120_000 })
-  const result = JSON.parse(ran.stdout.trim().split('\n').at(-1) || '{}') as AdminReply
-  if (ran.exitCode !== 0 || !result.ok) throw new Error(result.error || 'CPA 操作失败')
+  let result: AdminReply = { ok: false }
+  try { result = JSON.parse(ran.stdout.trim().split('\n').at(-1) || '{}') as AdminReply } catch { /* 非 JSON 输出，下面带上原始摘要 */ }
+  if (ran.exitCode !== 0 || !result.ok) {
+    // 脚本没给出原因时（崩溃、超时、被杀），带上退出码和输出末尾，否则面板只能显示一句空话。
+    const tail = (ran.stderr || ran.stdout || '').trim().split('\n').slice(-2).join(' ').slice(0, 200)
+    throw new Error(result.error || `${command} 退出码 ${ran.exitCode}${tail ? '：' + tail : '，无输出'}`)
+  }
   return result
 }
 let migrationPending: Promise<Config> | undefined
@@ -440,7 +445,8 @@ let loginUntil = 0
 let loginPending = false
 const redraw = async ($: EngineInterface): Promise<void> => { await update($, versionAtom, n => n + 1) }
 const paneAction = async ($: EngineInterface, fn: () => Promise<void>): Promise<void> => {
-  try { await fn() } catch { await setFlash($, 'CPA 操作失败，请检查供应商设置或本机服务后重试') }
+  // 报错来自 cpa-admin，已在脚本内脱敏，直接显示原因，方便定位是哪一项填错或服务没起来。
+  try { await fn() } catch (error) { await setFlash($, `CPA 操作失败：${messageOf(error).slice(0, 200) || '未知错误'}`) }
   await redraw($)
 }
 const refreshProviders = async ($: EngineInterface): Promise<void> => {
@@ -463,6 +469,8 @@ const saveProvider = async ($: EngineInterface, models?: string[]): Promise<void
   const existing = cpaProviders.find(p => p.id === editId)
   const id = editId || idOf(d.pName, cpaProviders.map(p => p.id))
   if (!d.pName.trim()) { await setFlash($, '名称不能为空'); return }
+  if (!d.pUrl.trim()) { await setFlash($, 'base-url 不能为空'); return }
+  if (!existing && !d.pKey.trim()) { await setFlash($, '新增供应商需要填 key'); return }
   await admin($, 'save', { id, name: d.pName, protocol: editProtocol, baseUrl: d.pUrl, ...(d.pKey.trim() ? { key: d.pKey.trim() } : {}), models: models || existing?.models || [] })
   const config = await loadConfig($)
   await saveConfig($, { ...config, providers: [...config.providers.filter(p => p.id !== id), { id, name: d.pName.trim() }] })
