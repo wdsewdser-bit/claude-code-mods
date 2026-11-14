@@ -507,3 +507,30 @@ test('restart_cc：注册表里的任务被禁用也算没建好', async ($, on)
   expect(s.files.get(MARKER)).toBeUndefined()
 })
 
+test('a session silent for days is not woken, even when its last message is a handoff', () => {
+  const at = Date.parse('2026-11-10T05:24:34.255Z')
+  const handoff = JSON.stringify({
+    type: 'user',
+    timestamp: '2026-11-10T05:24:34.255Z',
+    message: { role: 'user', content: '这是第 6 个窗口，上一个窗口的对话不在上下文里。' },
+  })
+  const digest = digestFromLines([handoff])
+  expect(digest.lastTs).toBe(at)
+  expect(judgeTranscript(digest, at + 4 * 24 * 3600 * 1000).state).toBe('idle')
+  // Just before the restart the same last message still means an unanswered turn.
+  expect(judgeTranscript(digest, at + 60 * 1000).state).toBe('working')
+  // No clock given: the old judgement.
+  expect(judgeTranscript(digest).state).toBe('working')
+})
+
+test('a stale session with a background job nobody reported on is still listed', () => {
+  const lines = [
+    assistantTool('toolu_del1', 'mcp__delegate__delegate_pro', { task: '审查代码' }),
+    userResult('toolu_del1', DELEGATE_START),
+    assistantText('先等它回来。'),
+    JSON.stringify({ type: 'system', timestamp: '2026-11-10T05:00:00.000Z' }),
+  ]
+  const verdict = judgeTranscript(digestFromLines(lines), Date.parse('2026-11-10T09:00:00.000Z'))
+  expect(verdict.interrupted.map(item => item.id)).toEqual(['bg-mvfeek2b'])
+  expect(verdict.state).toBe('working')
+})
