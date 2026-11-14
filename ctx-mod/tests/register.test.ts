@@ -1877,6 +1877,14 @@ test('a snapshot older than the last real main-thread request is not booked', as
   await goCold($, w)
   // A real main-thread request has run since the keepalive answered.
   await step($, 0)
+  // ...and that request too is an hour old by now, so the cache is cold again. Time cannot be moved
+  // under the mod, so the session reopens from a meta.json whose last request is written back an hour.
+  await w.clock.settle()
+  const meta = JSON.parse(fileAt(w, `ctx-mod/${w.sessionId}/meta.json`) ?? '{}') as { lastRequestAt?: number }
+  meta.lastRequestAt = (meta.lastRequestAt ?? Date.now()) - 3_600_000
+  w.sessionId = `${w.sessionId}-later`
+  w.readable.set(`${slashed(HOME)}/.claude/ctx-mod/${w.sessionId}/meta.json`, JSON.stringify(meta))
+  await boot($)
   w.snapshot = snapshotOf(1, [SNAPSHOT_ENTRY])
   await sayWhileCold($, '换完再说')
   await w.clock.advance(300)

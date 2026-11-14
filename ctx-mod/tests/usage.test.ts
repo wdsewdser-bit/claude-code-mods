@@ -148,6 +148,13 @@ describe('isCold', () => {
     expect(isCold({ now, cache: fiveMin, lastRequestAt: now - 300_000 }, DEFAULTS)).toBe(true)
     expect(isCold({ now, cache: fiveMin, lastRequestAt: now - 299_999 }, DEFAULTS)).toBe(false)
   })
+
+  test('a stale keeper expiry does not outvote a later request seen here', () => {
+    // The keeper stopped hearing the session an hour ago; a request 25 minutes ago refreshed the cache.
+    const stale = cache({ ttl: '1h', expiresAt: now - 1 })
+    expect(isCold({ now, cache: stale, lastRequestAt: now - 25 * 60_000 }, DEFAULTS)).toBe(false)
+    expect(isCold({ now, cache: stale, lastRequestAt: now - 3_600_000 }, DEFAULTS)).toBe(true)
+  })
 })
 
 describe('gateSwitch', () => {

@@ -282,8 +282,17 @@ let carriedEnabled: boolean | undefined
 let timer: Timer | undefined
 let isTicking = false
 
+// The debug log is off unless Claude Code runs with --debug, so errors also go
+// to a file of this load's own: the last ones, enough to tell why it went quiet.
+const loadId = Date.now().toString(36)
+const errorLines: string[] = []
+
 const debug = ($: EngineInterface, error: unknown): void => {
-  $.ui.log(`error: ${messageOf(error)}`, { to: 'debug' })
+  const text = `error: ${messageOf(error)}`
+  $.ui.log(text, { to: 'debug' })
+  errorLines.push(`${new Date().toISOString()} ${text}${error instanceof Error && error.stack ? `\n${error.stack}` : ''}`)
+  if (errorLines.length > 100) errorLines.splice(0, errorLines.length - 100)
+  void $.fs.write(`${config.dataDir}/errors-${loadId}.log`, `${errorLines.join('\n')}\n`).catch(() => {})
 }
 
 const eventsPath = (s: Session): string =>

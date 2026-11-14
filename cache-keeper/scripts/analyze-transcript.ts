@@ -6,7 +6,7 @@
 //   node scripts/analyze-transcript.ts --report <dataDir>         rebuild the report files
 //
 // It only ever reads transcripts.
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { observedTtl } from '../hooks/lib/classify.ts'
@@ -24,9 +24,28 @@ const fail = (message: string): never => {
 
 // The rows the mod's own parser needs, without the message content, so the
 // tail of a transcript too large for the mod to read fits in one reply.
+// Only the end of the file: a long session's transcript runs to hundreds of
+// MB, and reading all of it held the mod's reconcile for seconds each turn.
+const TAIL_BYTES = 32 * 1024 * 1024
+
+const readEnd = (path: string, bytes: number): string => {
+  const fd = openSync(path, 'r')
+  try {
+    const size = fstatSync(fd).size
+    const start = Math.max(0, size - bytes)
+    const buffer = Buffer.alloc(size - start)
+    readSync(fd, buffer, 0, buffer.length, start)
+    const text = buffer.toString('utf8')
+    // A cut first line is dropped, never parsed half.
+    return start === 0 ? text : text.slice(text.indexOf('\n') + 1)
+  } finally {
+    closeSync(fd)
+  }
+}
+
 const tail = (path: string, rows: number): void => {
   const slim: string[] = []
-  for (const line of readFileSync(path, 'utf8').split('\n')) {
+  for (const line of readEnd(path, TAIL_BYTES).split('\n')) {
     if (!line.includes('"type":"assistant"')) continue
     try {
       const row = JSON.parse(line)
