@@ -213,7 +213,7 @@ describe('keeper', () => {
     w.limits = [{ kind: 'five_hour', percentUsed: 91 }]
     await w.clock.advance(290_000)
     expect(w.forks).toHaveLength(0)
-    expect(w.toasts.join('\n')).toContain('five_hour is at 91%')
+    expect(w.toasts.join('\n')).toContain('5 小时额度已用 91%')
   })
 
   test('keeps forking however full the weekly window is', LONG, async ($, on) => {
