@@ -1932,24 +1932,26 @@ export const register: Register = (on, options) => {
     const isResumeCancelled = text.includes('已取消自动继续')
 
     return (
-      <Box flexWrap="wrap" columnGap={4} alignItems="center">
-        <Box gap={2} alignItems="center">
+      <Box flexDirection="column">
+        <Box justifyContent="space-between" alignItems="center">
           <Text>
             <Text color={isOn ? 'success' : 'inactive'}>● </Text>
             <Text>保活</Text>
             <Text dimColor>{detail === '' ? (isOn ? ' · 开' : ' · 关') : ` · ${detail}`}</Text>
           </Text>
-          <Button key="keeper-toggle" plain dimColor onPress={() => setEnabled($, !isOn)}>
-            {isOn ? '关闭' : '开启'}
-          </Button>
-          <Button key="anchor-toggle" plain dimColor={!isAnchor} onPress={() => setAnchor($, !isAnchor)}>
-            <Text color={isAnchor ? 'warning' : undefined}>{isAnchor ? '★ 锚点' : '☆ 锚点'}</Text>
-          </Button>
-          {isWaiting ? (
-            <Button key="resume-toggle" plain dimColor onPress={() => setResumeCancelled($, !isResumeCancelled)}>
-              {isResumeCancelled ? '恢复自动继续' : '到点不继续'}
+          <Box gap={2} alignItems="center">
+            <Button key="keeper-toggle" plain dimColor onPress={() => setEnabled($, !isOn)}>
+              {isOn ? '关闭' : '开启'}
             </Button>
-          ) : null}
+            <Button key="anchor-toggle" plain dimColor={!isAnchor} onPress={() => setAnchor($, !isAnchor)}>
+              <Text color={isAnchor ? 'warning' : undefined}>{isAnchor ? '★ 锚点' : '☆ 锚点'}</Text>
+            </Button>
+            {isWaiting ? (
+              <Button key="resume-toggle" plain dimColor onPress={() => setResumeCancelled($, !isResumeCancelled)}>
+                {isResumeCancelled ? '恢复自动继续' : '到点不继续'}
+              </Button>
+            ) : null}
+          </Box>
         </Box>
         {below}
       </Box>

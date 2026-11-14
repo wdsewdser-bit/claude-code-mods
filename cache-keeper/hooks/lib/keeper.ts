@@ -81,6 +81,9 @@ export const keepaliveAtMs = (ttl: Ttl, config: KeeperConfig): number =>
  * keeper costs a full rewrite of the prefix, the dearer way to spend it. Once
  * it is spent the keepalives fail and the failure count stops the keeper.
  */
+/** 额度类别的中文名；没列出的原样显示。 */
+const KIND_ZH: Readonly<Record<string, string>> = { five_hour: '5 小时额度', seven_day: '周额度' }
+
 export const isOverStopLine = (limit: RateLimit, config: KeeperConfig): boolean =>
   limit.kind === 'five_hour' && limit.percentUsed >= config.maxRateLimitPercent
 
@@ -119,7 +122,7 @@ export const decide = (
   if (state.consecutiveFailures >= config.maxConsecutiveProbeFailures) {
     return {
       action: 'stop',
-      reason: `${state.consecutiveFailures} consecutive keepalives failed or missed`,
+      reason: `连续 ${state.consecutiveFailures} 次保活失败或未命中，已停止`,
     }
   }
   if (state.isTurnRunning || state.isProbing) {
@@ -137,7 +140,7 @@ export const decide = (
   if (over !== undefined) {
     return {
       action: 'stop',
-      reason: `${over.kind} is at ${over.percentUsed}% (limit ${config.maxRateLimitPercent}%)`,
+      reason: `${KIND_ZH[over.kind] ?? over.kind}已用 ${over.percentUsed}%（上限 ${config.maxRateLimitPercent}%）`,
     }
   }
   const idle = now - state.lastActivityAt
