@@ -69,17 +69,20 @@ export type Digest = {
   lastMessage: { role: string; kinds: string[] } | null
   /** When the newest timestamped record was written (ms since epoch); 0 when none carries a time. */
   lastTs: number
-  backgroundBash: { id: string; detail: string }[]
-  backgroundAgents: { id: string; detail: string; agentId?: string }[]
-  delegateStarts: { id: string; detail: string }[]
+  /** `at` is the record index the task was started at, compared with lastRestartIndex. */
+  backgroundBash: { id: string; detail: string; at?: number }[]
+  backgroundAgents: { id: string; detail: string; agentId?: string; at?: number }[]
+  delegateStarts: { id: string; detail: string; at?: number }[]
   delegateDones: string[]
   notifications: { taskId: string; toolUseId: string; interim?: boolean }[]
-  monitors: { id: string; detail: string }[]
+  monitors: { id: string; detail: string; at?: number }[]
   wakeups: { id: string; detail: string; stop: boolean }[]
   crons: { id: string; detail: string }[]
   cronDeletes: string[]
   lastHumanIndex: number
   lastWakeIndex: number
+  /** Record index of the newest cc-restart wake message; -1 when the transcript has none. */
+  lastRestartIndex?: number
 }
 
 // Real shapes (checked against ~/.claude/projects):
@@ -89,6 +92,10 @@ export type Digest = {
 const BACKGROUND_BASH = /Command running in background with ID:\s*([A-Za-z0-9]{6,})\.\s*Output is being written to:/
 const DELEGATE_START = /后台任务\s*\[?\s*(bg-[A-Za-z0-9_-]+)\]?\s*已启动/
 const DELEGATE_DONE = /【delegate 后台任务\s*([^\s】]+)\s*(?:完成|失败)】/
+// A wake message this mod sent after an earlier restart. Anything started before it died with
+// that restart and was reported then, so a later restart did not interrupt it. Only the head of
+// the message counts: a handoff or a quote further down may repeat the same words.
+const RESTART_WAKE = /(?:^|\n)\s*\[cc-restart\]\s*(?:Claude Code\s*(?:刚被重启|已重启)|桌面版已重启)/
 const TASK_ID = /<task-id>\s*([^<\s]+)/
 const TOOL_USE_ID = /<tool-use-id>\s*([^<\s]+)/
 // An agent whose turn ended with its own background work still running gets an interim
@@ -139,8 +146,9 @@ export function digestFromLines(lines: readonly string[]): Digest {
     cronDeletes: [],
     lastHumanIndex: -1,
     lastWakeIndex: -1,
+    lastRestartIndex: -1,
   }
-  const toolUses = new Map<string, { name: string; input: any }>()
+  const toolUses = new Map<string, { name: string; input: any; at: number }>()
   const agentIdByUse = new Map<string, string>()
   let index = 0
 
@@ -180,6 +188,7 @@ export function digestFromLines(lines: readonly string[]): Digest {
           !recordText.includes('<task-notification>') &&
           (typeof originKind !== 'string' || originKind === 'composer' || originKind === 'user')
         if (looksHuman) digest.lastHumanIndex = index
+        if (!hasToolResult && RESTART_WAKE.test(recordText.slice(0, 300))) digest.lastRestartIndex = index
       }
     }
 
@@ -187,13 +196,13 @@ export function digestFromLines(lines: readonly string[]): Digest {
       const kind = kindOf(block)
       if (kind === 'tool_use') {
         const id = String(block.id ?? '')
-        if (id) toolUses.set(id, { name: String(block.name ?? ''), input: block.input ?? {} })
+        if (id) toolUses.set(id, { name: String(block.name ?? ''), input: block.input ?? {}, at: index })
         const name = String(block.name ?? '')
         if (name === 'ScheduleWakeup') {
           digest.wakeups.push({ id, detail: String(block.input?.reason ?? block.input?.prompt ?? ''), stop: block.input?.stop === true })
           digest.lastWakeIndex = index
         } else if (name === 'Monitor') {
-          digest.monitors.push({ id, detail: String(block.input?.command ?? block.input?.description ?? '') })
+          digest.monitors.push({ id, detail: String(block.input?.command ?? block.input?.description ?? ''), at: index })
         } else if (name === 'CronCreate') {
           digest.crons.push({ id, detail: String(block.input?.cron ?? block.input?.prompt ?? '').slice(0, 120) })
         } else if (name === 'CronDelete') {
@@ -208,6 +217,7 @@ export function digestFromLines(lines: readonly string[]): Digest {
           digest.backgroundBash.push({
             id: bash[1],
             detail: String(toolUse?.input?.description ?? toolUse?.input?.command ?? '').slice(0, 120),
+            at: index,
           })
         }
         // A background agent's completion notice names its agentId in <task-id>,
@@ -219,6 +229,7 @@ export function digestFromLines(lines: readonly string[]): Digest {
           digest.delegateStarts.push({
             id: delegate[1],
             detail: text.replace(/\s+/g, ' ').slice(0, 120),
+            at: index,
           })
         }
       }
@@ -242,7 +253,7 @@ export function digestFromLines(lines: readonly string[]): Digest {
   for (const [id, use] of toolUses) {
     if (use.name === 'Agent' && use.input?.run_in_background === true) {
       const agentId = agentIdByUse.get(id)
-      digest.backgroundAgents.push({ id, detail: String(use.input?.description ?? use.input?.prompt ?? '').slice(0, 120), ...(agentId ? { agentId } : {}) })
+      digest.backgroundAgents.push({ id, detail: String(use.input?.description ?? use.input?.prompt ?? '').slice(0, 120), ...(agentId ? { agentId } : {}), at: use.at })
     }
   }
 
@@ -280,19 +291,26 @@ export function judgeTranscript(
   const add = (item: Interrupted) => {
     if (!interrupted.some(existing => existing.type === item.type && existing.id === item.id)) interrupted.push(item)
   }
+  // Started before an earlier restart's wake message: that restart ended it, not this one.
+  const restartAt = digest.lastRestartIndex ?? -1
+  const old = (item: { at?: number }) => typeof item.at === 'number' && item.at < restartAt
   for (const job of digest.backgroundBash) {
+    if (old(job)) continue
     if (!digest.notifications.some(note => note.taskId === job.id)) add({ type: 'bash', id: job.id, detail: job.detail })
   }
   for (const agent of digest.backgroundAgents) {
+    if (old(agent)) continue
     // Only the latest notice counts: an interim one means its background work was still running.
     const notes = digest.notifications.filter(note => note.toolUseId === agent.id || (!!agent.agentId && note.taskId === agent.agentId))
     const done = notes.length > 0 && notes[notes.length - 1]?.interim !== true
     if (!done) add({ type: 'agent', id: agent.id, detail: agent.detail })
   }
   for (const job of digest.delegateStarts) {
+    if (old(job)) continue
     if (!digest.delegateDones.includes(job.id)) add({ type: 'delegate', id: job.id, detail: job.detail })
   }
   for (const monitor of digest.monitors) {
+    if (old(monitor)) continue
     if (!digest.notifications.some(note => note.toolUseId === monitor.id)) add({ type: 'monitor', id: monitor.id, detail: monitor.detail })
   }
   const wakeup = digest.wakeups[digest.wakeups.length - 1]

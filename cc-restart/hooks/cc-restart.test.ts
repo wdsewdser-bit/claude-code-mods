@@ -534,3 +534,38 @@ test('a stale session with a background job nobody reported on is still listed',
   expect(verdict.interrupted.map(item => item.id)).toEqual(['bg-mvfeek2b'])
   expect(verdict.state).toBe('working')
 })
+
+const wakeMessage = (text: string) => JSON.stringify({ type: 'user', cwd: 'D:/work', message: { role: 'user', content: text } })
+
+test('a background job started before an earlier restart wake message is not listed again', () => {
+  const lines = [
+    assistantTool('toolu_del1', 'mcp__delegate__delegate_pro', { task: '审查代码' }),
+    userResult('toolu_del1', DELEGATE_START),
+    assistantTool('toolu_ag1', 'Agent', { description: '代理A', run_in_background: true }),
+    userResult('toolu_ag1', ''),
+    assistantText('先等它们回来。'),
+    wakeMessage('[cc-restart] Claude Code 刚被重启，你上一轮被中断了。请先检查中断前在做的事情的真实状态。'),
+    assistantText('旧作业已随重启终止，没有要接着做的。'),
+  ]
+  const verdict = judgeTranscript(digestFromLines(lines))
+  expect(verdict.interrupted).toHaveLength(0)
+  expect(verdict.state).toBe('idle')
+})
+
+test('a job started after the wake message still counts, and a quoted wake message is not a restart', () => {
+  const after = [
+    wakeMessage('The cc-restart plugin sent a message:\n[cc-restart] Claude Code 已重启，请读账本，接着之前的任务继续'),
+    assistantTool('toolu_bash1', 'Bash', { command: 'npm test', run_in_background: true }),
+    userResult('toolu_bash1', BASH_BG),
+    assistantText('等它回来。'),
+  ]
+  expect(judgeTranscript(digestFromLines(after)).interrupted.map(item => item.id)).toEqual(['bq25oyz93'])
+  const quoted = [
+    assistantTool('toolu_bash1', 'Bash', { command: 'npm test', run_in_background: true }),
+    userResult('toolu_bash1', BASH_BG),
+    assistantText('等它回来。'),
+    wakeMessage('这是第 6 个窗口，上一个窗口的对话不在上下文里。' + '说明'.repeat(200) + '\n[cc-restart] Claude Code 已重启，请读账本'),
+    assistantText('继续等。'),
+  ]
+  expect(judgeTranscript(digestFromLines(quoted)).interrupted.map(item => item.id)).toEqual(['bq25oyz93'])
+})
