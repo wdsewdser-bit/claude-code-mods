@@ -58,7 +58,7 @@ export async function execute(command, input={}, arg='') {
  if(command==='save') return locked(async()=>{
    const {id,name=id,protocol,baseUrl}=input
    if(!/^[a-zA-Z0-9_-]+$/.test(id||'') || !String(name).trim() || !families[protocol]) throw new Error('无效的 id / 名称 / 协议')
-   const u=new URL(baseUrl); if(!['http:','https:'].includes(u.protocol)||u.username||u.password||u.search||u.hash) throw new Error('无效的 base-url')
+   let u; try { u=new URL(String(baseUrl||'').trim()) } catch { throw new Error('无效的 base-url') }; if(!['http:','https:'].includes(u.protocol)||u.username||u.password||u.search||u.hash) throw new Error('无效的 base-url')
    if(!Array.isArray(input.models)||input.models.some(m=>typeof m!=='string'||!m.trim())) throw new Error('models 必须是模型 ID 数组')
    const all=await groups(); const old=all.find(x=>x.group.name===id || x.group.prefix===id)
    const g={...(old?.group||{}),name:id,prefix:id,'base-url':baseUrl.replace(/\/$/,''),keys:input.key===undefined?old?.group.keys||[]:[{'api-key':input.key}],models:[...new Set(input.models)].map(m=>{const prev=old?.group.models?.find(x=>x.name===m);return {...prev,name:m,alias:m,thinking:{levels:['low','medium','high','xhigh','max']},...(input.isCompat!==undefined?{'is-compat':!!input.isCompat}:protocol==='chat'&&prev?.['is-compat']===undefined?{'is-compat':true}:{})}})}
@@ -103,7 +103,9 @@ export async function execute(command, input={}, arg='') {
  }
  throw new Error('未知子命令')
 }
-if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+// 插件根可能是指向仓库的链接：argv[1] 是链接路径，import.meta.url 是真实路径，两边都取 realpath 再比。
+const real = p => { try { return fs.realpathSync(p) } catch { return path.resolve(p) } }
+if(process.argv[1] && real(process.argv[1])===real(fileURLToPath(import.meta.url))) {
  let s='';for await(const chunk of process.stdin) s+=chunk
  let input
  try { input=s.trim()?JSON.parse(s):{} } catch { console.log(JSON.stringify({ok:false,error:'stdin 必须是有效 JSON'}));process.exit(1) }
