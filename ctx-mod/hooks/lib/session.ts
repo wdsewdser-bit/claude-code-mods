@@ -74,7 +74,7 @@ import type { FileContent, OpenTask } from './workset.ts'
 import { assemble, ENDED_STATE, renderAgents, renderCoverage, renderLoadReason, renderTools, rewriteOf } from './handoff.ts'
 import type { RebuiltTool } from './handoff.ts'
 import { extractDecisions, renderDecisions } from './decisions.ts'
-import { isBackfillPending, PENDING_FILE, withBackfillPrefix } from './backfill.ts'
+import { BACKFILL_PREFIX, isBackfillPending, PENDING_FILE, withBackfillPrefix } from './backfill.ts'
 import { cursorOf, notedFromLines, renderNoted } from './noter.ts'
 import type { NotedDecision } from './noter.ts'
 import { detectLineage, lineageFrom } from './lineage.ts'
@@ -438,6 +438,12 @@ type State = {
   lastHandoff: number | null
   /** The `at` of the last cache-keeper snapshot booked into the ledger, so it is booked once. */
   bookedSnapshotAt: number | null
+  /**
+   * The backfill-created tasks whose existence was already said to the model, once each:
+   * the ledger_append note and the reminder share this list, and it is persisted, so a
+   * reloaded session does not say the same thing again.
+   */
+  backfillTold: string[]
   /** The current ledger page, exactly what ledger.jsonl holds. */
   page: LedgerEntry[]
   pending: Pending | null
@@ -559,6 +565,7 @@ const emptyState = (): State => ({
   lastPrefix: null,
   lastHandoff: null,
   bookedSnapshotAt: null,
+  backfillTold: [],
   page: [],
   pending: null,
 })
@@ -801,6 +808,9 @@ const stateFrom = (raw: Record<string, unknown> | null): State => {
   }
   state.ledgerBase = typeof raw.ledgerBase === 'number' && Number.isFinite(raw.ledgerBase) ? raw.ledgerBase : null
   state.ledgerNudged = raw.ledgerNudged === true
+  state.backfillTold = Array.isArray(raw.backfillTold)
+    ? raw.backfillTold.filter((id): id is string => typeof id === 'string')
+    : []
 
   return state
 }
@@ -869,6 +879,10 @@ const costlyToolsOf = (tools: readonly LoadedTool[], costly: Record<string, numb
 
 /** The most unrecorded steps the handoff lists one by one. */
 const MAX_TAIL_ACTIONS = 25
+
+/** Backfilled tasks one ledger note names, and how much of a record's own text it shows. */
+const BACKFILL_HINT_MAX = 5
+const BACKFILL_HINT_CHARS = 60
 
 export const createSession =(dir: string, io: Io, config: Config, ancestors: readonly string[] = []): Session => {
   const root = dir.replaceAll('\\', '/').replace(/\/+$/, '')
@@ -1183,6 +1197,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
       lastPrefix: state.lastPrefix,
       lastHandoff: state.lastHandoff,
       bookedSnapshotAt: state.bookedSnapshotAt,
+      backfillTold: state.backfillTold,
     })
 
   /** Only ever writes what is loaded: saving before the load would erase the file. */
@@ -1855,7 +1870,76 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     return `距上次记账已增长约 ${k(growth)}k token，若刚完成一个阶段，用 ledger_append 记一笔（写明下一步和锚点）；正在任务中间可忽略。`
   }
 
+  /** Every ledger row the session holds, archive pages included: a task's first record may be on an older page. */
+  const allLedgerRows = async (): Promise<LedgerEntry[]> => {
+    const rows = [...state.page]
+    for (let page = 1; page <= state.archive.length; page += 1) {
+      const entries = await loadArchive(page)
+      if (entries !== null) rows.push(...entries)
+    }
+
+    return rows
+  }
+
+  /** A backfilled record's text as a note shows it: the mark off, one line, cut short. */
+  const briefBackfill = (text: string): string => {
+    const body = text.startsWith(BACKFILL_PREFIX) ? text.slice(BACKFILL_PREFIX.length) : text
+    const one = body.replace(/\s+/g, ' ').trim()
+
+    return one.length > BACKFILL_HINT_CHARS ? `${one.slice(0, BACKFILL_HINT_CHARS)}…` : one
+  }
+
+  /**
+   * The note a `ledger_append` earns when it opens an id the ledger never held and a task only
+   * the backfill ever wrote is still open: the two are likely the same work, and only one id
+   * should carry it on. Nothing is refused or changed — the entry is booked either way — and
+   * each such task is named once, with the reminder sharing the same record of what was said.
+   */
+  const backfillNote = async (newId: string): Promise<string> => {
+    // Nothing backfilled, nothing to say: the switch was never on, or nothing was ever booked.
+    if (!config.backfill && !state.page.some(entry => entry.source === 'backfill')) return ''
+    const rows = await allLedgerRows()
+    // An id that already exists, on this page or on an older one, is not a new one.
+    if (rows.some(row => row.task_id === newId)) return ''
+    const told = new Set(state.backfillTold)
+    const candidates = tasksOf(rows)
+      .filter(
+        task =>
+          task.taskId !== newId &&
+          (task.status === 'in_progress' || task.status === 'blocked') &&
+          task.entries.every(entry => entry.source === 'backfill') &&
+          !told.has(task.taskId),
+      )
+      .sort((left, right) => right.latest.seq - left.latest.seq || right.latest.ts - left.latest.ts)
+    if (candidates.length === 0) return ''
+    const shown = candidates.slice(0, BACKFILL_HINT_MAX)
+    state.backfillTold = [...state.backfillTold, ...shown.map(task => task.taskId)]
+    const count = candidates.length > shown.length ? `（共 ${candidates.length} 个，只列前 ${shown.length} 个）` : ''
+    const lines = [
+      `\n注意：账本里有只由补记写过的未结束任务${count}，可能是同一件事（新的在前）：`,
+      ...shown.map(task => `- ${task.taskId}｜${task.title}｜${briefBackfill(task.latest.text)}`),
+      `如果是同一件事，以后用那个 task_id 记账，并把刚记下的 ${newId} 标成 superseded、superseded_by 指向它；不是同一件事就忽略这段。`,
+    ]
+
+    return lines.join('\n')
+  }
+
+  /** Backfill-started tasks the model has not been told about yet, in the order they were booked. */
+  const backfillNotices: { id: string; title: string }[] = []
+
   const reminder = (env: Env): string | null => {
+    // What the backfill started is said first, and once per task: without it the model would
+    // go on booking the same work under an id of its own. The fill reminders keep their own
+    // flags, so at most one of them waits for the next tool call, and none is lost.
+    for (;;) {
+      const notice = backfillNotices.shift()
+      if (notice === undefined) break
+      if (state.backfillTold.includes(notice.id)) continue
+      state.backfillTold = [...state.backfillTold, notice.id]
+      saveMeta()
+
+      return `补记新建了任务 ${notice.id}（${notice.title}）；这件事后续记账沿用这个 id。`
+    }
     if (env.tokens === undefined) return null
     const level = levelOf(env.tokens, env.limit, config)
 
@@ -1946,6 +2030,9 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
 
     // An omitted next_step or anchors is stored as omitted: tasksOf reads it as "unchanged" and says which entry it came from.
     const isNewTask = !state.page.some(previous => previous.task_id === candidate.task_id)
+    // A new id may be a second name for work only the backfill has written: said once, and
+    // worked out before the entry joins the page, so "never seen in the ledger" stays honest.
+    const backfillSaid = isNewTask ? await backfillNote(candidate.task_id) : ''
     const seq = state.ledgerSeq + 1
     const entry = stamp(candidate, {
       seq,
@@ -2004,6 +2091,8 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
       const said = boundaryReminder(env)
       if (said !== null) result += `\n${said}`
     }
+    // Last, so the entry it may be a twin of is already booked and numbered.
+    result += backfillSaid
 
     return { result }
   }
@@ -2043,6 +2132,9 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     for (const item of raw.entries) if (item.evidence !== undefined) referenced.push(...item.evidence)
     await ensureHistory(referenced)
     const tasks = tasksOf(state.page)
+    // Whether the backfill started a task is judged on the whole ledger: its first record may
+    // sit on a page that has been archived already.
+    const known = new Set((await allLedgerRows()).map(row => row.task_id))
     const latestPersonSeq = latestPersonRow()?.seq ?? null
     const latestRelaySeq = latestRelayRow()?.seq ?? null
     const added: number[] = []
@@ -2099,6 +2191,11 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
       state.ledgerSeq = seq
       state.page.push(entry)
       added.push(seq)
+      if (!known.has(item.task_id)) {
+        known.add(item.task_id)
+        // The model does not know the backfill made this id: said once, at the next reminder.
+        backfillNotices.push({ id: item.task_id, title: entry.title })
+      }
     }
     if (added.length > 0) {
       await queue.push(pathIn('ledger.jsonl'), toJsonl(state.page))

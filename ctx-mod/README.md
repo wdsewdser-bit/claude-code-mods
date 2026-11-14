@@ -104,6 +104,7 @@ mod 还会在系统提示里加一段说明，告诉模型这些工具怎么配�
 - 只写进展：状态只能是 `in_progress` 或 `blocked`（模型说 done/superseded 一律按 in_progress 记），evidence 只留该轮动作里真实出现过的编号，一轮最多 2 条，text 截到 200 字，新起任务 id 一轮最多一个。已有的 `next_step`、`anchors`、`done_when`、`dead_ends` 一律沿用，不改。某个任务在这一轮之前就已经 done/superseded 时，这条记录被丢弃，不会把它重新打开。
 - 落盘方式：子进程不碰 `ledger.jsonl`（那个文件由主进程整页重写），只把记录写进 `backfill-pending.json`；钩子进程在下一次用户消息或工具调用之后把它并进账本，编号由主进程分配，所以和主模型自己记账不会重号。
 - 记录带 `"source": "backfill"`，文字以“〔补记〕”开头，交接首页和 `ledger_read` 里都能看出来；窗口号和时间取那一轮自己的，所以不会让账本在别人眼里显得“刚更新过”。
+- 免得同一件事有两个 id：主模型给账本里从未出现过的新 id 记账时，如果账本里还有“只由补记写过”的未结束任务，`ledger_append` 的返回文字末尾会列出这些任务（id｜标题｜补记正文前 60 字，最多 5 个，新的在前），并提示：是同一件事就沿用那个 id，把刚起的这个标成 `superseded`、`superseded_by` 指向它。只提示一次（记在 `meta.json` 的 `backfillTold`，重启也不重复）；补记新建任务时，同一件事也会走提醒通道说一次：“补记新建了任务 <id>（<标题>）；这件事后续记账沿用这个 id。”
 - 同一轮只处理一次，失败最多重试一次（`backfill-state.json` 记着每轮的尝试次数）。
 - 试跑（不写盘、不落日志，只打印将要写入的记录和实际用量）：`node scripts/noter.mjs <会话目录> --backfill-round <轮次编号> --dry-run`；列出可试跑的轮次：`node scripts/noter.mjs <会话目录> --list-backfill-rounds`。
 

@@ -471,3 +471,237 @@ describe('the state file', () => {
     expect(pending.entries[0]?.text.startsWith('〔补记〕')).toBe(true)
   })
 })
+
+describe('a new id beside a backfilled task', () => {
+  /** A session whose round was booked by the backfill, under an id the model has never heard of. */
+  const withBackfilled = async (box: Box, entry: Partial<LedgerEntry> = {}) => {
+    const session = await sessionWithRound(box)
+    box.files.set(
+      `${DIR}/${PENDING_FILE}`,
+      JSON.stringify(
+        pendingOfRound([
+          { task_id: 'backfill-a', title: '补记起的任务', text: '补记写的第一条', ...entry },
+        ]),
+      ),
+    )
+    await session.mergeBackfill()
+
+    return session
+  }
+
+  test('opening a new id names the backfilled task, once, and the entry is booked anyway', async () => {
+    const box = makeIo()
+    const session = await withBackfilled(box)
+    const first = await session.ledgerAppend(
+      { task_id: 'model-b', title: '主模型起的', status: 'in_progress', text: '主模型写的', next_step: '接着做' },
+      out(),
+    )
+    expect(first.isError).toBe(undefined)
+    expect(first.result).toContain('注意：账本里有只由补记写过的未结束任务')
+    expect(first.result).toContain('backfill-a｜补记起的任务｜补记写的第一条')
+    expect(first.result).toContain('把刚记下的 model-b 标成 superseded')
+    expect(first.result.startsWith('已记录 #L2。')).toBe(true)
+    // The record itself lands: nothing is refused.
+    expect(ledgerOf(box).map(entry => entry.task_id)).toEqual(['backfill-a', 'model-b'])
+
+    // A second new id is not told again: the one task was already named.
+    const second = await session.ledgerAppend(
+      { task_id: 'model-c', title: '又一件', status: 'in_progress', text: '又写一条', next_step: '接着做' },
+      out(),
+    )
+    expect(second.result.includes('只由补记写过的未结束任务')).toBe(false)
+  })
+
+  test('an existing id is never a new one, so nothing is added to its answer', async () => {
+    const box = makeIo()
+    const session = await sessionWithRound(box)
+    await session.ledgerAppend(
+      { task_id: 'fix-login', title: '改登录页', status: 'in_progress', text: '按钮改好了', next_step: '接着改表单' },
+      out(),
+    )
+    box.files.set(
+      `${DIR}/${PENDING_FILE}`,
+      JSON.stringify(pendingOfRound([{ task_id: 'backfill-a', title: '补记起的任务' }])),
+    )
+    await session.mergeBackfill()
+    const answer = await session.ledgerAppend(
+      { task_id: 'fix-login', title: '改登录页', status: 'in_progress', text: '接着改', next_step: '改表单' },
+      out(),
+    )
+    expect(answer.result.includes('只由补记写过')).toBe(false)
+    expect(answer.result.startsWith('已记录 #L3。')).toBe(true)
+  })
+
+  test('a backfilled task the model has booked itself is no longer only the backfill\'s', async () => {
+    const box = makeIo()
+    const session = await withBackfilled(box)
+    await session.ledgerAppend(
+      { task_id: 'backfill-a', title: '补记起的任务', status: 'in_progress', text: '主模型接手', next_step: '接着做' },
+      out(),
+    )
+    const answer = await session.ledgerAppend(
+      { task_id: 'model-b', title: '另一件', status: 'in_progress', text: '新起一个', next_step: '接着做' },
+      out(),
+    )
+    expect(answer.result.includes('只由补记写过')).toBe(false)
+  })
+
+  test('a backfilled task that already ended is not named', async () => {
+    const box = makeIo()
+    box.files.set(
+      `${DIR}/ledger.jsonl`,
+      `${JSON.stringify({
+        task_id: 'backfill-done',
+        title: '补记写完的任务',
+        status: 'done',
+        text: '〔补记〕做完了',
+        source: 'backfill',
+        evidence: [2],
+        seq: 1,
+        ts: 4_000,
+        window: 1,
+        request_ref: 1,
+      })}\n`,
+    )
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '把登录页的按钮改成蓝色' })
+    await session.record({ uuid: 't2', role: 'tool', tool: 'Edit', text: 'edited ok' })
+    const answer = await session.ledgerAppend(
+      { task_id: 'model-b', title: '另一件', status: 'in_progress', text: '新起一个', next_step: '接着做' },
+      out(),
+    )
+    expect(answer.result.includes('只由补记写过')).toBe(false)
+  })
+
+  test('a task whose first record is on an archived page is still found', async () => {
+    const box = makeIo()
+    box.files.set(
+      `${DIR}/archive-001.jsonl`,
+      `${JSON.stringify({
+        task_id: 'backfill-old',
+        title: '早先补记的任务',
+        status: 'in_progress',
+        text: `〔补记〕${'很久以前记下的一件事'.repeat(12)}`,
+        source: 'backfill',
+        seq: 1,
+        ts: 4_000,
+        window: 1,
+        request_ref: 1,
+      })}\n`,
+    )
+    box.files.set(
+      `${DIR}/meta.json`,
+      JSON.stringify({ window: 1, archive: [{ page: 1, titles: ['早先补记的任务'], fromSeq: 1, toSeq: 1, fromTs: 4_000, toTs: 4_000 }] }),
+    )
+    const session = createSession(DIR, box.io, { ...DEFAULTS, backfill: true })
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '把登录页的按钮改成蓝色' })
+    const answer = await session.ledgerAppend(
+      { task_id: 'model-b', title: '另一件', status: 'in_progress', text: '新起一个', next_step: '接着做' },
+      out(),
+    )
+    expect(answer.result).toContain('backfill-old｜早先补记的任务｜')
+    // Only the first 60 characters of the record are shown, with the mark taken off.
+    expect(answer.result).toContain('很久以前记下的一件事')
+    expect(answer.result).not.toContain('〔补记〕很久')
+    expect(answer.result).toContain('…')
+
+    // With the switch off the same ledger says nothing: the answer is the one it always was.
+    const quiet = createSession(DIR, box.io, DEFAULTS)
+    await quiet.ready()
+    const silent = await quiet.ledgerAppend(
+      { task_id: 'model-d', title: '再来一件', status: 'in_progress', text: '又新起一个', next_step: '接着做' },
+      out(),
+    )
+    expect(silent.result.includes('只由补记写过')).toBe(false)
+  })
+
+  test('with no backfilled record at all the answer is exactly what it was', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '把登录页的按钮改成蓝色' })
+    const answer = await session.ledgerAppend(
+      { task_id: 't1', title: '改登录页', status: 'in_progress', text: '开始改', next_step: '接着改' },
+      out(),
+    )
+    expect(answer.result).toBe('已记录 #L1。对应请求 #1（用户消息，省略 request_ref 时取最近一条）。')
+  })
+
+  test('what was said once stays said after a reload', async () => {
+    const box = makeIo()
+    const session = await withBackfilled(box)
+    await session.ledgerAppend(
+      { task_id: 'model-b', title: '主模型起的', status: 'in_progress', text: '主模型写的', next_step: '接着做' },
+      out(),
+    )
+    await session.flush()
+
+    const reloaded = createSession(DIR, box.io, DEFAULTS)
+    await reloaded.ready()
+    const answer = await reloaded.ledgerAppend(
+      { task_id: 'model-c', title: '又一件', status: 'in_progress', text: '又写一条', next_step: '接着做' },
+      out(),
+    )
+    expect(answer.result.includes('只由补记写过')).toBe(false)
+  })
+})
+
+describe('the reminder a backfill task earns', () => {
+  test('is said once, and only for a task the backfill started', async () => {
+    const box = makeIo()
+    const session = await sessionWithRound(box)
+    box.files.set(
+      `${DIR}/${PENDING_FILE}`,
+      JSON.stringify(pendingOfRound([{ task_id: 'backfill-a', title: '补记起的任务' }])),
+    )
+    await session.mergeBackfill()
+
+    expect(session.reminder(out())).toBe('补记新建了任务 backfill-a（补记起的任务）；这件事后续记账沿用这个 id。')
+    // Once only: the next reminder is the ordinary one (nothing due yet, so none).
+    expect(session.reminder(out())).toBe(null)
+
+    // A second record for the same task is not a second notice.
+    box.files.set(
+      `${DIR}/${PENDING_FILE}`,
+      JSON.stringify({
+        round: 1,
+        window: 1,
+        ts: 4_000,
+        through: 4,
+        entries: [{ task_id: 'backfill-a', title: '补记起的任务', status: 'in_progress', text: '补记又写一条' }],
+      }),
+    )
+    await session.mergeBackfill()
+    expect(session.reminder(out())).toBe(null)
+  })
+
+  test('is not said for a task that was already in the ledger', async () => {
+    const box = makeIo()
+    const session = await sessionWithRound(box)
+    await session.ledgerAppend(
+      { task_id: 'fix-login', title: '改登录页', status: 'in_progress', text: '按钮改好了', next_step: '接着改表单' },
+      out(),
+    )
+    box.files.set(
+      `${DIR}/${PENDING_FILE}`,
+      JSON.stringify({
+        round: 1,
+        window: 1,
+        ts: 4_000,
+        through: 4,
+        entries: [{ task_id: 'fix-login', title: '改登录页', status: 'in_progress', text: '补记补一条' }],
+      }),
+    )
+    await session.mergeBackfill()
+    expect(session.reminder(out())).toBe(null)
+  })
+
+  test('leaves the ordinary reminders exactly as they were', async () => {
+    const box = makeIo()
+    const session = createSession(DIR, box.io, DEFAULTS)
+    await session.record({ uuid: 'p1', role: 'user', isPerson: true, text: '把登录页的按钮改成蓝色' })
+    const filled = { tokens: 210_000, limit: 400_000, cache: null, fiveHourPercent: undefined }
+    expect(session.reminder(filled)).toBe(
+      '上下文已用 210k/400k。如果当前任务刚告一段落（刚完成一项、刚交付结果或在等用户回复），现在换窗口最划算：先把进度写进账本，再调用 context 工具换窗口。如果正在任务中间，就继续，不用理会。',
+    )
+  })
+})
