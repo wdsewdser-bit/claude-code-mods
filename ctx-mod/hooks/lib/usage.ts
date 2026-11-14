@@ -122,14 +122,15 @@ export const isCold = (
   input: { now: number; cache: CacheState | null; lastRequestAt: number | null },
   config: Config,
 ): boolean => {
-  if (input.cache !== null && input.cache.expiresAt !== null) {
-    return input.now >= input.cache.expiresAt
-  }
-  if (input.lastRequestAt === null) return false
   // A cache that says it lives five minutes (overage) must not be held to the hour.
-  const lifetimeSec = input.cache?.ttl === '5m' ? FIVE_MINUTES_SEC : config.cacheTtlSec
+  const lifetimeMs = (input.cache?.ttl === '5m' ? FIVE_MINUTES_SEC : config.cacheTtlSec) * 1000
+  // The keeper's expiry is only as fresh as the keeper: when it stopped hearing this
+  // session, a later request seen here still refreshed the cache.
+  const keeperExpiry = input.cache?.expiresAt ?? null
+  const ownExpiry = input.lastRequestAt === null ? null : input.lastRequestAt + lifetimeMs
+  if (keeperExpiry === null && ownExpiry === null) return false
 
-  return input.now - input.lastRequestAt >= lifetimeSec * 1000
+  return input.now >= Math.max(keeperExpiry ?? 0, ownExpiry ?? 0)
 }
 
 export type Gate = { isAllowed: true } | { isAllowed: false; reason: string }
