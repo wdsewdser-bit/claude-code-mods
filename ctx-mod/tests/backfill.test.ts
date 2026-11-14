@@ -250,14 +250,25 @@ describe('parseBackfillOutput', () => {
     expect(family.rejected.some(item => item.reason.includes('同族'))).toBe(true)
   })
 
-  test('a record for a task that already ended is dropped, never written back as in_progress', () => {
+  test('follow-up work on an ended task goes to a new follow-up id, never reopening it', () => {
     const closed = tasksOf([entryOf({ status: 'done', evidence: [2] })])
     const parsed = parseBackfillOutput(
       JSON.stringify({ entries: [{ task_id: 'fix-login', status: 'in_progress', text: '又动了它' }] }),
       { tasks: closed, actionSeqs: [] },
     )
-    expect(parsed.entries.length).toBe(0)
-    expect(parsed.rejected.some(item => item.reason.includes('已经结束'))).toBe(true)
+    expect(parsed.rejected.length).toBe(0)
+    expect(parsed.entries[0]?.task_id).toBe('fix-login-followup')
+    expect(parsed.entries[0]?.title).toContain('（后续）')
+    expect(parsed.entries[0]?.status).toBe('in_progress')
+
+    // An open follow-up is written to again; an ended one moves on to the next number.
+    const open = tasksOf([entryOf({ status: 'done', evidence: [2] }), entryOf({ task_id: 'fix-login-followup', title: '后续', status: 'in_progress', evidence: [2] })])
+    const again = parseBackfillOutput(JSON.stringify({ entries: [{ task_id: 'fix-login', status: 'in_progress', text: '再动一次' }] }), { tasks: open, actionSeqs: [] })
+    expect(again.entries[0]?.task_id).toBe('fix-login-followup')
+    expect(again.entries[0]?.title).toBe('后续')
+    const ended = tasksOf([entryOf({ status: 'done', evidence: [2] }), entryOf({ task_id: 'fix-login-followup', title: '后续', status: 'done', evidence: [2] })])
+    const third = parseBackfillOutput(JSON.stringify({ entries: [{ task_id: 'fix-login', status: 'in_progress', text: '第三次' }] }), { tasks: ended, actionSeqs: [] })
+    expect(third.entries[0]?.task_id).toBe('fix-login-followup-2')
   })
 
   test('no JSON at all throws, so nothing is booked on it', () => {

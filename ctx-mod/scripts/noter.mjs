@@ -552,6 +552,12 @@ const runBackfill = async (dir, options) => {
       dir,
       `补记 #${round.seq}（${fit.actionCount} 个动作，写 ${parsed.entries.length} 条，状态改写 ${parsed.coerced} 条，丢弃 ${parsed.rejected.length} 条）耗时 ${Date.now() - started}ms 费用 ${cost} 估算输入 ${fit.estimate} 实际 ${tokens}${warning}`,
     )
+    // 每条丢弃单独一行写明原因和被丢的内容摘要，否则事后无法判断丢得对不对。
+    for (const { item, reason } of parsed.rejected) {
+      const id = item && typeof item === 'object' && typeof item.task_id === 'string' ? item.task_id : '?'
+      const body = item && typeof item === 'object' && typeof item.text === 'string' ? item.text : JSON.stringify(item) ?? ''
+      await appendLog(dir, `  补记丢弃 #${round.seq} ${id}：${reason}｜${body.replace(/\s+/g, ' ').slice(0, 160)}`)
+    }
     const state = stateOf(await readText(path.join(dir, STATE_FILE)))
     await writeAtomic(path.join(dir, STATE_FILE), stateText(noteAttempt(state, round.seq, 'ok'))).catch(() => undefined)
 

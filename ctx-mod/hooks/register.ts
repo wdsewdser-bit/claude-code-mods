@@ -1166,11 +1166,32 @@ const armAttachments = ($: EngineInterface): void => {
   $.ui.invalidate('prompt.section')
 }
 
+// 热加载会换掉模块、把 enabled/config 重置为默认值，却不会再触发 session.start：
+// 首个钩子发现还没读过配置时自己读一次，否则热加载后到下次 session.start 之前，所有工具调用都会落空。
+let heldOptions: Parameters<Register>[1] | undefined
+let initialized = false
+let initPending: Promise<void> | undefined
+const initConfig = async ($: EngineInterface): Promise<void> => {
+  const env = await configEnv($)
+  enabled = enabledOf(heldOptions, env)
+  enabledByEnv = switchOf(env) === true
+  config = readConfig(heldOptions, env, text => logError($, 'config', text))
+  initialized = true
+}
+const isOn = async ($: EngineInterface): Promise<boolean> => {
+  if (!initialized) {
+    initPending ??= initConfig($).catch(error => { initPending = undefined; logError($, 'lazy config', error) })
+    await initPending
+  }
+
+  return enabled
+}
+
 export const register: Register = (on, options) => {
   // The context fires once per conversation and again after a compaction.
   on('prompt.context', async ($, e, next) => {
     const result = await next(e)
-    if (!enabled || claudeMdPath === '') return result
+    if (!(await isOn($)) || claudeMdPath === '') return result
     try {
       const block = result.blocks.find(b => b.name === 'claudeMd')
       const files = (result.instructionFiles ?? e.instructionFiles ?? []).filter(f => f.content.trim() !== '')
@@ -1194,12 +1215,10 @@ export const register: Register = (on, options) => {
     }
   })
 
+  heldOptions = options
   on('session.start', async ($, e, next) => {
     try {
-      const env = await configEnv($)
-      enabled = enabledOf(options, env)
-      enabledByEnv = switchOf(env) === true
-      config = readConfig(options, env, text => logError($, 'config', text))
+      await initConfig($)
       if (enabled) {
         await loadAttachments($, e.cwd).catch(error => logError($, 'attachments', error))
         await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
@@ -1224,7 +1243,7 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: COMMAND }, async ($, e, next) => {
-    if (!enabled) {
+    if (!(await isOn($))) {
       return { text: 'ctx-mod 未启用：用环境变量 CTX_MOD=1 启动 Claude Code，或把插件配置的 enabled 设为 true。' }
     }
     try {
@@ -1248,7 +1267,7 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.compose', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     const result = await next(e)
     try {
       const main = isMainCompose(e.traits)
@@ -1293,7 +1312,7 @@ export const register: Register = (on, options) => {
   // the system prompt carries a text, the message leaves it out. A subagent's
   // attachments are its own and pass through.
   on('prompt.attachment', async ($, e, next) => {
-    if (!enabled || !attachToSystem) return next(e)
+    if (!(await isOn($)) || !attachToSystem) return next(e)
     if (isSubagentCall(e)) return next(e)
     const result = await next(e)
     try {
@@ -1320,7 +1339,7 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'mcp__ctx-mod__context' as never }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (isSubagentCall(e)) return AGENT_ONLY
     const input = argsOf(e)
     try {
@@ -1335,12 +1354,13 @@ export const register: Register = (on, options) => {
     } catch (error) {
       logError($, 'tool.call context', error)
 
-      return next(e)
+      // 交给 next(e) 只会得到「no tool.call hook answered」，看不出原因：直接把原因作为错误结果返回。
+      return { isError: true, result: `ctx-mod context 内部出错：${messageOf(error)}${error instanceof Error && error.stack ? '\n' + error.stack.split('\n').slice(1, 6).join('\n') : ''}` }
     }
   })
 
   on('tool.call', { tool: 'mcp__ctx-mod__ledger_append' as never }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (isSubagentCall(e)) return AGENT_ONLY
     const input = argsOf(e)
     try {
@@ -1352,12 +1372,13 @@ export const register: Register = (on, options) => {
     } catch (error) {
       logError($, 'tool.call ledger_append', error)
 
-      return next(e)
+      // 交给 next(e) 只会得到「no tool.call hook answered」，看不出原因：直接把原因作为错误结果返回。
+      return { isError: true, result: `ctx-mod ledger_append 内部出错：${messageOf(error)}${error instanceof Error && error.stack ? '\n' + error.stack.split('\n').slice(1, 6).join('\n') : ''}` }
     }
   })
 
   on('tool.call', { tool: 'mcp__ctx-mod__ledger_read' as never }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (isSubagentCall(e)) return AGENT_ONLY
     const input = argsOf(e)
     try {
@@ -1368,12 +1389,13 @@ export const register: Register = (on, options) => {
     } catch (error) {
       logError($, 'tool.call ledger_read', error)
 
-      return next(e)
+      // 交给 next(e) 只会得到「no tool.call hook answered」，看不出原因：直接把原因作为错误结果返回。
+      return { isError: true, result: `ctx-mod ledger_read 内部出错：${messageOf(error)}${error instanceof Error && error.stack ? '\n' + error.stack.split('\n').slice(1, 6).join('\n') : ''}` }
     }
   })
 
   on('tool.call', { tool: 'mcp__ctx-mod__decision_revoke' as never }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (isSubagentCall(e)) return AGENT_ONLY
     const input = argsOf(e)
     try {
@@ -1384,12 +1406,13 @@ export const register: Register = (on, options) => {
     } catch (error) {
       logError($, 'tool.call decision_revoke', error)
 
-      return next(e)
+      // 交给 next(e) 只会得到「no tool.call hook answered」，看不出原因：直接把原因作为错误结果返回。
+      return { isError: true, result: `ctx-mod decision_revoke 内部出错：${messageOf(error)}${error instanceof Error && error.stack ? '\n' + error.stack.split('\n').slice(1, 6).join('\n') : ''}` }
     }
   })
 
   on('tool.call', { tool: 'mcp__ctx-mod__history' as never }, async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (isSubagentCall(e)) return AGENT_ONLY
     const input = argsOf(e)
     try {
@@ -1400,12 +1423,13 @@ export const register: Register = (on, options) => {
     } catch (error) {
       logError($, 'tool.call history', error)
 
-      return next(e)
+      // 交给 next(e) 只会得到「no tool.call hook answered」，看不出原因：直接把原因作为错误结果返回。
+      return { isError: true, result: `ctx-mod history 内部出错：${messageOf(error)}${error instanceof Error && error.stack ? '\n' + error.stack.split('\n').slice(1, 6).join('\n') : ''}` }
     }
   })
 
   on('tool.call', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (e.agentId !== undefined) return next(e)
     // A tool of this mod's own is answered by its matcher above; this hook is
     // for everything else, and it runs after that one.
@@ -1460,7 +1484,7 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   on('session.append', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (e.agentId !== undefined) return next(e)
     try {
       const session = await sessionOf($)
@@ -1620,7 +1644,7 @@ export const register: Register = (on, options) => {
   })
 
   on('agent.spawn', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     const result = await next(e)
     try {
       const id = result.agentId
@@ -1647,7 +1671,7 @@ export const register: Register = (on, options) => {
   // `turn.step` streams, so its hook is the generator the engine reads: every chunk
   // passes through untouched, and the recording reads only the result that comes back.
   on('turn.step', async function* ($, e, next) {
-    if (!enabled) return yield* next(e)
+    if (!(await isOn($))) return yield* next(e)
     const result = yield* next(e)
     try {
       // Only the main loop's requests are measured: a subagent has a cache of its own.
@@ -1693,7 +1717,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (e.agentId !== undefined) {
       // A subagent's own turn: its noted row is tagged as ended, which the handoff reads.
       try {
@@ -1760,7 +1784,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.compact', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
     const mine = switchReason !== null && e.trigger === 'manual'
     let session: Session | undefined
@@ -1833,7 +1857,7 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     let holds = false
     let starts = false
     let isExpired = false
@@ -1938,7 +1962,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.measure', async ($, e, next) => {
-    if (!enabled) return next(e)
+    if (!(await isOn($))) return next(e)
     try {
       const session = await sessionOf($)
       const id = await idOf($)
