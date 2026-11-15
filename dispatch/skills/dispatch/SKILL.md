@@ -93,8 +93,8 @@ description: 根代理需要派发时加载：分包、模型与档位、精简�
 
 ## delegate_agy（AGY）派发
 - 走 Google Antigravity 订阅，经官方 agy CLI 无界面运行（不经 CPA，不是反代），不占 Claude 额度，也不占 DS 的每日 8 亿；Gemini 4 Hydrogen（4h）额度池独立于 4a/4c，用户实测日常编码强于 DS 4.1 flash。日常执行默认 delegate_agy（model 默认 4h）。
-- model：'4h'（默认）；'4a'（Gemini 4 Argon）高一档，只在 4h 做过一次仍不稳或真正难的活用；4c 目前 agy CLI 不提供。effort 映射到模型档位（low/medium/high/xhigh，不填 medium；Argon 最高 high）。
-- 用法与 DS 相同：mode=read（按 agy 的 plan 模式只读）/ work（可改文件、跑命令），background、resume（agent ID 就是 agy 会话 id）、delegate_send、delegate_cancel 都可用；没有 ptc/readPaths，子代理用 agy 自带的读写、编辑、命令工具。执行包要求同 DS 那四点。
+- model：'4h'（默认）；'4a'（Gemini 4 Argon）高一档，只在 4h 做过一次仍不稳或真正难的活用；'4c'（Gemini 4 Carbon）要 Ultra 订阅，当前是 Pro，换 Ultra 后才能用。每次 delegate_agy 返回都带 AGY 额度（Gemini 组周额度 / 5 小时额度、Argon 周额度）；Gemini 组剩余很低时提前改派 DS。effort 映射到模型档位（low/medium/high/xhigh，不填 medium；Argon 最高 high）。
+- 用法与 DS 相同：mode=read（只读沙箱）/ work（可改文件、跑命令），background、resume（agent ID 就是 agy 会话 id）、delegate_send、delegate_cancel 都可用；子代理用自建精简 agent，唯一工具是 ptc-run 的 run_code（和 DS 通道同一沙箱，经 MCP 接入；read 是只读沙箱，硬拦写入和命令）；不支持 readPaths。执行包要求同 DS 那四点。
 - 4h 报额度用完、agy 未登录或启动失败时改派 delegate_flash / delegate_pro，不反复重试；agy 登录要用户本人在 Antigravity 里完成。含密钥或敏感数据的活交给 DS。
 
 ## delegate（DS）派发（备选）

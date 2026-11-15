@@ -81,15 +81,17 @@ const AGY_TOOL = 'mcp__delegate__delegate_agy'
 const AGY_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const
 type AgyEffort = (typeof AGY_EFFORTS)[number]
 const isAgyEffort = (v: unknown): v is AgyEffort => typeof v === 'string' && (AGY_EFFORTS as readonly string[]).includes(v)
-/** '4h'（默认，Gemini 4 Hydrogen）/ '4a'（Gemini 4 Argon，高一档）/ agy models 里的完整模型名 → 实际模型名。 */
+/** '4h'（默认，Gemini 4 Hydrogen）/ '4a'（Gemini 4 Argon）/ '4c'（Gemini 4 Carbon，需 Ultra）/ agy models 里的完整模型名 → 实际模型名。 */
 const agyModelOf = (wanted: unknown, effort: unknown): string | { error: string } => {
   const w = typeof wanted === 'string' && wanted.trim() !== '' ? wanted.trim().toLowerCase() : '4h'
   const ef: AgyEffort = isAgyEffort(effort) ? effort : effort === 'max' ? 'xhigh' : 'medium'
   if (w === '4h' || w === 'hydrogen') return `gemini-4-hydrogen-${ef}`
   // Argon 只有 low / medium / high
   if (w === '4a' || w === 'argon') return `gemini-4-argon-${ef === 'xhigh' ? 'high' : ef}`
+  // Carbon 要 Ultra 订阅（Pro 订阅的 agy models 里没有它），没有时 agy 会报错，原样返回给调用方
+  if (w === '4c' || w === 'carbon') return `gemini-4-carbon-${ef === 'xhigh' ? 'high' : ef}`
   if (/^[a-z0-9][a-z0-9.-]+$/.test(w) && w.includes('-')) return w
-  return { error: `delegate_agy 不认识模型「${String(wanted)}」：用 '4h'（默认）、'4a'，或 agy models 列出的完整名称` }
+  return { error: `delegate_agy 不认识模型「${String(wanted)}」：用 '4h'（默认）、'4a'、'4c'（需 Ultra），或 agy models 列出的完整名称` }
 }
 const agyLabel = (model: string, flags: { background: boolean; work: boolean }): string =>
   `AGY ${model}${flags.work ? ' · 可改文件' : ' · 只读'}${flags.background ? ' · 后台' : ''}`
@@ -246,14 +248,14 @@ const describeAgy = async ($: EngineInterface): Promise<void> => {
     await $.tool.register({
       name: 'delegate_agy',
       description:
-        '【agy 档】把执行活交给 Antigravity 订阅里的 Gemini（官方 agy CLI，无界面运行，不占 Claude 额度，也不占 DS 日额度）。日常执行默认用它（模型 4h = Gemini 4 Hydrogen）；更难的活传 model:"4a"（Gemini 4 Argon）。子代理用 agy 自带的读写文件、编辑、跑命令工具，在 cwd 下工作，做完返回最终报告和 agent ID（agy 会话 id，可 resume）。read 模式按 agy 的 plan 模式只读运行。',
+        '【agy 档】把执行活交给 Antigravity 订阅里的 Gemini（官方 agy CLI，无界面运行，不占 Claude 额度，也不占 DS 日额度）。日常执行默认用它（模型 4h = Gemini 4 Hydrogen）；更难的活传 model:"4a"（Gemini 4 Argon）。子代理是去掉 agy 默认提示词和内置工具的精简 agent，唯一工具是 ptc-run 的 run_code（和 DS 通道同一沙箱），在 cwd 下工作，做完返回最终报告和 agent ID（agy 会话 id，可 resume）。read 模式是只读沙箱（写文件、跑命令被硬拦）。返回末尾附 AGY 额度。',
       inputSchema: {
         type: 'object',
         properties: {
           task: { type: 'string', description: '自包含的任务说明' },
           model: {
             type: 'string',
-            description: "默认 '4h'（Gemini 4 Hydrogen），日常都用它；'4a'（Gemini 4 Argon）高一档，只在 4h 不稳或真正难的活用；也可传 agy models 列出的完整模型名",
+            description: "默认 '4h'（Gemini 4 Hydrogen），日常都用它；'4a'（Gemini 4 Argon）高一档，只在 4h 不稳或真正难的活用；'4c'（Gemini 4 Carbon）要 Ultra 订阅，当前 Pro 订阅不可用；也可传 agy models 列出的完整模型名",
           },
           mode: { type: 'string', enum: ['read', 'work'], description: 'read 只读（默认）；work 可改文件和跑命令' },
           cwd: { type: 'string', description: '工作目录；不填用当前会话的' },
@@ -1418,7 +1420,7 @@ const callTool = async (
   }
   if (background) {
     void runBackground($, record, wire)
-    const startQuota = target === 'gpt' ? await gptQuotaLine($) : ''
+    const startQuota = target === 'gpt' ? await gptQuotaLine($) : target === 'agy' ? await agyQuotaLine($) : ''
 
     return {
       result: `[delegate ${target} · ${mode} · 后台任务 ${jobId}] 已启动（agent ${record.sessionId ?? '?'}）。完成后会自动通知你（结果和 agent ID 都在通知里）。期间继续做别的，不要轮询，也不要为同一件事再派一个；要看进度用 delegate_status("${jobId}")，要停用 delegate_cancel("${jobId}")，要补充要求用 delegate_send("${jobId}", "…")。${cwdNote}${startQuota === '' ? '' : `\n${startQuota}`}`,
@@ -1450,7 +1452,7 @@ const settle = async (
   if (!reply.ok) record.error = (reply.error ?? reply.text ?? '').slice(0, 300)
   await saveJob($, record)
   const id = record.sessionId ?? ''
-  const quotaNote = record.tier === 'gpt' ? await gptQuotaLine($) : ''
+  const quotaNote = record.tier === 'gpt' ? await gptQuotaLine($) : record.tier === 'agy' ? await agyQuotaLine($) : ''
   const head = `[delegate ${record.tier} · ${record.mode} · agent ${id === '' ? '?' : id} · ${reply.turns ?? '?'} 轮 · ${Math.round((reply.ms ?? 0) / 1000)} 秒 · ${record.jobId}]${quotaNote === '' ? '' : `\n${quotaNote}`}`
   // GPT 走自定义供应商时默认不显示前缀：runner 报的“实际模型”也照此显示。
   const config = await loadConfig($).catch(() => undefined)
@@ -1918,6 +1920,46 @@ const refreshQuota = async ($: EngineInterface, force = false): Promise<void> =>
   await requestRedraw($)
 }
 
+// AGY（Antigravity 订阅）额度：scripts/agy-quota.mjs 跑官方 agy 的 /usage（不耗 token），形状同 GPT 额度。
+// 每次要起一个 agy 进程，TTL 比 GPT 长一些。
+const AGY_QUOTA_TTL = 120_000
+let agyQuota: GptQuota | undefined
+let agyQuotaAt = 0
+let agyQuotaPending = false
+const refreshAgyQuota = async ($: EngineInterface, force = false): Promise<void> => {
+  if (agyQuotaPending || (!force && Date.now() - agyQuotaAt < AGY_QUOTA_TTL)) return
+  agyQuotaPending = true
+  try {
+    const ran = await $.process.run(['node', `${$.plugin.root}/scripts/agy-quota.mjs`], { timeoutMs: 70_000 })
+    const line = ran.stdout.trim().split('\n').at(-1) ?? ''
+    try {
+      agyQuota = normalizeQuota(JSON.parse(line))
+    } catch {
+      agyQuota = { ok: false, error: ran.stderr.trim().slice(0, 120) || '额度脚本没有输出' }
+    }
+  } catch (error) {
+    agyQuota = { ok: false, error: messageOf(error).slice(0, 120) }
+  } finally {
+    agyQuotaAt = Date.now()
+    agyQuotaPending = false
+  }
+  await requestRedraw($)
+}
+
+/** 一行额度文字（作业返回末尾用）：每个窗口剩多少、多久后重置。 */
+const quotaText = (name: string, q: GptQuota | undefined): string => {
+  if (q === undefined) return ''
+  if (!q.ok) return `[${name} 额度查询失败：${q.error}]`
+  const now = Date.now()
+  const parts = q.windows.map(w => `${w.label}剩 ${Math.round(100 - w.used)}%${w.resetAt === undefined ? '' : `，${resetIn(w.resetAt, now)}`}`)
+  return `[${name} 额度：${parts.join(' · ')}${q.limitReached ? '；有窗口已用完' : ''}]`
+}
+
+const agyQuotaLine = async ($: EngineInterface): Promise<string> => {
+  if (Date.now() - agyQuotaAt > 15_000) await refreshAgyQuota($, true)
+  return quotaText('AGY', agyQuota)
+}
+
 // GPT 作业结束时附上订阅额度，方便主会话决定还能不能接着派 GPT。15 秒内查过就复用。
 const gptQuotaLine = async ($: EngineInterface): Promise<string> => {
   // 自定义供应商按自己的账单走，没有订阅窗口可报。
@@ -2019,6 +2061,7 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         await pollLogin($)
         // 闲着时也按 TTL 刷新 GPT 额度，按钮栏才不会停在旧读数上（refreshQuota 自己会触发重绘）。
         await refreshQuota($)
+        await refreshAgyQuota($)
         // 面板没开、本进程也没有作业在跑：这一轮不读 store。新派的作业 saveJob 会置 liveJobsRunning，
         // 打开面板会置 livePaneOpen，下一轮自动接上，不用重建计时器。
         if (!liveJobsRunning && !livePaneOpen) return
@@ -2392,6 +2435,52 @@ export const register: Register = on => {
     const shown = more ? jobs : jobs.slice(0, 6)
     const nDone = jobs.filter(r => r.status === 'done').length
 
+    void refreshAgyQuota($).catch(() => undefined)
+    const quotaCard = (key: string, title: string, q: GptQuota | undefined, pending: boolean, refresh: () => Promise<void>) => (
+      <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} overflow="hidden">
+        <Box justifyContent="space-between">
+          <Text>
+            <Text weight="semibold">{title}</Text>
+            {q?.ok === true && q.limitReached && <Text color="error"> · 有窗口已用完</Text>}
+          </Text>
+          <Button key={`live-${key}-refresh`} plain dimColor onPress={refresh}>
+            {pending ? '查询中…' : '↻ 刷新'}
+          </Button>
+        </Box>
+        {q === undefined && <Text dimColor>查询中…</Text>}
+        {q?.ok === false && <Text dimColor>{q.error}</Text>}
+        {q?.ok === true && (
+          <Box flexDirection="column" marginTop={1}>
+            {q.windows.map(w => {
+              const [usedBar, restBar] = barOf(w.used, 12)
+
+              return (
+                <Box key={`live-${key}-${w.label}`}>
+                  <Box width={18} flexShrink={0}>
+                    <Text dimColor wrap="truncate">
+                      {w.label}
+                    </Text>
+                  </Box>
+                  <Text color={usedColor(w.used)}>{usedBar}</Text>
+                  <Text color="inactive">{restBar}</Text>
+                  <Box width={6} flexShrink={0} justifyContent="flex-end">
+                    <Text weight="semibold" tabular>
+                      {Math.round(w.used)}%
+                    </Text>
+                  </Box>
+                  <Text dimColor wrap="truncate-end">
+                    {'  '}
+                    {resetIn(w.resetAt, now)}
+                  </Text>
+                </Box>
+              )
+            })}
+          </Box>
+        )}
+      </Box>
+    )
+    const agyBox = quotaCard('agy', 'AGY 额度（已用）', agyQuota, agyQuotaPending, () => refreshAgyQuota($, true))
+
     const quotaBox = !showQuota ? undefined : (
       <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} overflow="hidden">
         <Box justifyContent="space-between">
@@ -2454,10 +2543,11 @@ export const register: Register = on => {
       return ok(
         <Box flexDirection="column" gap={1}>
           {quotaBox}
+          {agyBox}
           {dsBox}
           <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1}>
             <Text weight="semibold">{showAll ? '还没有委派任务' : '本会话还没有委派任务'}</Text>
-            <Text dimColor>派出 delegate_flash / pro / gpt 后，这里会实时显示它们在做什么。</Text>
+            <Text dimColor>派出 delegate_agy / flash / pro / gpt 后，这里会实时显示它们在做什么。</Text>
             {scopeToggle}
           </Box>
         </Box>
@@ -2699,6 +2789,7 @@ export const register: Register = on => {
     return ok(
       <Box flexDirection="column" gap={1} overflow="hidden">
         {quotaBox}
+        {agyBox}
         {dsBox}
         <Box flexWrap="wrap" gap={1} alignItems="flex-start" overflow="hidden">
           {list}
@@ -2757,6 +2848,18 @@ export const register: Register = on => {
         </Text>,
         <Text key="gp" color={usedColor(five.used)}>
           {`${Math.round(five.used)}%`}
+        </Text>,
+      )
+    }
+    // AGY：4h 所在的 Gemini 组 5 小时窗口（读内存值，计时器刷新）。
+    const agyFive = agyQuota?.ok === true ? agyQuota.windows.find(w => w.label === 'Gemini 5 小时') : undefined
+    if (agyFive !== undefined) {
+      parts.push(
+        <Text key="a" dimColor>
+          {' · 4h 5h '}
+        </Text>,
+        <Text key="ap" color={usedColor(agyFive.used)}>
+          {`${Math.round(agyFive.used)}%`}
         </Text>,
       )
     }
