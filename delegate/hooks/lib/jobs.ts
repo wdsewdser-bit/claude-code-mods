@@ -50,6 +50,8 @@ export type JobStatusFile = {
   turns?: number
   lastTool?: string | null
   lastText?: string
+  /** agy 断流计数：count 是本轮断流次数，retrying 表示 agy 正在自动重试（还没重试成功，也没失败）。 */
+  retry?: { count: number; retrying: boolean } | null
   /** 运行中数出来的输出 token 总数：assistant 行的 usage 是 0，runner 从 stream_event 里累加，result 时覆盖。 */
   outputTokens?: number
   /** 最近一次请求的真实输入（runner 从 message_delta 取；事件流里的是 CPA 预估，偏大）。 */
@@ -258,6 +260,9 @@ export const normalizeStatus = (raw: unknown): JobStatusFile | undefined => {
     turns: num(raw.turns),
     lastTool: str(raw.lastTool) === '' ? null : str(raw.lastTool),
     lastText: str(raw.lastText),
+    ...(raw.retry !== null && typeof raw.retry === 'object' && num((raw.retry as { count?: unknown }).count) !== undefined
+      ? { retry: { count: num((raw.retry as { count?: unknown }).count)!, retrying: (raw.retry as { retrying?: unknown }).retrying === true } }
+      : {}),
     ...(num(raw.outputTokens) === undefined || num(raw.outputTokens)! < 0 ? {} : { outputTokens: num(raw.outputTokens) }),
     ...(num(raw.contextTokens) === undefined || num(raw.contextTokens)! <= 0 ? {} : { contextTokens: num(raw.contextTokens) }),
     ...(usage === undefined ? {} : { usage }),
@@ -305,7 +310,7 @@ export const formatList = (
         : ` · 结束 ${timeOf(rec.endedAt, opts.now)} · 用时 ${spanOf(rec.endedAt - rec.at)}`
     const liveBit =
       rec.status === 'running'
-        ? `${st?.phase === undefined ? '' : ` · ${st.phase}`}${st?.lastTool ? ` · 最后工具 ${st.lastTool}` : ''}`
+        ? `${st?.phase === undefined ? '' : ` · ${st.phase}`}${st?.lastTool ? ` · 最后工具 ${st.lastTool}` : ''}${st?.retry?.retrying ? ` · 断流，agy 自动重试中（第 ${st.retry.count} 次）` : ''}`
         : ''
     const tail = [
       rec.status === 'running' || rec.status === 'orphaned'
@@ -400,6 +405,7 @@ export const formatStatus = (
   const turns = status?.turns ?? rec?.turns
   if (turns !== undefined) lines.push(`轮数：${turns}`)
   if (status?.lastTool) lines.push(`最后工具：${status.lastTool}`)
+  if (status?.retry) lines.push(status.retry.retrying ? `断流：agy 正在自动重试（本轮第 ${status.retry.count} 次断流）` : `断流：本轮已发生 ${status.retry.count} 次，agy 已自动恢复`)
   const agent = status?.sessionId ?? rec?.sessionId
   if (agent) lines.push(`agent：${agent}（resume 用这个）`)
   if (rec?.cwd) lines.push(`cwd：${rec.cwd}`)
