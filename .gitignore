@@ -17,3 +17,4 @@ node_modules/
 dryrun.log
 /ptc-run/bin/
 phase0/
+/NOTES-*.md
