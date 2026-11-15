@@ -1,7 +1,8 @@
 // node --test delegate/tests/run-agy.test.mjs
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { agentFileOf, argsOf, createTranslator, promptOf } from '../scripts/run-agy.mjs'
+import { agentFileOf, agentKindOf, argsOf, createTranslator, promptOf, recoveredTurn, retrySuffix, nextRetryState } from '../scripts/run-agy.mjs'
+import fs from 'node:fs'
 
 test('each mode runs its own agent with permissions auto-approved; resume passes the conversation', () => {
   const work = argsOf({ mode: 'work', model: 'gemini-4-hydrogen-medium' }, 'do it', null)
@@ -68,4 +69,59 @@ test('flush emits un-DONE text as an assistant event without changing turns or u
   assert.deepEqual(tr.flush(), [])
   assert.equal(tr.turns, 0)
   assert.deepEqual(tr.usage, { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 })
+})
+
+test('ptc:false picks the native agent, which never mentions run_code', () => {
+  assert.equal(agentKindOf({ mode: 'work', ptc: false }), 'native')
+  assert.equal(agentKindOf({ mode: 'work' }), 'work')
+  assert.equal(agentKindOf({ mode: 'read' }), 'read')
+  assert.ok(argsOf({ mode: 'work', ptc: false }, 'p', null).includes('cc-delegate-native-work'))
+  const file = agentFileOf('native')
+  assert.match(file, /^name: cc-delegate-native-work$/m)
+  assert.doesNotMatch(file, /run_code|ptc|mcpServers/)
+})
+
+// 断流判定：夹具是 agy 真实会话 e528d7dd 第 74–88 步（第 76 步是断流的 ERROR_MESSAGE，之后 agy 自己接着跑完）。
+const fixtureSteps = fs.readFileSync(new URL('./fixtures/agy-interrupt-e528d7dd.jsonl', import.meta.url), 'utf8')
+  .split('\n').filter(Boolean).map(l => JSON.parse(l))
+const STREAM_ERR = 'The stream was interrupted. Please continue the task you were working on.'
+const FAILED = { status: 'ERROR', error: STREAM_ERR }
+
+test('断流后恢复并完成：判为恢复，计 1 次断流', () => {
+  assert.deepEqual(recoveredTurn(fixtureSteps, 0, FAILED), { interrupts: 1 })
+})
+
+test('续跑时带着历史断流错误：只看续跑起点之后，历史错误不计入本轮', () => {
+  const resumed = [...fixtureSteps, { step_index: 89, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: '续跑的最终报告' }]
+  assert.deepEqual(recoveredTurn(resumed, 89, FAILED), { interrupts: 0 })
+})
+
+test('真失败：断流后没有任何回复，最后一步是错误，不判恢复', () => {
+  assert.equal(recoveredTurn(fixtureSteps.slice(0, 3), 0, FAILED), null)
+})
+
+test('报错文本与 agy 记录的错误步骤不相等（结构化比对失败）：不判恢复，退化成失败', () => {
+  assert.equal(recoveredTurn(fixtureSteps, 0, { status: 'ERROR', error: 'quota exceeded' }), null)
+})
+
+test('成功的结果不做判定', () => {
+  assert.equal(recoveredTurn(fixtureSteps, 0, { status: 'SUCCESS', error: STREAM_ERR }), null)
+})
+
+test('失败时的说明带上本轮断流次数和最后一次错误，历史错误不计入', () => {
+  assert.equal(retrySuffix(fixtureSteps, 0), `（本轮断流 1 次，最后一次：${STREAM_ERR}）`)
+  assert.equal(retrySuffix(fixtureSteps, 89), '')
+})
+
+test('实时重试状态：错误步骤记为重试中，之后的回复或工具调用清掉“重试中”，次数保留', () => {
+  let st = null
+  st = nextRetryState(st, { step_type: 'error_message' })
+  assert.deepEqual(st, { count: 1, retrying: true })
+  st = nextRetryState(st, { step_type: 'agent_response' })
+  assert.deepEqual(st, { count: 1, retrying: false })
+  st = nextRetryState(st, { step_type: 'error_message' })
+  assert.deepEqual(st, { count: 2, retrying: true })
+  st = nextRetryState(st, { step_type: 'tool' })
+  assert.deepEqual(st, { count: 2, retrying: false })
+  assert.equal(nextRetryState(null, { step_type: 'user_input' }), null)
 })

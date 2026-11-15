@@ -78,7 +78,11 @@ const COMMON_RULES = [
   '## 唯一的工具：run_code',
   '用 call_mcp_tool 调用，ServerName 填 "ptc"，ToolName 填 "run_code"，Arguments 是 {"description": "<一句中文，说明这个程序要做什么>", "code": "<异步函数体>"}，可选 timeoutMs、root、maxChars。description 必填，用户靠它看你在做什么。',
   '程序里只有 console.log 的输出和 return 的值会回来。相对路径以任务给的工作目录为准。',
-  '把能预见的多步操作写进一个程序一次做完（定位→读片段→改→验证），只打印需要的摘录，不要一次只做一步。',
+  '',
+  '## 工作方式（硬规则）',
+  '- 每一轮只调用一次 run_code。一块内容（定位→读→改→验证）写在同一个程序里完成，程序内用变量和 if 判断衔接，不要拆成多轮。',
+  '- 骨架示例（一块内容一个程序）：const hit = tools.grep({...}); const s = tools.read({path, offset, limit}); tools.edit({...}); const t = tools.sh("pytest ...", {tail: 40}); console.log(只打印需要的摘录)。',
+  '- 信息不够时，在同一个程序里继续查，不要停下来一次只问一个。',
   '',
   '## SDK',
   '@@SDK@@',
@@ -90,6 +94,15 @@ const COMMON_RULES = [
   '- 做完给最终报告（中文，简洁）：结论、改了哪些文件（绝对路径）、怎么验证的（命令和真实输出）、还有什么没验证。只报真实结果，没跑过的检查写明没跑。',
   '- 报告最后单独一行：TASK_TERMINAL: completed（目标完成且必要验证做过）、TASK_TERMINAL: blocked（缺信息或权限）或 TASK_TERMINAL: failed（尝试后失败）。',
 ]
+// 不带 ptc 的 native agent 的规则：用 agy 自带工具干活，不提 run_code。
+const NATIVE_RULES = [
+  '你是主会话派出的执行代理，在 Windows 上工作。按任务说明做，不扩大范围，不再派给别人。',
+  '',
+  '## 工具',
+  '用 agy 自带的文件读写、搜索和命令工具干活（工具名以你当前可用的为准，不要猜）。',
+  '',
+  ...COMMON_RULES.slice(COMMON_RULES.indexOf('## 规则')),
+]
 const AGENTS = {
   work: {
     name: 'cc-delegate-work',
@@ -99,6 +112,11 @@ const AGENTS = {
     name: 'cc-delegate-read',
     body: [...COMMON_RULES, '- 这是只读任务：run_code 是只读沙箱，只能 read/glob/grep/peek 和 ref.*，写文件和跑命令会返回 POLICY_DENIED；不要尝试改动，需要改的写进报告。'],
   },
+  // 不带 ptc 的对照组：不写 run_code 相关提示，启动时也不设 PTC_* 环境变量，所以 ptc 服务器不会暴露工具。
+  native: {
+    name: 'cc-delegate-native-work',
+    body: [...NATIVE_RULES, '- 你可以改文件、跑命令（用 run_command）；改完要读文件或跑命令核实结果。'],
+  },
 }
 
 export const agentFileOf = kind => {
@@ -106,9 +124,9 @@ export const agentFileOf = kind => {
   return [
     '---',
     `name: ${a.name}`,
-    `description: claude-code delegate 的${kind === 'work' ? '执行' : '只读'}代理（由 delegate 插件自动生成，改动会被覆盖）`,
+    `description: claude-code delegate 的${kind === 'read' ? '只读' : '执行'}代理（由 delegate 插件自动生成，改动会被覆盖）`,
     'mainAgent: true',
-    'excludeDefaultComponents: true',
+    ...(kind === 'native' ? ['tools: [read_file, write_file, edit_file, run_command]'] : ['excludeDefaultComponents: true']),
     '---',
     ...a.body.map(l => (l === '@@SDK@@' ? sdkText() : l)),
     '',
@@ -144,8 +162,11 @@ export const promptOf = (job, first) => {
   return `工作目录：${cwd}\n\n${task}`
 }
 
+// ptc:false 选不带 ptc 的 native agent（对照组）；否则按模式选 work / read。
+export const agentKindOf = job => (job.ptc === false ? 'native' : job.mode === 'work' ? 'work' : 'read')
+
 export const argsOf = (job, prompt, conversation) => {
-  const kind = job.mode === 'work' ? 'work' : 'read'
+  const kind = agentKindOf(job)
   // 只读靠 agent 的工具白名单（没有写文件和命令工具），所以两种模式都自动批准：
   // print 模式下被拒的权限请求会让这一轮直接结束、报告为空。
   const args = [`--print=${prompt}`, '--output-format', 'stream-json', '--agent', AGENTS[kind].name, '--dangerously-skip-permissions']
@@ -322,7 +343,14 @@ const runTurn = (job, prompt, conversation, control, tr, deadline) =>
     let child
     try {
       // ptc 服务器从 agy 继承环境：PTC_MCP_CWD 让它暴露 run_code 并以此为工作目录，只读模式加 PTC_RUN_READONLY。
-      const env = { ...process.env, PTC_MCP_CWD: cwd, PTC_MCP_SCOPE: `agy-${job.jobId ?? 'job'}`, PTC_RUN_READONLY: job.mode === 'work' ? '0' : '1' }
+      const env = { ...process.env }
+      if (job.ptc === false) {
+        delete env.PTC_MCP_CWD
+        delete env.PTC_MCP_SCOPE
+        delete env.PTC_RUN_READONLY
+      } else {
+        Object.assign(env, { PTC_MCP_CWD: cwd, PTC_MCP_SCOPE: `agy-${job.jobId ?? 'job'}`, PTC_RUN_READONLY: job.mode === 'work' ? '0' : '1' })
+      }
       child = spawn(exe, argsOf(job, prompt, conversation), { cwd, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     } catch (e) {
       resolve({ error: `agy 启动失败（${exe}）：${e?.message ?? e}` })
@@ -352,8 +380,13 @@ const runTurn = (job, prompt, conversation, control, tr, deadline) =>
     }
     const onLine = line => {
       if (line.trim() === '') return
+      if (process.env.DELEGATE_AGY_RAW_LOG) { try { fs.appendFileSync(process.env.DELEGATE_AGY_RAW_LOG, line + '\n') } catch {} }
       let o
       try { o = JSON.parse(line) } catch { return }
+      if (o.event === 'step_update' && control) {
+        const next = nextRetryState(control.state.retry, o.step_update)
+        if (next !== control.state.retry) { control.state.retry = next; control.write(true) }
+      }
       if (o.event === 'init' && typeof o.conversation_id === 'string') {
         convId = o.conversation_id
         if (control) { control.state.sessionId = convId; control.write(true) }
@@ -382,6 +415,46 @@ const runTurn = (job, prompt, conversation, control, tr, deadline) =>
       resolve({ code, result, convId, stderr, cancelled, timedOut, tail })
     })
   })
+
+// agy 把每一步写进 brain/<会话>/.system_generated/logs/transcript_full.jsonl，step_index 从 0 连续编号。
+export const stepsOf = conv => {
+  if (!conv) return []
+  const file = path.join(home, '.gemini', 'antigravity-cli', 'brain', String(conv), '.system_generated', 'logs', 'transcript_full.jsonl')
+  try {
+    return fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim() !== '').map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  } catch { return [] }
+}
+
+// 判定：agy 的 result 报了非成功，但它其实已经自己恢复并跑完这一轮。全部条件都要满足：
+// 1) 本轮（step_index >= startStep，即续跑起点之后）的最后一步是模型的回复，不是错误步骤；
+// 2) agy 在它自己的会话记录里留有错误步骤（ERROR_MESSAGE），且其 error 字段与 result 报的 error 完全相等（结构化的相等，不是猜文案）。
+// 1)、2) 任一不满足 → null，按失败处理。agy 改文案时两边一起变，相等不成立就退化成报失败，不会误报成功。
+// 返回 { interrupts }：本轮（续跑起点之后）的断流次数；续跑时历史里的旧错误不计入本轮。
+const isErrStep = st => /ERROR/.test(String(st?.type ?? ''))
+export const recoveredTurn = (steps, startStep, res) => {
+  if (!res || res.status === 'SUCCESS' || typeof res.error !== 'string') return null
+  const since = steps.filter(st => st.step_index >= startStep)
+  const last = since[since.length - 1]
+  if (!last || isErrStep(last) || last.type !== 'PLANNER_RESPONSE' || last.source !== 'MODEL') return null
+  if (!steps.some(st => isErrStep(st) && st.error === res.error)) return null
+  return { interrupts: since.filter(isErrStep).length }
+}
+
+// 失败时在报错后面附上本轮断流次数和最后一次真实错误（只统计续跑起点之后）。
+export const retrySuffix = (steps, startStep) => {
+  const errs = steps.filter(st => st.step_index >= startStep && isErrStep(st))
+  if (errs.length === 0) return ''
+  const last = errs[errs.length - 1]
+  return `（本轮断流 ${errs.length} 次，最后一次：${String(last.error ?? last.content ?? '')}）`
+}
+
+// 实时的重试状态（给 delegate_status 看）：遇到错误步骤记为“断流、自动重试中”，之后出现 agy 的新回复或工具调用就清掉“重试中”。
+export const nextRetryState = (prev, s) => {
+  const type = String(s?.step_type ?? '')
+  if (/ERROR/i.test(type)) return { count: (prev?.count ?? 0) + 1, retrying: true }
+  if (prev?.retrying && (type === 'agent_response' || type === 'tool')) return { count: prev.count, retrying: false }
+  return prev ?? null
+}
 
 const main = async () => {
   let job
@@ -416,7 +489,7 @@ const main = async () => {
   }
   const tr = createTranslator(model, thinkingOf)
   const deadline = started + TIME_LIMIT_MS
-  try { ensureAgent(job.mode === 'work' ? 'work' : 'read'); ensurePtcServer() } catch (e) {
+  try { ensureAgent(agentKindOf(job)); if (job.ptc !== false) ensurePtcServer() } catch (e) {
     return finish({ ok: false, error: `准备 agy 自定义 agent / ptc 服务器失败：${e?.message ?? e}` }, 1)
   }
   let conversation = job.resume ? String(job.resume) : null
@@ -433,11 +506,15 @@ const main = async () => {
   }
   let lastText = ''
   let turnText = ''
+  const notes = []
   for (;;) {
+    const startStep = stepsOf(conversation).length
     const r = await runTurn(job, prompt, conversation, control, tr, deadline)
     if (r.error) return done({ ok: false, error: r.error, sessionId: conversation }, 1)
     conversation = r.convId ?? conversation
     const res = r.result
+    const recovered = res && res.status !== 'SUCCESS' ? recoveredTurn(stepsOf(conversation), startStep, res) : null
+    if (recovered) notes.push(`本轮中途断流 ${recovered.interrupts} 次，agy 已自动恢复并跑完（agy 报的错误：${res.error}）`)
     // agy 有时在回复前带一段空的结构化输出 "{}"，去掉。
     turnText = (typeof res?.response === 'string' ? res.response : (r.tail ?? tr.text)).replace(/^\s*\{\}\s*/, '')
     const fallbackText = turnText || lastText
@@ -447,10 +524,10 @@ const main = async () => {
     if (r.timedOut || Date.now() > deadline) {
       return done({ ok: false, error: '超过 2 小时，已停止', text: fallbackText, sessionId: conversation, turns: tr.turns, terminal: terminalOf(fallbackText) }, 1)
     }
-    if (!res || res.status !== 'SUCCESS') {
+    if ((!res || res.status !== 'SUCCESS') && !recovered) {
       const why = res?.error ?? res?.status ?? `agy 退出 ${r.code}，没有 result 事件`
       const err = String(r.stderr ?? '').replace(/\s+/g, ' ').trim().slice(-400)
-      return done({ ok: false, error: `${typeof why === 'string' ? why : JSON.stringify(why)}${err ? `：${err}` : ''}`, text: fallbackText, sessionId: conversation, turns: tr.turns, terminal: terminalOf(fallbackText) }, 1)
+      return done({ ok: false, error: `${typeof why === 'string' ? why : JSON.stringify(why)}${err ? `：${err}` : ''}${retrySuffix(stepsOf(conversation), startStep)}`, text: fallbackText, sessionId: conversation, turns: tr.turns, terminal: terminalOf(fallbackText) }, 1)
     }
     if (turnText.trim() === '') {
       return done({ ok: false, error: 'agy 这一轮结束了但没有给出最终回复（可能是工具被拒或中途停下）；用 delegate_status 看事件，或 resume 让它补报告', sessionId: conversation, turns: tr.turns }, 1)
@@ -469,7 +546,9 @@ const main = async () => {
     for (const q of queued) control?.append({ type: 'sent', text: q })
     prompt = queued.join('\n\n')
   }
-  return done({ ok: true, text: turnText, sessionId: conversation, turns: tr.turns, terminal: terminalOf(turnText) })
+  const note = notes.map(n => `> ${n}`).join('\n')
+  const text = note ? `${note}\n\n${turnText}` : turnText
+  return done({ ok: true, text, sessionId: conversation, turns: tr.turns, terminal: terminalOf(turnText), ...(notes.length ? { recovered: notes } : {}) })
 }
 
 // 经链接路径运行时 argv[1] 和模块路径写法不同：两边都取 realpath 再比（测试 import 时不跑 main）。
