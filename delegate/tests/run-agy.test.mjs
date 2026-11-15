@@ -125,3 +125,12 @@ test('实时重试状态：错误步骤记为重试中，之后的回复或工�
   assert.deepEqual(st, { count: 2, retrying: false })
   assert.equal(nextRetryState(null, { step_type: 'user_input' }), null)
 })
+
+test('最后一步是只发工具调用的中间回复（没有正文）：不判恢复', () => {
+  const midTool = [...fixtureSteps.slice(0, 3), { step_index: 77, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: '' }]
+  assert.equal(recoveredTurn(midTool, 0, FAILED), null)
+})
+
+test('被取消的作业即使历史里有断流记录，也不判成恢复', () => {
+  assert.equal(recoveredTurn(fixtureSteps, 0, FAILED, true), null)
+})

@@ -431,11 +431,14 @@ export const stepsOf = conv => {
 // 1)、2) 任一不满足 → null，按失败处理。agy 改文案时两边一起变，相等不成立就退化成报失败，不会误报成功。
 // 返回 { interrupts }：本轮（续跑起点之后）的断流次数；续跑时历史里的旧错误不计入本轮。
 const isErrStep = st => /ERROR/.test(String(st?.type ?? ''))
-export const recoveredTurn = (steps, startStep, res) => {
+export const recoveredTurn = (steps, startStep, res, cancelled = false) => {
+  if (cancelled) return null
   if (!res || res.status === 'SUCCESS' || typeof res.error !== 'string') return null
   const since = steps.filter(st => st.step_index >= startStep)
   const last = since[since.length - 1]
   if (!last || isErrStep(last) || last.type !== 'PLANNER_RESPONSE' || last.source !== 'MODEL') return null
+  // 中间回复只发工具调用、没有正文；有正文才是这一轮的最终回复。
+  if (typeof last.content !== 'string' || last.content.trim() === '') return null
   if (!steps.some(st => isErrStep(st) && st.error === res.error)) return null
   return { interrupts: since.filter(isErrStep).length }
 }
@@ -513,7 +516,7 @@ const main = async () => {
     if (r.error) return done({ ok: false, error: r.error, sessionId: conversation }, 1)
     conversation = r.convId ?? conversation
     const res = r.result
-    const recovered = res && res.status !== 'SUCCESS' ? recoveredTurn(stepsOf(conversation), startStep, res) : null
+    const recovered = res && res.status !== 'SUCCESS' ? recoveredTurn(stepsOf(conversation), startStep, res, Boolean(r.cancelled || r.timedOut || control?.isCancelled())) : null
     if (recovered) notes.push(`本轮中途断流 ${recovered.interrupts} 次，agy 已自动恢复并跑完（agy 报的错误：${res.error}）`)
     // agy 有时在回复前带一段空的结构化输出 "{}"，去掉。
     turnText = (typeof res?.response === 'string' ? res.response : (r.tail ?? tr.text)).replace(/^\s*\{\}\s*/, '')
