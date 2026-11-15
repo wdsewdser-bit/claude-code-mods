@@ -46,12 +46,13 @@ const TOOL = {
   inputSchema: {
     type: 'object',
     properties: {
+      description: { type: 'string', description: '一句中文，说明这个程序要做什么（显示给用户看，写在 code 之前）。' },
       code: { type: 'string', description: 'Body of an async function; use return and console.log.' },
       timeoutMs: { type: 'integer', minimum: 1000, maximum: 600000, description: 'whole-program timeout, default 300000' },
       root: { type: 'string', description: 'optional existing absolute directory used as the base for relative paths, glob/grep and bash' },
       maxChars: { type: 'integer', minimum: 1000, maximum: 50000, description: 'output cap in chars (default 50000)' },
     },
-    required: ['code'],
+    required: ['description', 'code'],
   },
 }
 

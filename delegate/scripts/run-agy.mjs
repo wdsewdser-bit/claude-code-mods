@@ -76,7 +76,7 @@ const COMMON_RULES = [
   '你是主会话派出的执行代理，在 Windows 上工作。按任务说明做，不扩大范围，不再派给别人。',
   '',
   '## 唯一的工具：run_code',
-  '用 call_mcp_tool 调用，ServerName 填 "ptc"，ToolName 填 "run_code"，Arguments 是 {"code": "<异步函数体>"}，可选 timeoutMs、root、maxChars。',
+  '用 call_mcp_tool 调用，ServerName 填 "ptc"，ToolName 填 "run_code"，Arguments 是 {"description": "<一句中文，说明这个程序要做什么>", "code": "<异步函数体>"}，可选 timeoutMs、root、maxChars。description 必填，用户靠它看你在做什么。',
   '程序里只有 console.log 的输出和 return 的值会回来。相对路径以任务给的工作目录为准。',
   '把能预见的多步操作写进一个程序一次做完（定位→读片段→改→验证），只打印需要的摘录，不要一次只做一步。',
   '',
@@ -155,7 +155,8 @@ export const argsOf = (job, prompt, conversation) => {
 }
 
 // agy event → the Claude-stream-shaped lines liveEvents/usageOf already read.
-export const createTranslator = model => {
+// thinkingOf(stepIndex)：stream-json 里没有思考文本（只有 thinking_tokens），由调用方从 agy 的会话转写里取。
+export const createTranslator = (model, thinkingOf = () => '') => {
   let text = ''
   let msg = 0
   const usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
@@ -186,7 +187,9 @@ export const createTranslator = model => {
             usage.cacheRead += cr
             usage.output += op
             if (inp + cr > 0) context = inp + cr
-            const blocks = text.trim() === '' ? [] : [{ type: 'text', text }]
+            let thought = ''
+            try { thought = String(thinkingOf(s.step_index) ?? '').trim() } catch {}
+            const blocks = [...(thought === '' ? [] : [{ type: 'thinking', thinking: thought }]), ...(text.trim() === '' ? [] : [{ type: 'text', text }])]
             out.push(assistant(blocks, { input_tokens: inp, cache_read_input_tokens: cr, output_tokens: op }))
             text = ''
           }
@@ -386,7 +389,32 @@ const main = async () => {
   const started = Date.now()
   const control = job.jobId ? createControl(String(job.jobId), job) : null
   const model = typeof job.model === 'string' ? job.model : ''
-  const tr = createTranslator(model)
+  // agy 把每步的思考写在 ~/.gemini/antigravity-cli/brain/<会话>/.system_generated/logs/transcript_full.jsonl：
+  // 按 step_index 取。文件只增不改，读过的部分记住偏移量，不重复解析。
+  const thoughts = new Map()
+  let tPath = ''
+  let tOffset = 0
+  const thinkingOf = step => {
+    const conv = control?.state.sessionId ?? job.resume
+    if (!conv) return ''
+    const file = path.join(home, '.gemini', 'antigravity-cli', 'brain', String(conv), '.system_generated', 'logs', 'transcript_full.jsonl')
+    if (file !== tPath) { tPath = file; tOffset = 0 }
+    try {
+      const buf = fs.readFileSync(file)
+      if (buf.length > tOffset) {
+        const chunk = buf.subarray(tOffset).toString('utf8')
+        const cut = chunk.lastIndexOf('\n')
+        if (cut >= 0) {
+          for (const line of chunk.slice(0, cut).split('\n')) {
+            try { const o = JSON.parse(line); if (typeof o.thinking === 'string' && o.thinking.trim() !== '') thoughts.set(o.step_index, o.thinking) } catch {}
+          }
+          tOffset += Buffer.byteLength(chunk.slice(0, cut + 1))
+        }
+      }
+    } catch {}
+    return thoughts.get(step) ?? ''
+  }
+  const tr = createTranslator(model, thinkingOf)
   const deadline = started + TIME_LIMIT_MS
   try { ensureAgent(job.mode === 'work' ? 'work' : 'read'); ensurePtcServer() } catch (e) {
     return finish({ ok: false, error: `准备 agy 自定义 agent / ptc 服务器失败：${e?.message ?? e}` }, 1)

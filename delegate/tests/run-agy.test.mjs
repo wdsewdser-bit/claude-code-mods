@@ -28,6 +28,14 @@ test('the first prompt names the working directory; follow-ups are bare', () => 
   assert.equal(promptOf({ mode: 'work', task: 'T' }, false), 'T')
 })
 
+test('thinking from the transcript is put before the text of that step', () => {
+  const tr = createTranslator('m', step => (step === 3 ? 'plan it' : ''))
+  const su = s => ({ event: 'step_update', step_update: s })
+  tr.on(su({ step_type: 'agent_response', state: 'ACTIVE', step_index: 3, text_delta: 'ok' }))
+  const [ev] = tr.on(su({ step_type: 'agent_response', state: 'DONE', step_index: 3, usage: {} }))
+  assert.deepEqual(ev.message.content, [{ type: 'thinking', thinking: 'plan it' }, { type: 'text', text: 'ok' }])
+})
+
 test('agy events become assistant lines with tool_use, text and usage', () => {
   const tr = createTranslator('m')
   const su = s => ({ event: 'step_update', step_update: s })
