@@ -34,6 +34,8 @@ test('classify: dispatch beats execution beats bookkeeping', () => {
   expect(classify([u('Read'), u('mcp__ctx-mod__ledger_append')])).toBe('exec')
   expect(classify([u('Read'), u('Agent')])).toBe('dispatch')
   expect(classify([u('mcp__delegate__delegate_pro')])).toBe('dispatch')
+  expect(classify([u('mcp__delegate__delegate_agy')])).toBe('dispatch')
+  expect(classify([u('mcp__delegate__delegate_gpt')])).toBe('dispatch')
   expect(classify([u('SendMessage')])).toBe('dispatch')
   expect(classify([u('mcp__ccd_turn__update_plan')])).toBe('book')
   expect(classify([u('WebFetch')])).toBe('other')

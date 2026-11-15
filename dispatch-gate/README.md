@@ -8,7 +8,7 @@
 
 | 请求里有什么 | 对计数 |
 | --- | --- |
-| 派发：`Agent`、`Task`、`SendMessage`、`mcp__delegate__delegate_flash/pro` | 清零，并给 3 批只读验收宽限 |
+| 派发：`Agent`、`Task`、`SendMessage`、`mcp__delegate__delegate_agy/flash/pro/gpt` | 清零，并给 3 批只读验收宽限 |
 | 执行：`Read/Grep/Glob/Bash/PowerShell/Edit/MultiEdit/Write/NotebookEdit/BashOutput/mcp__ptc-run__run_code` | +1；全是只读的执行请求 +`readOnlyWeight`（默认 0.5）（宽限期内全是 Read/Grep/Glob 的批次不计） |
 | 簿记：`mcp__ccd_turn__update_plan/wrap_up`、`mcp__ctx-mod__context/history/ledger_append/ledger_read` | 不变，也不清零 |
 | 其他（WebFetch、浏览器、LSP、AskUserQuestion、纯文本） | 不变，也不清零 |
@@ -21,7 +21,7 @@
 - 用户新消息、`session.start/end`、任何派发都会清零。
 - 只能主会话做的事不计：`claude --version/--print/--doctor`、`--inspect`、`debugpy/gdb/lldb`、`-it`/`--interactive`、`chrome/msedge/playwright` 这类 Bash 或 run_code 输入，以及本来就不在执行类里的浏览器、LSP、AskUserQuestion。
 
-**方向二：Claude 子代理派得太密。** 统计主会话调用 `Agent`/`Task` 的次数，滚动 1 小时窗口内超过 `agentPerHour`（默认 3）时，对下一次派发软拦截一次：拒绝理由里要求先按文件集合合并分包；确实不能合并的，重新调用并在 prompt 开头写明为什么不能合并。重试即放行，同一小时内不再拦。派给 DS（`mcp__delegate__delegate_flash/pro`）不计入这一侧、不设上限，并且也会清零"自己干"的计数。
+**方向二：Claude 子代理派得太密。** 统计主会话调用 `Agent`/`Task` 的次数，滚动 1 小时窗口内超过 `agentPerHour`（默认 3）时，对下一次派发软拦截一次：拒绝理由里要求先按文件集合合并分包；确实不能合并的，重新调用并在 prompt 开头写明为什么不能合并。重试即放行，同一小时内不再拦。派给 AGY / DS / GPT（`mcp__delegate__delegate_*`）不计入这一侧、不设上限，并且也会清零"自己干"的计数。
 
 ## 配置
 

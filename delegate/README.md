@@ -5,6 +5,7 @@
 ## 提供的工具
 
 - `delegate_flash` / `delegate_pro`：DS 快档 / 强档。`mode` 为 `read`（只读）或 `work`（可改文件），支持 `background`、`resume`（续用同一子代理，沿用上次的 mode/ptc/模型/档位）、`effort`。
+- `delegate_agy`：AGY 执行（Antigravity 订阅，官方 `agy` CLI 无界面运行，不经 CPA）。`model` 默认 `4h`（gemini-4-hydrogen-<effort>），`4a` 为 Gemini 4 Argon，也可传 `agy models` 列出的完整名；`mode` read 走 agy 的 plan 模式，work 加 `--dangerously-skip-permissions`；支持 background / resume（agy 会话 id）/ send / cancel。用量不计入 DS 日账本。
 - `delegate_gpt`：GPT 执行，默认 `gpt-6.1-sol`，可选 `gpt-6-astra`；档位最低 medium。
 - `delegate_send` / `delegate_status` / `delegate_list` / `delegate_cancel`：后台任务插话、查看、列表、取消。任务状态落盘在 `~/.claude/delegate/jobs/`，重启后仍能找回并续用。
 - `/delegate`：管理供应商、协议（chat / responses / anthropic）、key 和模型列表。
@@ -23,6 +24,7 @@
 
 ## 依赖
 
+- AGY：`%LOCALAPPDATA%\agy\bin\agy.exe`（官方安装：`irm https://antigravity.google/cli/install.ps1 | iex`），用它自己缓存的登录；可用 `DELEGATE_AGY` 覆盖路径。runner 是 `scripts/run-agy.mjs`。
 - DS：本地 `a2o`（ant2oai）代理，`scripts/run_proxy.py` 在它外面加了 system 消息展开和 `--effort`。
 - GPT：本地 CLIProxyAPI，默认 `http://127.0.0.1:8317`；启动脚本默认在 `~/tools/cliproxyapi/ensure_cpa.py`，可用 `DELEGATE_CPA_ENSURE`、`DELEGATE_CPA_BASE` 覆盖。
 - 子代理用 ptc-run 的提示词（`scripts/ptc-*-system.md`）。

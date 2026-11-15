@@ -3,7 +3,7 @@
  *  ~/.claude/delegate/jobs/<jobId>/ 里写 status.json / events.jsonl / result.json，
  *  重启后的会话据此列出作业、看进度、取消、插话。 */
 
-export type Agent = 'flash' | 'pro' | 'gpt'
+export type Agent = 'flash' | 'pro' | 'gpt' | 'agy'
 export type Mode = 'read' | 'work'
 export type Ptc = 'only' | 'off'
 export type JobStatus = 'running' | 'done' | 'failed' | 'cancelled' | 'orphaned'
@@ -156,7 +156,7 @@ const str = (v: unknown): string => (typeof v === 'string' ? v : '')
 const num = (v: unknown): number | undefined =>
   typeof v === 'number' && Number.isFinite(v) ? v : undefined
 
-const agentOf = (v: unknown): Agent => (v === 'pro' || v === 'gpt' ? v : 'flash')
+const agentOf = (v: unknown): Agent => (v === 'pro' || v === 'gpt' || v === 'agy' ? v : 'flash')
 
 /** 额外可读目录：只留非空字符串，去掉末尾分隔符并去重（Windows 上不区分大小写）。空数组就是“没有”。 */
 export const normalizeReadPaths = (raw: unknown): string[] => {

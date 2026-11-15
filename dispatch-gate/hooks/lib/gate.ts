@@ -96,7 +96,12 @@ const WRITING_CODE = /\b(?:tools\s*\.\s*(?:write|edit|replace|batch|bash|paralle
 const CLAUDE_AGENT = new Set(['Agent', 'Task'])
 
 /** Dispatching to DeepSeek: never limited, and it clears the self-work count. */
-const DELEGATE = new Set(['mcp__delegate__delegate_flash', 'mcp__delegate__delegate_pro'])
+const DELEGATE = new Set([
+  'mcp__delegate__delegate_agy',
+  'mcp__delegate__delegate_flash',
+  'mcp__delegate__delegate_pro',
+  'mcp__delegate__delegate_gpt',
+])
 
 /** The host's own bookkeeping: neither counted nor cleared. */
 const BOOK = new Set([
@@ -441,11 +446,11 @@ const judgeAgentWindow = (state: State, config: Config, now: number): string | u
 
 /** L1: the reminder injected once per streak, after the batch that earned it. */
 export const remindText = (requests: number): string =>
-  `dispatch-gate：主会话已连续 ${requests} 个执行请求，没有派发。如果剩下的工作值得派（能并行、输出长、可以挪到 DS 省额度），按文件集合打包交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件。交代任务比自己做还长、结果马上要用于下一步判断、或只能主会话做的（探针、浏览器、交互式调试），继续自己做即可。`
+  `dispatch-gate：主会话已连续 ${requests} 个执行请求，没有派发。如果剩下的工作值得派（能并行、输出长、可以挪到 AGY 省额度），按文件集合打包交给 mcp__delegate__delegate_agy（4h 不可用时用 delegate_flash），写清要改的文件、验收标准和不要碰的文件。交代任务比自己做还长、结果马上要用于下一步判断、或只能主会话做的（探针、浏览器、交互式调试），继续自己做即可。`
 
 /** L2: the one refusal per streak, given at the tool call that would keep going. */
 export const denyText = (requests: number, cooldownMinutes: number): string =>
-  `dispatch-gate（软拦截，可直接重试）：主会话已连续 ${requests} 个执行请求没有派发。如果剩下的工作能按文件集合打成 1–2 个工作包，建议交给 mcp__delegate__delegate_flash，写清要改的文件、验收标准和不要碰的文件。如果改法已定、交接比自己做更费事，或者只能主会话做，重新调用同一个工具即可放行。${cooldownMinutes > 0 ? `放行后 ${cooldownMinutes} 分钟内不会再拦，期间最多只有提醒。` : '放行后这一段不会再拦。'}`
+  `dispatch-gate（软拦截，可直接重试）：主会话已连续 ${requests} 个执行请求没有派发。如果剩下的工作能按文件集合打成 1–2 个工作包，建议交给 mcp__delegate__delegate_agy（4h 不可用时用 delegate_flash），写清要改的文件、验收标准和不要碰的文件。如果改法已定、交接比自己做更费事，或者只能主会话做，重新调用同一个工具即可放行。${cooldownMinutes > 0 ? `放行后 ${cooldownMinutes} 分钟内不会再拦，期间最多只有提醒。` : '放行后这一段不会再拦。'}`
 
 /** The refusal of a Claude subagent dispatched past the hourly limit. */
 export const agentDenyText = (count: number): string =>

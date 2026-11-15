@@ -75,6 +75,24 @@ const PANE = 'delegate'
 const toolOf = (tier: Tier): string => `mcp__delegate__delegate_${tier}`
 // gpt is a target like a tier, but it has no slot: the model is chosen per call and CPA supplies the endpoint.
 const GPT_TOOL = 'mcp__delegate__delegate_gpt'
+const AGY_TOOL = 'mcp__delegate__delegate_agy'
+
+// ── AGY：官方 Antigravity CLI（agy.exe）走 Antigravity 订阅，不经 CPA、不碰 token。 ──
+const AGY_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const
+type AgyEffort = (typeof AGY_EFFORTS)[number]
+const isAgyEffort = (v: unknown): v is AgyEffort => typeof v === 'string' && (AGY_EFFORTS as readonly string[]).includes(v)
+/** '4h'（默认，Gemini 4 Hydrogen）/ '4a'（Gemini 4 Argon，高一档）/ agy models 里的完整模型名 → 实际模型名。 */
+const agyModelOf = (wanted: unknown, effort: unknown): string | { error: string } => {
+  const w = typeof wanted === 'string' && wanted.trim() !== '' ? wanted.trim().toLowerCase() : '4h'
+  const ef: AgyEffort = isAgyEffort(effort) ? effort : effort === 'max' ? 'xhigh' : 'medium'
+  if (w === '4h' || w === 'hydrogen') return `gemini-4-hydrogen-${ef}`
+  // Argon 只有 low / medium / high
+  if (w === '4a' || w === 'argon') return `gemini-4-argon-${ef === 'xhigh' ? 'high' : ef}`
+  if (/^[a-z0-9][a-z0-9.-]+$/.test(w) && w.includes('-')) return w
+  return { error: `delegate_agy 不认识模型「${String(wanted)}」：用 '4h'（默认）、'4a'，或 agy models 列出的完整名称` }
+}
+const agyLabel = (model: string, flags: { background: boolean; work: boolean }): string =>
+  `AGY ${model}${flags.work ? ' · 可改文件' : ' · 只读'}${flags.background ? ' · 后台' : ''}`
 const STORE_KEY = 'cfg'
 // 旧版把全部作业挤在这一个 key 里；现在每条作业单独 job:<id>，这张表只当镜像和迁移用。
 const JOBS_KEY = 'jobs'
@@ -222,6 +240,45 @@ const describeOne = async ($: EngineInterface, config: Config, tier: Tier): Prom
   }
 }
 
+// delegate_agy: Gemini through the official Antigravity CLI (Antigravity subscription), not through CPA.
+const describeAgy = async ($: EngineInterface): Promise<void> => {
+  try {
+    await $.tool.register({
+      name: 'delegate_agy',
+      description:
+        '【agy 档】把执行活交给 Antigravity 订阅里的 Gemini（官方 agy CLI，无界面运行，不占 Claude 额度，也不占 DS 日额度）。日常执行默认用它（模型 4h = Gemini 4 Hydrogen）；更难的活传 model:"4a"（Gemini 4 Argon）。子代理用 agy 自带的读写文件、编辑、跑命令工具，在 cwd 下工作，做完返回最终报告和 agent ID（agy 会话 id，可 resume）。read 模式按 agy 的 plan 模式只读运行。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: '自包含的任务说明' },
+          model: {
+            type: 'string',
+            description: "默认 '4h'（Gemini 4 Hydrogen），日常都用它；'4a'（Gemini 4 Argon）高一档，只在 4h 不稳或真正难的活用；也可传 agy models 列出的完整模型名",
+          },
+          mode: { type: 'string', enum: ['read', 'work'], description: 'read 只读（默认）；work 可改文件和跑命令' },
+          cwd: { type: 'string', description: '工作目录；不填用当前会话的' },
+          effort: {
+            type: 'string',
+            enum: ['low', 'medium', 'high', 'xhigh'],
+            description: '思考强度，映射到模型档位（如 gemini-4-hydrogen-high），不填 medium；Argon 最高 high',
+          },
+          background: {
+            type: 'boolean',
+            description: 'true：立即返回，完成后自动通知你（你有别的事可做、任务较久时用）；默认 false：等它做完再继续',
+          },
+          resume: {
+            type: 'string',
+            description: '上次返回的 agent ID：接着那个 agy 会话继续（沿用它的模型、mode 和目录；显式传则覆盖）',
+          },
+        },
+        required: ['task'],
+      },
+    })
+  } catch (error) {
+    $.ui.log(`delegate: agy tool not registered: ${messageOf(error)}`, { to: 'debug' })
+  }
+}
+
 // delegate_gpt: GPT through the local CPA proxy (ChatGPT subscription). No provider, no key, no slot to set up.
 const describeGpt = async ($: EngineInterface): Promise<void> => {
   try {
@@ -359,7 +416,7 @@ const runJob = async (
   $: EngineInterface,
   job: Record<string, unknown>,
 ): Promise<JobReply> => {
-  const script = `${$.plugin.root}/scripts/run-delegate.mjs`
+  const script = `${$.plugin.root}/scripts/${job.agy === true ? 'run-agy.mjs' : 'run-delegate.mjs'}`
   const input = JSON.stringify(job)
   try {
     let stdout = ''
@@ -559,7 +616,9 @@ const testAction = async ($: EngineInterface, target: Agent): Promise<void> => {
     maxTurns: 3,
     timeoutMs: 90_000,
   }
-  if (target === 'gpt') {
+  if (target === 'agy') {
+    Object.assign(job, { agy: true, model: agyModelOf(undefined, undefined) })
+  } else if (target === 'gpt') {
     // 和 delegate_gpt 走同一条路：来源是自定义供应商时用它自己的默认模型和前缀。
     const config = await loadConfig($)
     const source = gptSourceOf(config)
@@ -947,7 +1006,7 @@ const noteDsUsage = async (
   parts: UsageParts | undefined,
   force: boolean,
 ): Promise<void> => {
-  if (rec.tier === 'gpt') return
+  if (rec.tier === 'gpt' || rec.tier === 'agy') return
   const entry = entryOf(rec.jobId, rec.at, parts)
   dsLedger = upsertEntry(dsLedger, entry)
   const today = localDate(Date.now())
@@ -973,7 +1032,7 @@ const syncDsUsage = async ($: EngineInterface): Promise<void> => {
   const today = localDate(Date.now())
   const root = await rootOf($)
   for (const rec of records) {
-    if (rec.tier === 'gpt') continue
+    if (rec.tier === 'gpt' || rec.tier === 'agy') continue
     if (localDate(rec.at) !== today && rec.status !== 'running') continue
     if (dsLedger[rec.jobId] !== undefined) continue
     let parts: UsageParts | undefined
@@ -1246,7 +1305,17 @@ const callTool = async (
   if (gptModel !== undefined && typeof gptModel !== 'string') {
     return { result: `delegate: ${gptModel.error}`, isError: true }
   }
-  const resolved = target === 'gpt' ? undefined : resolveTier(config, target)
+  // agy：模型由这次调用决定（默认 4h），resume 没传 model/effort 时沿用原作业的模型。
+  const agyModel =
+    target === 'agy'
+      ? input.model === undefined && input.effort === undefined && old?.tier === 'agy' && old.model !== ''
+        ? old.model
+        : agyModelOf(input.model, input.effort)
+      : undefined
+  if (agyModel !== undefined && typeof agyModel !== 'string') {
+    return { result: `delegate: ${agyModel.error}`, isError: true }
+  }
+  const resolved = target === 'gpt' || target === 'agy' ? undefined : resolveTier(config, target)
   if (resolved !== undefined && 'error' in resolved) {
     return { result: `delegate: ${resolved.error}`, isError: true }
   }
@@ -1261,7 +1330,9 @@ const callTool = async (
   const readPathsActive = mode === 'read' && ptc === 'only' && readPaths.length > 0
   const background = input.background === true
   const label =
-    target === 'gpt'
+    target === 'agy'
+      ? agyLabel(agyModel as string, { background, work: mode === 'work' })
+      : target === 'gpt'
       ? gptLabel(
           gptShownModel(config, gptModel as string, gptSource),
           { background, work: mode === 'work' },
@@ -1269,7 +1340,9 @@ const callTool = async (
         )
       : callLabel(config, target, { background, work: mode === 'work' })
   const effort =
-    target === 'gpt'
+    target === 'agy'
+      ? undefined // agy 的强度已经编码在模型名里
+      : target === 'gpt'
       ? // GPT 最低 medium：不填或传 low 都按 medium 跑
         input.effort === 'high' || input.effort === 'xhigh' || input.effort === 'max'
         ? input.effort
@@ -1302,21 +1375,24 @@ const callTool = async (
   // gpt carries no url/key: the runner asks ensure_cpa.py for them (and starts CPA if it is down).
   // The wire model keeps the provider prefix (CPA routes on it); the job record stores the bare one.
   const job =
-    resolved === undefined
+    target === 'agy'
+      ? { ...common, agy: true, model: agyModel as string }
+      : resolved === undefined
       ? { ...common, gpt: true, model: gptWireModel(gptSource, gptModel as string), effort }
       : { ...common, model: resolved.modelId, effort: effort ?? resolved.effort }
-  const modelId = resolved === undefined ? String(gptModel) : resolved.modelId
+  const modelId = target === 'agy' ? String(agyModel) : resolved === undefined ? String(gptModel) : resolved.modelId
   // 开跑前就记下来（status=running），宿主重启后也还能按 agent ID 找回这个代理。
   // 新建任务给一个 UUID 让 runner 用 --session-id 传下去；resume 不传，沿用旧 id。
   const at = Date.now()
   const jobId = nextJobId(background)
-  const sessionId = resume === '' ? uuid() : undefined
+  // agy 自己分配会话 id（runner 从 init 事件取回），这里不预先生成。
+  const sessionId = resume === '' && target !== 'agy' ? uuid() : undefined
   const record: JobRecord = {
     jobId,
     sessionId: sessionId ?? resume,
     tier: target,
     model: modelId,
-    ...(typeof job.effort === 'string' ? { effort: job.effort } : {}),
+    ...('effort' in job && typeof job.effort === 'string' ? { effort: job.effort } : {}),
     cwd: recordedCwd,
     mode,
     ptc,
@@ -1382,7 +1458,7 @@ const settle = async (
   const tail = note === '' ? '' : `\n${note}`
   // DS 每日用量：结束时把这条作业的总量覆盖进账本（反复更新不会重复加）；跨零点仍记在开始那天。
   let usageNote = ''
-  if (record.tier !== 'gpt') {
+  if (record.tier === 'flash' || record.tier === 'pro') {
     try {
       await refreshDsUsage($, true)
       await noteDsUsage($, record, partsOf(reply.usageParts), true)
@@ -1869,6 +1945,7 @@ const AGENT_TAG: Record<Agent, { text: string; color: string; bg: string }> = {
   flash: { text: 'DS flash', color: '#6cb6ff', bg: '#132e4a' },
   pro: { text: 'DS pro', color: '#a8a2ff', bg: '#2a2556' },
   gpt: { text: 'GPT', color: '#4ac26b', bg: '#14331f' },
+  agy: { text: 'AGY', color: '#f2a65a', bg: '#3d2a14' },
 }
 const DOT: Record<JobRecord['status'], { glyph: string; color: string }> = {
   running: { glyph: '●', color: 'suggestion' },
@@ -1963,7 +2040,7 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         // DS 今日用量：先按 TTL 合并别的会话的账本，再把运行中作业的最新总量覆盖进去（同一作业不会重复加）。
         await refreshDsUsage($)
         for (const r of running) {
-          const parts = r.tier === 'gpt' ? undefined : partsOf(statuses[r.jobId]?.usage)
+          const parts = r.tier === 'gpt' || r.tier === 'agy' ? undefined : partsOf(statuses[r.jobId]?.usage)
           if (parts !== undefined) await noteDsUsage($, r, parts, false)
         }
         // 请示要播报给主会话，和面板开没开无关，所以放在下面的面板判断之前。
@@ -2070,12 +2147,13 @@ export const register: Register = on => {
       await $.command.register({
         name: COMMAND,
         description: '管理委派用的供应商、API key 与 flash / pro 两个模型位（面板）；gpt 走本机 CPA，不用配置；也列作业、看进度、取消、插话',
-        argumentHint: '[live | list | status <id> | cancel <id> | send <id> <话> | test flash|pro|gpt]',
+        argumentHint: '[live | list | status <id> | cancel <id> | send <id> <话> | test flash|pro|gpt|agy]',
         // 前台 delegate 调用会把主模型卡在工具调用上，取消只能靠人在这里下命令。
         immediate: true,
       })
       await describeTool($, await loadConfig($))
       await describeGpt($)
+      await describeAgy($)
       await describeJobTools($)
       // 重启后：补发没发出去的后台通知，把进程没了的 running 标成 orphaned（仍可 resume）。
       await recoverJobs($)
@@ -2095,7 +2173,7 @@ export const register: Register = on => {
     const [sub, ...rest] = args === '' ? [] : args.split(/\s+/)
     const tail = args.replace(/^\S+\s*/, '')
     if (sub === 'test') {
-      await testAction($, rest[0] === 'gpt' ? 'gpt' : (parseTier(rest[0]) ?? 'flash'))
+      await testAction($, rest[0] === 'gpt' || rest[0] === 'agy' ? rest[0] : (parseTier(rest[0]) ?? 'flash'))
 
       return { text: await read($, flashAtom) }
     }
@@ -2191,6 +2269,33 @@ export const register: Register = on => {
     } catch (error) {
       return { result: `delegate: ${messageOf(error)}`, isError: true as const }
     }
+  })
+
+  on('tool.call', { tool: AGY_TOOL }, async ($, e) => {
+    try {
+      return await callTool($, 'agy', e as unknown as Record<string, unknown>)
+    } catch (error) {
+      return { result: `delegate: ${messageOf(error)}`, isError: true as const }
+    }
+  })
+
+  on('ui.render', { component: 'ToolUse', tool: AGY_TOOL }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const input = (typeof e.input === 'object' && e.input !== null ? e.input : {}) as Record<string, unknown>
+    const m = agyModelOf(input.model, input.effort)
+    const label = agyLabel(typeof m === 'string' ? m : String(input.model ?? '4h'), {
+      background: input.background === true,
+      work: input.mode === 'work',
+    })
+
+    return (
+      <Box>
+        <Text bold>delegate</Text>
+        <Text> {label}</Text>
+        {e.isRunning && <Text dimColor> · 运行中…</Text>}
+        {e.isErrored && <Text color="red"> · 失败</Text>}
+      </Box>
+    )
   })
 
   on('tool.call', { tool: GPT_TOOL }, async ($, e) => {
