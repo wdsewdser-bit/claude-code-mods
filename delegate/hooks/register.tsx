@@ -1073,8 +1073,11 @@ const SESSION_FALLBACK_MS = 5_000
 const OWNER_WAIT_MS = 3_000
 let lastSessionId: { id: string; at: number } | undefined
 // 派活写 owner 时传更长的 waitMs：拿不到 id 的作业会变成「无主」，重启补发时不知道该发给谁。
-const sessionOf = async ($: EngineInterface, waitMs = SESSION_ID_WAIT_MS): Promise<string | undefined> => {
-  const id = await new Promise<string | undefined>(resolve => {
+// 投递不能使用别的会话留下的兜底 id；失效错误也必须交给计时器退场。
+const invalidSession = (error: unknown): boolean =>
+  /已失效|已过期|invalidat|expired|disposed|no longer (?:valid|active)|(?:scope|context|session|engine).*?(?:invalid|closed|ended)/i.test(messageOf(error))
+const sessionOf = async ($: EngineInterface, waitMs = SESSION_ID_WAIT_MS, fallback = true): Promise<string | undefined> => {
+  const id = await new Promise<string | undefined>((resolve, reject) => {
     let settled = false
     let timer: { cancel: () => void } | undefined
     const settle = (value: string | undefined): void => {
@@ -1087,14 +1090,18 @@ const sessionOf = async ($: EngineInterface, waitMs = SESSION_ID_WAIT_MS): Promi
     }
     try {
       timer = $.clock.after(waitMs, () => settle(undefined))
-    } catch {
+    } catch (error) {
+      if (!fallback && invalidSession(error)) reject(error)
       settle(undefined)
     }
     void Promise.resolve()
       .then(() => $.session.id())
       .then(
         value => settle(typeof value === 'string' && value !== '' ? value : undefined),
-        () => settle(undefined),
+        error => {
+          if (!fallback && invalidSession(error)) reject(error)
+          settle(undefined)
+        },
       )
   })
   if (id !== undefined) {
@@ -1106,7 +1113,7 @@ const sessionOf = async ($: EngineInterface, waitMs = SESSION_ID_WAIT_MS): Promi
   // 超时兜底：只用刚刚拿到的值，太旧就当拿不到（宁可当作「无会话」，也不把别的会话的 id 当成自己的）。
   const last = lastSessionId
 
-  return last !== undefined && Date.now() - last.at < SESSION_FALLBACK_MS ? last.id : undefined
+  return fallback && last !== undefined && Date.now() - last.at < SESSION_FALLBACK_MS ? last.id : undefined
 }
 
 /** 属于本会话的作业：旧记录没有 owner，只在「全部会话」里出现。 */
@@ -1456,8 +1463,7 @@ const callTool = async (
       // 计时器补一条“被中断”的通知，附改动摘要。
       record.notified = false
       await saveJob($, record).catch(() => undefined)
-      pendingNotify = true
-      nextNotifyAt = 0
+      notifyGeneration += 1
     }
     return done
   } finally {
@@ -1518,7 +1524,8 @@ const settle = async (
 
 // 终态通知只由 session.start 起的计时器发（它的 $ 跟会话一样长）：派活钩子的 $ 在钩子返回、
 // 调用被打断或热重载之后，prompt.submit 可能不报错却送不进会话，记成已通知就再也补不回来。
-let pendingNotify = false
+// 广播代数：每个会话各记进度，不能让一个会话把别人的唤醒信号清掉。
+let notifyGeneration = 0
 // 每分钟巡检一次：runner 结束了、或者死了，都由这里收尾和补发，不依赖发起作业的那次调用还活着。
 const SWEEP_MS = 60_000
 let nextSweepAt = 0
@@ -1527,7 +1534,6 @@ const ownJobs = new Set<string>()
 // 刚派出的作业给 runner 留这么久写出 status.json。
 const START_GRACE_MS = 5 * 60_000
 const NOTIFY_WINDOW_MS = 2 * 3_600_000
-let nextNotifyAt = 0
 
 /** 把一条通知送进会话；被钩子 drop 或抛错都算没送到。 */
 const deliver = async ($: EngineInterface, text: string): Promise<boolean> => {
@@ -1539,6 +1545,7 @@ const deliver = async ($: EngineInterface, text: string): Promise<boolean> => {
     }
     return true
   } catch (error) {
+    if (invalidSession(error)) throw error
     $.ui.log(`delegate: 通知没送出去：${messageOf(error)}`, { to: 'debug' })
     return false
   }
@@ -1599,8 +1606,7 @@ const runBackground = async (
       }
     } catch {}
     // 交给计时器投递：它用会话级的 $，送不进去会每分钟再试。先置位，存盘失败也会补。
-    pendingNotify = true
-    nextNotifyAt = 0
+    notifyGeneration += 1
     record.notified = false
     await saveJob($, record)
   } catch (error) {
@@ -1850,43 +1856,51 @@ const notifyDone = async ($: EngineInterface, rec: JobRecord): Promise<boolean> 
   return await deliver($, `${saved !== undefined && saved !== '' ? `【delegate 后台任务 ${rec.jobId} ${endWord(rec.status, askTimeout)}】` : head}\n${lead}${body}${changes}${where}${next}`)
 }
 
-// 会话启动和计时器都会补发：同一时刻只跑一遍，后到的等前一遍的结果，免得同一条通知发两次。
-let recovering: Promise<boolean> | undefined
-const recoverJobs = async ($: EngineInterface): Promise<boolean> => {
-  if (recovering !== undefined) return await recovering
-  recovering = recoverOnce($).finally(() => {
-    recovering = undefined
+// 只让同一会话的补发单飞，A 等待 submit 时不能挡住 B。
+const recovering = new Map<string, Promise<boolean>>()
+const recoverJobs = async ($: EngineInterface, me: string): Promise<boolean> => {
+  const current = recovering.get(me)
+  if (current !== undefined) return await current
+  const recovery = recoverOnce($, me).finally(() => {
+    if (recovering.get(me) === recovery) recovering.delete(me)
   })
-
-  return await recovering
+  recovering.set(me, recovery)
+  return await recovery
 }
 
-// 在后台补发，不 await：prompt.submit 要等会话空闲才返回，等在 session.start 或计时器里会让
-// 计时器起不来或整拍卡住（面板、请示播报、之后的通知全停）。没补完的一分钟后由计时器再来。
-const kickRecovery = ($: EngineInterface): void => {
+type DeliveryState = { pending: boolean; generation: number; nextNotifyAt: number }
+// 不等 submit 返回：面板刷新、别的会话、之后的请示都不该被它挡住。
+const kickRecovery = ($: EngineInterface, me: string, state: DeliveryState, fail: (error: unknown) => void): void => {
+  if (recovering.has(me)) return
+  state.pending = false
   const retry = (): void => {
-    pendingNotify = true
-    nextNotifyAt = Date.now() + 60_000
+    state.pending = true
+    state.nextNotifyAt = Date.now() + SWEEP_MS
   }
-  void recoverJobs($).then(
-    ok => {
-      if (!ok) retry()
-    },
-    error => {
-      retry()
-      $.ui.log(`delegate: 补发出错：${messageOf(error)}`, { to: 'debug' })
-    },
-  )
+  void recoverJobs($, me).then(ok => {
+    if (!ok) retry()
+  }, error => {
+    retry()
+    fail(error)
+  })
 }
 
-const recoverOnce = async ($: EngineInterface): Promise<boolean> => {
+const freshNotice = (r: JobRecord): boolean => Date.now() - (r.endedAt ?? r.at) < NOTIFY_WINDOW_MS
+// 只有不含 submit 的磁盘维护共享单飞，避免两会话同时收尾同一记录、覆盖 notified。
+let collectingRecovery: Promise<JobRecord[]> | undefined
+const collectRecovery = async ($: EngineInterface): Promise<JobRecord[]> => {
+  if (collectingRecovery !== undefined) return copyJobs(await collectingRecovery)
+  const work = collectRecoveryOnce($).finally(() => {
+    if (collectingRecovery === work) collectingRecovery = undefined
+  })
+  collectingRecovery = work
+  return copyJobs(await work)
+}
+const collectRecoveryOnce = async ($: EngineInterface): Promise<JobRecord[]> => {
   const records = await listJobs($)
-  if (records.length === 0) return true
+  if (records.length === 0) return []
   const root = await rootOf($)
-  const me = await sessionOf($)
   const pending: JobRecord[] = []
-  // 两小时以前结束的不再补发：早就没人在等它了。
-  const fresh = (r: JobRecord): boolean => Date.now() - (r.endedAt ?? r.at) < NOTIFY_WINDOW_MS
   for (const rec of records) {
     if (rec.status === 'running') {
       if (ownJobs.has(rec.jobId)) continue
@@ -1910,7 +1924,7 @@ const recoverOnce = async ($: EngineInterface): Promise<boolean> => {
         rec.status = 'orphaned'
         rec.endedAt = status?.updatedAt ?? status?.endedAt ?? Date.now()
         // 很久以前就停了的不再推送：只当场记成已通知，免得每次重启把历史孤儿作业刷一遍。
-        if (!fresh(rec)) rec.notified = true
+        if (!freshNotice(rec)) rec.notified = true
         await saveJob($, rec)
         if (rec.background && rec.notified !== true) pending.push(rec)
       }
@@ -1922,10 +1936,15 @@ const recoverOnce = async ($: EngineInterface): Promise<boolean> => {
       pending.push(rec)
     }
   }
+  return pending
+}
+
+const recoverOnce = async ($: EngineInterface, me: string): Promise<boolean> => {
+  const pending = await collectRecovery($)
   // 别的会话派的作业不在这里补发：那边恢复时自己会补。
   // 无主作业（派活时没拿到会话 id）也不补：否则谁先恢复就发给谁，会投到无关会话里；它们仍在面板「全部会话」里可见。
   let allSent = true
-  for (const rec of pending.filter(r => me !== undefined && r.owner === me && fresh(r)).slice(0, 5)) {
+  for (const rec of pending.filter(r => r.owner === me && freshNotice(r)).slice(0, 5)) {
     try {
       // 发之前按 store 里的最新记录再确认一次：别处可能刚通知过。
       const latest = await loadJob($, rec.jobId)
@@ -1946,6 +1965,9 @@ const recoverOnce = async ($: EngineInterface): Promise<boolean> => {
       await saveJob($, rec)
     } catch (error) {
       allSent = false
+      rec.notified = false
+      await saveJob($, rec).catch(() => undefined)
+      if (invalidSession(error)) throw error
       $.ui.log(`delegate: 补发 ${rec.jobId} 的通知失败：${messageOf(error)}`, { to: 'debug' })
     }
   }
@@ -2179,20 +2201,24 @@ const notifyAsks = async (
     if (ask === undefined || ask.seq <= (askNotified.get(rec.jobId) ?? 0)) continue
     const agent = st?.sessionId ?? rec.sessionId ?? '?'
     const body = ask.text.trim() === '' ? '（请示内容为空，用 delegate_status 看它的进度）' : ask.text.trim()
+    // 先占位，submit 等待期间的新计时器也不能重复发同一 seq；失败才回滚。
+    const previous = askNotified.get(rec.jobId)
+    askNotified.set(rec.jobId, ask.seq)
+    let sent = false
     try {
-      await $.prompt.submit({
-        text: `【delegate 后台任务 ${rec.jobId} 请示】（agent ${agent}）\n${body}\n用 delegate_send("${rec.jobId}", "你的决定") 回复，它会在原进程里接着做；${askMinutesOf(st)} 分钟内没有回复，它会结束，之后可以用 resume 续做。`,
-      })
-      askNotified.set(rec.jobId, ask.seq)
-    } catch (error) {
-      $.ui.log(`delegate: ${rec.jobId} 的请示没通知出去：${messageOf(error)}`, { to: 'debug' })
+      sent = await deliver($, `【delegate 后台任务 ${rec.jobId} 请示】（agent ${agent}）\n${body}\n用 delegate_send("${rec.jobId}", "你的决定") 回复，它会在原进程里接着做；${askMinutesOf(st)} 分钟内没有回复，它会结束，之后可以用 resume 续做。`)
+    } finally {
+      if (!sent && askNotified.get(rec.jobId) === ask.seq) {
+        if (previous === undefined) askNotified.delete(rec.jobId)
+        else askNotified.set(rec.jobId, previous)
+      }
     }
   }
 }
 
 // 每 2 秒看一眼：面板开着、有作业在跑、且作业状态确实变了才重绘；作业刚停时再画一次收尾。
 // 不能无条件每秒重绘：宿主里每次读取都要跨进程，一次绘制可能超过 1 秒，会被下一次重绘打断，面板永远画不出来。
-// 只在 session.start 里起一次：那里的 $ 跟会话一样长，派活钩子里的 $ 钩子返回就失效（后台作业的请示也靠它播报）。
+// 面板/额度仍只有一条刷新路径，投递则每个 session.start 各起一条。
 let liveWasRunning = false
 let liveBusy = false
 let liveSig = ''
@@ -2209,77 +2235,125 @@ const paneOpen = async ($: EngineInterface): Promise<boolean> => {
     return livePaneOpen // 问不出来就沿用上一轮的判断，别把面板刷新停掉
   }
 }
+// Map 只存控制器，不存 $（宿主不允许把 $ 当普通值保存）。
+type DeliveryTimer = { serial: number; cancel: () => void }
+const deliveryTimers = new Map<string, DeliveryTimer>()
+let deliverySerial = 0
 const ensureLiveTimer = ($: EngineInterface): void => {
-  if (liveTimer !== undefined) return
-  try {
-    liveTimer = $.clock.every(2000, () => {
-      if (liveBusy) return
-      liveBusy = true
-      void (async () => {
-        await pollLogin($)
-        // 闲着时也按 TTL 刷新 GPT 额度，按钮栏才不会停在旧读数上（refreshQuota 自己会触发重绘）。
-        await refreshQuota($)
-        await refreshAgyQuota($)
-        // 面板没开、本进程也没有作业在跑：这一轮不读 store。新派的作业 saveJob 会置 liveJobsRunning，
-        // 打开面板会置 livePaneOpen，下一轮自动接上，不用重建计时器。
-        if (Date.now() >= nextSweepAt) {
-          nextSweepAt = Date.now() + SWEEP_MS
-          pendingNotify = true
-        }
-        if (!liveJobsRunning && !livePaneOpen && !pendingNotify) return
-        if (pendingNotify && Date.now() >= nextNotifyAt && recovering === undefined) {
-          // 结束了的作业由这里发通知；没送进去的每分钟再试，送到为止。
-          pendingNotify = false
-          kickRecovery($)
-        }
-        const all = await listJobs($)
-        const running = all.filter(r => r.status === 'running')
-        // 作业结束了就不再惦记它的请示。
-        for (const r of all) if (r.status !== 'running') askNotified.delete(r.jobId)
-        // 面板开着就一直刷新；这里同时把上一轮的判断收回（面板关了下一轮开头就早退）。
-        livePaneOpen = await paneOpen($)
-        if (running.length === 0 && !liveWasRunning) return
-        const stopped = running.length === 0
-        liveWasRunning = !stopped
-        const root = await rootOf($)
-        const statuses: Record<string, JobStatusFile> = {}
-        for (const r of running) {
-          const st = root === undefined ? undefined : await readStatus($, jobDir(root, r.jobId))
-          if (st !== undefined) statuses[r.jobId] = st
-        }
-        // DS 今日用量：先按 TTL 合并别的会话的账本，再把运行中作业的最新总量覆盖进去（同一作业不会重复加）。
-        await refreshDsUsage($)
-        for (const r of running) {
-          const parts = r.tier === 'gpt' || r.tier === 'agy' ? undefined : partsOf(statuses[r.jobId]?.usage)
-          if (parts !== undefined) await noteDsUsage($, r, parts, false)
-        }
-        // 请示要播报给主会话，和面板开没开无关，所以放在下面的面板判断之前。
-        // 只播报本会话派的作业：别的会话的请示由那边自己的计时器播报。
-        if (!stopped) {
-          const me = await sessionOf($)
-          await notifyAsks($, running.filter(r => r.owner === undefined || r.owner === me), statuses)
-        }
-        if (!stopped && !livePaneOpen) return
-        let sig = ''
-        for (const r of running) {
-          const st = statuses[r.jobId]
-          sig += `${r.jobId}:${st?.turns ?? 0};`
-        }
-        // 不用 updatedAt：流式作业每个事件都改它，会 2 秒重绘一次；绘制慢于 2 秒时次次被打断，面板一直空白。
-        // 轮数变了才重绘，耗时显示最多 10 秒刷新一次。
-        sig += String(Math.floor(Date.now() / 10_000))
-        if (!stopped && sig === liveSig) return
-        liveSig = sig
-        await requestRedraw($)
-      })()
-        .catch(error => $.ui.log(`delegate: 面板计时出错：${messageOf(error)}`, { to: 'debug' }))
-        .finally(() => {
-          liveBusy = false
-        })
-    })
-  } catch {
-    liveTimer = undefined
+  let timer: { cancel: () => void } | undefined
+  let stopped = false
+  let busy = false
+  let registeredId: string | undefined
+  const state: DeliveryState = { pending: true, generation: notifyGeneration, nextNotifyAt: 0 }
+  const control: DeliveryTimer = { serial: ++deliverySerial, cancel: () => {
+    stopped = true
+    try { timer?.cancel() } catch {}
+    if (liveTimer === timer) liveTimer = undefined
+    if (registeredId !== undefined && deliveryTimers.get(registeredId) === control) deliveryTimers.delete(registeredId)
+  } }
+  const fail = (error: unknown): void => {
+    if (invalidSession(error)) control.cancel()
+    else {
+      try { $.ui.log(`delegate: 投递计时出错：${messageOf(error)}`, { to: 'debug' }) } catch { control.cancel() }
+    }
   }
+  const deliverTick = (): void => {
+    if (stopped || busy) return
+    busy = true
+    void (async () => {
+      // 每拍重新取；启动时可能尚无 id，绝不能把 fallback id 固定在闭包里。
+      const me = await sessionOf($, SESSION_ID_WAIT_MS, false)
+      if (me === undefined || stopped) return
+      if (registeredId !== me) {
+        const previous = deliveryTimers.get(me)
+        // 较早启动的异步取 id 不能反过来取消较新的计时器。
+        if (previous !== undefined && previous.serial > control.serial) { control.cancel(); return }
+        previous?.cancel()
+        if (registeredId !== undefined && deliveryTimers.get(registeredId) === control) deliveryTimers.delete(registeredId)
+        registeredId = me
+        deliveryTimers.set(me, control)
+      }
+      if (Date.now() >= nextSweepAt) {
+        nextSweepAt = Date.now() + SWEEP_MS
+        notifyGeneration += 1
+      }
+      if (state.generation !== notifyGeneration) {
+        state.generation = notifyGeneration
+        state.pending = true
+        state.nextNotifyAt = 0
+      }
+      if (state.pending && Date.now() >= state.nextNotifyAt) kickRecovery($, me, state, fail)
+      if (!liveJobsRunning) return
+      const all = await listJobs($)
+      for (const rec of all) if (rec.status !== 'running') askNotified.delete(rec.jobId)
+      const running = all.filter(r => r.status === 'running' && r.owner === me)
+      const root = await rootOf($)
+      const statuses: Record<string, JobStatusFile> = {}
+      for (const rec of running) {
+        const st = root === undefined ? undefined : await readStatus($, jobDir(root, rec.jobId))
+        if (st !== undefined) statuses[rec.jobId] = st
+      }
+      if (!stopped) await notifyAsks($, running, statuses)
+    })().catch(fail).finally(() => { busy = false })
+  }
+  const panelTick = (): void => {
+    if (stopped) return
+    if (liveTimer === undefined) liveTimer = timer
+    if (liveTimer !== timer || liveBusy) return
+    liveBusy = true
+    void (async () => {
+      await pollLogin($)
+      // 闲着时也按 TTL 刷新 GPT 额度，按钮栏才不会停在旧读数上（refreshQuota 自己会触发重绘）。
+      await refreshQuota($)
+      await refreshAgyQuota($)
+      // 面板没开、本进程也没有作业在跑：这一轮不读 store。新派的作业 saveJob 会置 liveJobsRunning，
+      // 打开面板会置 livePaneOpen，下一轮自动接上，不用重建计时器。
+      if (!liveJobsRunning && !livePaneOpen) return
+      const all = await listJobs($)
+      const running = all.filter(r => r.status === 'running')
+      // 作业结束了就不再惦记它的请示。
+      for (const r of all) if (r.status !== 'running') askNotified.delete(r.jobId)
+      // 面板开着就一直刷新；这里同时把上一轮的判断收回（面板关了下一轮开头就早退）。
+      livePaneOpen = await paneOpen($)
+      if (running.length === 0 && !liveWasRunning) return
+      const stopped = running.length === 0
+      liveWasRunning = !stopped
+      const root = await rootOf($)
+      const statuses: Record<string, JobStatusFile> = {}
+      for (const r of running) {
+        const st = root === undefined ? undefined : await readStatus($, jobDir(root, r.jobId))
+        if (st !== undefined) statuses[r.jobId] = st
+      }
+      // DS 今日用量：先按 TTL 合并别的会话的账本，再把运行中作业的最新总量覆盖进去（同一作业不会重复加）。
+      await refreshDsUsage($)
+      for (const r of running) {
+        const parts = r.tier === 'gpt' || r.tier === 'agy' ? undefined : partsOf(statuses[r.jobId]?.usage)
+        if (parts !== undefined) await noteDsUsage($, r, parts, false)
+      }
+      if (!stopped && !livePaneOpen) return
+      let sig = ''
+      for (const r of running) {
+        const st = statuses[r.jobId]
+        sig += `${r.jobId}:${st?.turns ?? 0};`
+      }
+      // 不用 updatedAt：流式作业每个事件都改它，会 2 秒重绘一次；绘制慢于 2 秒时次次被打断，面板一直空白。
+      // 轮数变了才重绘，耗时显示最多 10 秒刷新一次。
+      sig += String(Math.floor(Date.now() / 10_000))
+      if (!stopped && sig === liveSig) return
+      liveSig = sig
+      await requestRedraw($)
+    })().catch(fail).finally(() => { liveBusy = false })
+  }
+  try {
+    timer = $.clock.every(2000, () => {
+      deliverTick()
+      panelTick()
+    })
+    if (liveTimer === undefined) liveTimer = timer
+  } catch (error) { fail(error) }
+  // 保留启动时的孤儿维护（即使尚无会话 id），它不含通知投递。
+  void collectRecovery($).catch(fail)
+  deliverTick()
 }
 
 // 会话的界面通道坏掉时 $.ui.open 会一直不返回，派活也跟着卡住：限时 2 秒，到点就不等面板。
@@ -2367,9 +2441,8 @@ export const register: Register = on => {
     // 计时器最先起，且不等任何可能卡住的步骤：通知、请示播报、孤儿收尾全靠它。
     // 以前这里先 await recoverJobs —— 里面的 prompt.submit 要等会话空闲才返回，热重载撞上
     // 忙着的会话、又恰好有待补发的作业时，计时器就一直起不来，之后所有完成通知都发不出去。
-    // 现在只置位，由计时器下一拍在后台补发（重启后补发、标孤儿也在那里做）。
+    // 每次启动各起自己的投递路径；首拍也只在后台补发，绝不等 submit 返回。
     ensureLiveTimer($)
-    kickRecovery($)
     try {
       await describeTool($, await loadConfig($))
       await describeGpt($)
@@ -2591,15 +2664,19 @@ export const register: Register = on => {
     const msg = await read($, liveMsgAtom)
     const elapsed = (r: JobRecord): number => (r.endedAt ?? (r.status === 'running' ? now : r.at)) - r.at
     const turnsOf = (r: JobRecord): number => live[r.jobId]?.turns ?? r.turns ?? 0
-    const nRunning = jobs.filter(r => r.status === 'running').length
+    // 请示中的作业进程还活着、status 仍是 running，但它在等主会话回复，不是在干活。
+    const asking = (r: JobRecord): boolean => r.status === 'running' && live[r.jobId]?.phase === 'asking'
+    const statusOf = (r: JobRecord): string => (asking(r) ? '等待回复请示' : statusText(r.status))
+    const nAsking = jobs.filter(asking).length
+    const nRunning = jobs.filter(r => r.status === 'running').length - nAsking
     // 旧版只记了 tier/cwd/mode/开始时间：没有摘要、结束时间和事件文件。
     const legacy = (r: JobRecord): boolean => r.status !== 'running' && r.endedAt === undefined && r.summary === ''
     const titleOf = (r: JobRecord): string =>
       r.summary !== '' ? r.summary : `${r.mode === 'work' ? '改动' : '只读'} · ${r.cwd.split('/').filter(Boolean).at(-1) ?? '旧任务'}`
     const metaOf = (r: JobRecord): string =>
       legacy(r)
-        ? `${statusText(r.status)} · ${r.at > 0 ? `${spanOf(now - r.at)}前开始` : '时间未知'}`
-        : `${statusText(r.status)} · 第 ${turnsOf(r)} 轮 · ${spanOf(elapsed(r))}`
+        ? `${statusOf(r)} · ${r.at > 0 ? `${spanOf(now - r.at)}前开始` : '时间未知'}`
+        : `${statusOf(r)} · 第 ${turnsOf(r)} 轮 · ${spanOf(elapsed(r))}`
     void refreshQuota($).catch(() => undefined)
     // GPT 走自定义供应商时没有订阅额度，额度区整块不画。
     const config = await loadConfig($).catch(() => undefined)
@@ -2748,7 +2825,9 @@ export const register: Register = on => {
         : (live[sel.jobId] ?? (root === undefined ? undefined : await readStatus($, jobDir(root, sel.jobId))))
     const current =
       sel?.status === 'running'
-        ? s?.lastTool
+        ? s?.phase === 'asking'
+          ? '等待主会话回复请示（作业已停下，不在干活）'
+          : s?.lastTool
           ? `正在调用 ${s.lastTool.replace(/^mcp__[^_]+(?:-[^_]+)*__/, '')}`
           : (s?.phase ?? '启动中')
         : ''
@@ -2780,7 +2859,7 @@ export const register: Register = on => {
         <Box justifyContent="space-between" paddingX={2} paddingY={1}>
           <Text weight="semibold">☰ 委派任务</Text>
           <Text dimColor>
-            运行中 {nRunning} · 已完成 {nDone}
+            运行中 {nRunning}{nAsking > 0 ? ` · 等待回复 ${nAsking}` : ''} · 已完成 {nDone}
           </Text>
         </Box>
         <Box paddingX={2} marginTop={-1} marginBottom={1}>

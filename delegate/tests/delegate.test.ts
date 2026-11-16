@@ -656,7 +656,7 @@ const jobSetup = (
   on: never,
   reply: Record<string, unknown>,
   opts: { files?: Files; alive?: number[]; git?: string; mtimes?: Record<string, number>; dropSubmit?: boolean
-  hangSubmit?: boolean } = {},
+  hangSubmit?: boolean; submit?: (text: string) => unknown; run?: () => unknown } = {},
 ) => {
   const store = new Map<string, unknown>([
     ['cfg', normalize(undefined)],
@@ -714,6 +714,7 @@ const jobSetup = (
     return { value: { kind, size: 0, mtimeMs: 0, isLink: false } }
   })
   o('prompt.submit', (_$, e: { text: string }) => {
+    if (opts.submit !== undefined) return opts.submit(e.text)
     if (opts.hangSubmit === true) {
       submitted.push(e.text)
       return new Promise(() => undefined) // 会话一直不空闲：submit 永不返回
@@ -753,6 +754,7 @@ const jobSetup = (
       ),
     )
     runs.push(JSON.parse(e.init?.stdin ?? e.stdin ?? '{}'))
+    if (opts.run !== undefined && typeof runs.at(-1)?.jobId === 'string') return opts.run()
     return {
       value: {
         exitCode: 0,
@@ -1678,6 +1680,224 @@ describe('CPA settings and transactional migration', () => {
 // ---- 多会话共用进程：作业归属和面板开关不能串 --------------------------------
 
 describe('session scoping', () => {
+  // 每个 clock.every 派发都记住创建它的假会话；tick 只唤醒指定会话的
+  // 那一拍，而不是把所有计时器都伪装成当前打开的会话。
+  const deliverySessions = (on: never, holdRunner = false) => {
+    const o = on as (name: string, fn: (_$: unknown, e: never) => unknown) => void
+    let sessionId = 'sess-A'
+    let idError: string | undefined
+    const waits: { owner: string; resolve: (value: unknown) => void }[] = []
+    const delivered: { owner: string; text: string }[] = []
+    const attempts: { owner: string; text: string }[] = []
+    let submit: (text: string) => unknown = text => ({ text })
+    let finishRunner: () => void = () => undefined
+    o('session.id', () => {
+      if (idError !== undefined) return { deny: idError }
+      return { value: sessionId }
+    })
+    o('clock.after', () => new Promise(() => undefined))
+    o('clock.every', () => new Promise(resolve => waits.push({ owner: sessionId, resolve })))
+    const t = jobSetup(on, { ok: true, text: 'finished in B', sessionId: 'sid-B', turns: 1 }, { submit: async text => {
+      const owner = sessionId
+      attempts.push({ owner, text })
+      const result = await submit(text)
+      if (!(typeof result === 'object' && result !== null && 'drop' in result)) delivered.push({ owner, text })
+      return result
+    }, ...(holdRunner ? { run: () => new Promise(resolve => {
+      finishRunner = () => resolve({ value: {
+        exitCode: 0, stdout: JSON.stringify({ ok: true, text: 'finished in B', sessionId: 'sid-B', turns: 1 }) + '\n',
+        stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
+      } })
+    }) } : {}) })
+    const seed = (id: string, owner: string | undefined, status: 'running' | 'done' = 'running') => {
+      t.store.set(jobKey(id), {
+        jobId: id, sessionId: 'sid-B', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
+        background: true, status, at: Date.now(), summary: id, owner, notified: false,
+      })
+    }
+    const asking = (id: string, seq = 1) => t.files.set(`${ROOT}/${id}/status.json`, JSON.stringify({
+      jobId: id, phase: 'asking', sessionId: 'sid-B', ask: { seq, text: 'Should B continue?' },
+    }))
+    const tick = async (owner: string) => {
+      const index = waits.findIndex(w => w.owner === owner)
+      expect(index).toBeGreaterThanOrEqual(0)
+      sessionId = owner
+      waits.splice(index, 1)[0].resolve({ value: undefined })
+      await settle()
+    }
+    return { ...t, seed, asking, tick, waits, delivered, attempts, finishRunner: () => finishRunner(),
+      switchTo: (id: string) => { sessionId = id },
+      failId: (error: string | undefined) => { idError = error },
+      submitWith: (fn: (text: string) => unknown) => { submit = fn },
+    }
+  }
+
+  test('B asks only B once while A and B share the module; ownerless asks stay silent', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = deliverySessions(on as never, true)
+    t.seed('bg-no-owner', undefined)
+    await startSession($ as never)
+    t.switchTo('sess-B')
+    await startSession($ as never)
+    const ran = await jobCall($ as never, 'mcp__delegate__delegate_flash', { task: 'ask only B', background: true })
+    expect(text(ran)).toContain('后台任务 bg-')
+    await settle()
+    const id = String(t.runs.find(r => typeof r.jobId === 'string')?.jobId)
+    expect(jobOf(t.store, id).owner).toBe('sess-B')
+    t.asking(id)
+    t.asking('bg-no-owner')
+    await t.tick('sess-A')
+    expect(t.delivered).toHaveLength(0)
+    await t.tick('sess-B')
+    await t.tick('sess-A')
+    await t.tick('sess-B')
+    expect(t.delivered).toHaveLength(1)
+    expect(t.delivered[0].owner).toBe('sess-B')
+    expect(t.delivered[0].text).toContain(id + ' 请示')
+    t.finishRunner()
+    await settle()
+  })
+
+  test('an unresolved B id skips delivery without replacing A via its fallback id', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = deliverySessions(on as never)
+    t.seed('bg-A-id', 'sess-A')
+    t.seed('bg-B-id', 'sess-B')
+    await startSession($ as never)
+    t.asking('bg-A-id')
+    t.asking('bg-B-id')
+    t.switchTo('sess-B')
+    t.failId('session id not ready')
+    await startSession($ as never)
+    await t.tick('sess-B')
+    expect(t.attempts).toHaveLength(0)
+    t.failId(undefined)
+    await t.tick('sess-B')
+    await t.tick('sess-A')
+    expect(t.delivered.map(d => d.owner)).toEqual(['sess-B', 'sess-A'])
+  })
+
+  test('A waiting on an ask submit does not hold B delivery busy', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = deliverySessions(on as never)
+    t.seed('bg-A-ask-busy', 'sess-A')
+    t.seed('bg-B-ask-free', 'sess-B')
+    await startSession($ as never)
+    t.switchTo('sess-B')
+    await startSession($ as never)
+    let release: (value: unknown) => void = () => undefined
+    t.submitWith(text => text.includes('bg-A-ask-busy') ? new Promise(resolve => { release = resolve }) : ({ text }))
+    t.asking('bg-A-ask-busy')
+    t.asking('bg-B-ask-free')
+    await t.tick('sess-A')
+    await t.tick('sess-A')
+    await t.tick('sess-B')
+    await t.tick('sess-B')
+    expect(t.attempts).toHaveLength(2)
+    expect(t.delivered).toHaveLength(1)
+    expect(t.delivered[0].owner).toBe('sess-B')
+    release({ text: 'accepted' })
+    await settle()
+    await t.tick('sess-A')
+    expect(t.delivered).toHaveLength(2)
+  })
+
+  test('B completion reaches only B even when A has consumed the completion generation', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = deliverySessions(on as never)
+    await startSession($ as never)
+    t.switchTo('sess-B')
+    await startSession($ as never)
+    const ran = await jobCall($ as never, 'mcp__delegate__delegate_flash', { task: 'finish for B', background: true })
+    expect(text(ran)).toContain('后台任务 bg-')
+    await settle()
+    await t.tick('sess-A')
+    expect(t.delivered).toHaveLength(0)
+    await t.tick('sess-B')
+    await t.tick('sess-A')
+    await t.tick('sess-B')
+    expect(t.delivered).toHaveLength(1)
+    expect(t.delivered[0].owner).toBe('sess-B')
+    expect(t.delivered[0].text).toContain('完成')
+    expect(t.delivered[0].text).toContain('finished in B')
+  })
+
+  for (const failure of ['throw', 'drop'] as const) {
+    test(`B ask retries next tick after submit ${failure} and succeeds only once`, { timeoutMs: 10_000 }, async ($, on) => {
+      const t = deliverySessions(on as never)
+      t.seed('bg-B-retry', 'sess-B')
+      await startSession($ as never)
+      t.switchTo('sess-B')
+      await startSession($ as never)
+      t.asking('bg-B-retry')
+      t.submitWith(() => {
+        if (failure === 'throw') throw new Error('temporary submit failure')
+        return { drop: 'busy' }
+      })
+      await t.tick('sess-B')
+      expect(t.delivered).toHaveLength(0)
+      t.submitWith(text => ({ text }))
+      await t.tick('sess-A')
+      await t.tick('sess-B')
+      await t.tick('sess-B')
+      expect(t.attempts).toHaveLength(2)
+      expect(t.delivered).toHaveLength(1)
+      expect(t.delivered[0].owner).toBe('sess-B')
+    })
+  }
+
+  test('A blocked in submit does not block B asks or B terminal recovery', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = deliverySessions(on as never)
+    t.seed('bg-A-busy', 'sess-A', 'done')
+    t.seed('bg-B-ready', 'sess-B', 'done')
+    t.seed('bg-B-live', 'sess-B')
+    t.submitWith(text => text.includes('bg-A-busy') ? new Promise(() => undefined) : ({ text }))
+    await startSession($ as never)
+    expect(t.attempts.filter(a => a.owner === 'sess-A')).toHaveLength(1)
+    t.switchTo('sess-B')
+    await startSession($ as never)
+    t.asking('bg-B-live')
+    await t.tick('sess-B')
+    expect(t.delivered).toHaveLength(2)
+    expect(t.delivered.every(d => d.owner === 'sess-B')).toBe(true)
+    expect(t.delivered.some(d => d.text.includes('bg-B-ready 完成'))).toBe(true)
+    expect(t.delivered.some(d => d.text.includes('bg-B-live 请示'))).toBe(true)
+  })
+
+  test('restarting B replaces its old timer without repeating a pending ask', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = deliverySessions(on as never)
+    t.seed('bg-B-pending', 'sess-B')
+    await startSession($ as never)
+    t.switchTo('sess-B')
+    await startSession($ as never)
+    let release: (value: unknown) => void = () => undefined
+    t.submitWith(() => new Promise(resolve => { release = resolve }))
+    t.asking('bg-B-pending')
+    await t.tick('sess-B')
+    expect(t.attempts).toHaveLength(1)
+    await startSession($ as never)
+    // 被取消的旧派发可能还留在假宿主队列里，但不能再次派生周期。
+    await t.tick('sess-B')
+    await t.tick('sess-B')
+    expect(t.attempts).toHaveLength(1)
+    expect(t.waits.filter(w => w.owner === 'sess-B')).toHaveLength(1)
+    release({ text: 'accepted' })
+    await settle()
+    await t.tick('sess-B')
+    expect(t.delivered).toHaveLength(1)
+  })
+
+  test('an invalid B session retires its delivery timer', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = deliverySessions(on as never)
+    await startSession($ as never)
+    t.switchTo('sess-B')
+    await startSession($ as never)
+    t.failId('session context is no longer valid')
+    await t.tick('sess-B')
+    // 再唤醒一次底层 wait：取消后的回调不能继续派发。
+    if (t.waits.some(w => w.owner === 'sess-B')) await t.tick('sess-B')
+    expect(t.waits.filter(w => w.owner === 'sess-B')).toHaveLength(0)
+    t.failId(undefined)
+    await t.tick('sess-A')
+    expect(t.delivered).toHaveLength(0)
+  })
+
   // 同一个进程服务多个会话：$.session.id() 会换成另一个会话的 id。
   const twoSessions = (on: never, reply: Record<string, unknown>) => {
     const t = jobSetup(on, reply)
