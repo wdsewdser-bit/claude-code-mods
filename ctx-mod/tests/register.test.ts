@@ -2983,6 +2983,31 @@ test('a delta reports only its new lines and never a missing one', async ($, on)
   expect(await attach($, 'agent_listing_delta', 'd2\nd1')).toBeNull()
 })
 
+test('a main compose writes what the prompt carries, for a hot reload to restore', async ($, on) => {
+  const w = world(on, 's-at-render', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  await boot($)
+  expect(await attach($, 'output_style_instructions', 'STYLE')).toBe('STYLE')
+  await compact($, 'manual')
+  await composeIds($)
+  const saved = JSON.parse(w.files.get('C:/Users/someone/.claude/ctx-mod/render/s-at-render.json') ?? 'null')
+  expect(saved).toEqual({ cwd: '/work', attachments: [{ type: 'output_style_instructions', text: 'STYLE' }], claudeMd: null })
+})
+
+test('after a hot reload (no session.start) the old rows and the prompt render as before it', async ($, on) => {
+  const w = world(on, 's-at-reload', { CTX_MOD: '1' })
+  promptBottoms(on)
+  attachmentBottom(on)
+  const style = { type: 'output_style_instructions', text: 'STYLE' }
+  w.readable.set('C:/Users/someone/.claude/ctx-mod/render/s-at-reload.json', JSON.stringify({ cwd: '/work', attachments: [style], claudeMd: null }))
+  w.readable.set('C:/Users/someone/.claude/ctx-mod/attachments/s-at-reload.json', JSON.stringify([style, { type: 'environment', text: 'ENV' }]))
+  // The engine asks the old rows' attachments again before it composes.
+  expect(await attach($, 'output_style_instructions', 'STYLE')).toBeNull()
+  expect(await attach($, 'environment', 'ENV')).toBe('ENV')
+  expect(attachmentText(await composeIds($))).toBe('STYLE')
+})
+
 test('a whole-text shared type that changed keeps its text', async ($, on) => {
   const w = world(on, 's-at-whole', { CTX_MOD: '1' })
   promptBottoms(on)

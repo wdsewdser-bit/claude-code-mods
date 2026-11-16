@@ -1110,6 +1110,17 @@ let attachmentsSaving: Promise<void> = Promise.resolve()
 let attachmentsInSystem: SeenAttachment[] = []
 /** A compaction happened: every main compose from now on carries the section. */
 let attachmentsArmed = false
+/**
+ * After a hot reload: the attachments the main prompt carried before it, so it
+ * composes the same until the next window switch.
+ */
+let composedBeforeReload: SeenAttachment[] | undefined
+/** Where this session's render state lives; empty when the mod is off or the id or home is unknown. */
+let renderPath = ''
+/** The render state last written, so an unchanged one is not written again. */
+let renderSaved = ''
+/** The working directory the session started in: the archives are keyed by it, not by a later cd. */
+let renderCwd = ''
 
 /** The entries in one archive; a damaged, empty or old string-array file is no archive. */
 const readArchive = async ($: EngineInterface, path: string): Promise<SeenAttachment[] | undefined> => {
@@ -1194,10 +1205,79 @@ const saveAttachments = async ($: EngineInterface): Promise<void> => {
 
 /** After a window switch: the next main compose carries the attachments, so it is composed again. */
 const armAttachments = ($: EngineInterface): void => {
+  composedBeforeReload = undefined
   if (!attachToSystem) return
   attachmentsArmed = true
   attachmentsInSystem = []
   $.ui.invalidate('prompt.section')
+}
+
+// 热加载后引擎会把旧消息里的附件再问一遍、系统提示再组一遍。模块状态归零，
+// 答案就和重载前不同，整段消息缓存失效。所以把主提示实际带上的附件和
+// CLAUDE.md 正文、会话起始目录记到磁盘，重载后的首个钩子据此恢复。
+type RenderState = { cwd: string; attachments: SeenAttachment[]; claudeMd: string | null }
+
+const isRenderState = (value: unknown): value is RenderState => {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+
+  return typeof v.cwd === 'string' &&
+    Array.isArray(v.attachments) && v.attachments.every(isSeenAttachment) &&
+    (v.claudeMd === null || typeof v.claudeMd === 'string')
+}
+
+/** The render state's file for this session; empty when the id or home is unknown. */
+const renderPathOf = async ($: EngineInterface): Promise<string> => {
+  const home = await homeOf($)
+  const id = await idOf($)
+
+  return home !== '' && id !== undefined && /^[\w-]+$/.test(id) ? `${home}/.claude/ctx-mod/render/${id}.json` : ''
+}
+
+/** At session start: where the render state goes, and the directory the archives are keyed by. */
+const startRender = async ($: EngineInterface, cwd: string): Promise<void> => {
+  renderCwd = cwd
+  renderSaved = ''
+  composedBeforeReload = undefined
+  renderPath = await renderPathOf($)
+}
+
+/** After a main compose: what the prompt now carries, written only when it changed. */
+const saveRender = async ($: EngineInterface): Promise<void> => {
+  if (renderPath === '') return
+  const state: RenderState = {
+    cwd: renderCwd,
+    attachments: attachmentsInSystem,
+    claudeMd: claudeMdInSystem && storedClaudeMd !== undefined ? storedClaudeMd : null,
+  }
+  const text = JSON.stringify(state)
+  if (text === renderSaved) return
+  renderSaved = text
+  await $.fs.write(renderPath, text).catch(error => logError($, 'render', error))
+}
+
+/** The first hook after a hot reload: the archives and what the prompt carried, as before it. */
+const restoreAfterReload = async ($: EngineInterface): Promise<void> => {
+  const path = await renderPathOf($)
+  if (path === '') return
+  const text = await attempt(async () => await $.fs.read(path), undefined)
+  if (typeof text !== 'string') return
+  const saved = await attempt(async () => JSON.parse(text) as unknown, undefined)
+  if (!isRenderState(saved)) return
+  await loadAttachments($, saved.cwd)
+  await loadClaudeMd($, saved.cwd)
+  await startRender($, saved.cwd)
+  renderSaved = text
+  // The session archive holds what this process had seen when it last wrote.
+  if (attachmentsSaved !== '' && storedAttachments !== undefined) seenAttachments = [...storedAttachments]
+  if (attachToSystem) {
+    attachmentsInSystem = saved.attachments
+    composedBeforeReload = saved.attachments
+  }
+  if (saved.claudeMd !== null && claudeMdPath !== '') {
+    storedClaudeMd = saved.claudeMd
+    claudeMdInSystem = true
+  }
 }
 
 // 热加载会换掉模块、把 enabled/config 重置为默认值，却不会再触发 session.start：
@@ -1214,7 +1294,10 @@ const initConfig = async ($: EngineInterface): Promise<void> => {
 }
 const isOn = async ($: EngineInterface): Promise<boolean> => {
   if (!initialized) {
-    initPending ??= initConfig($).catch(error => { initPending = undefined; logError($, 'lazy config', error) })
+    initPending ??= (async () => {
+      await initConfig($)
+      if (enabled) await restoreAfterReload($).catch(error => logError($, 'reload restore', error))
+    })().catch(error => { initPending = undefined; logError($, 'lazy config', error) })
     await initPending
   }
 
@@ -1256,6 +1339,7 @@ export const register: Register = (on, options) => {
       if (enabled) {
         await loadAttachments($, e.cwd).catch(error => logError($, 'attachments', error))
         await loadClaudeMd($, e.cwd).catch(error => logError($, 'claude-md', error))
+        await startRender($, e.cwd).catch(error => logError($, 'render', error))
       }
       // The command is always there, so a person who installed the mod and
       // typed /ctx-mod is told how to turn it on instead of meeting an unknown command.
@@ -1318,13 +1402,16 @@ export const register: Register = (on, options) => {
       // Only the shared types move: a session's own texts (its scratchpad path,
       // model, git status) would make every session's prompt differ, so the
       // prompt's tail could never be read from another session's cache.
-      const attachmentsSource = orderedAttachments(attachmentsArmed ? seenAttachments : storedAttachments ?? [])
+      const attachmentsSource = orderedAttachments(composedBeforeReload ?? (attachmentsArmed ? seenAttachments : storedAttachments ?? []))
         .filter(seen => SHARED_TYPE_SET.has(seen.type))
       const attachments = main && attachToSystem && attachmentsSource.length > 0
         ? [{ id: 'ctx-mod:attachments', text: attachmentsSource.map(seen => seen.text).join('\n\n'), scope: 'session' as const }]
         : []
       // Only a main prompt carries them; a side analysis leaves the set alone.
-      if (main) attachmentsInSystem = attachments.length > 0 ? attachmentsSource : []
+      if (main) {
+        attachmentsInSystem = attachments.length > 0 ? attachmentsSource : []
+        await saveRender($)
+      }
 
       return {
         ...result,
@@ -1503,7 +1590,9 @@ export const register: Register = (on, options) => {
         // so a switch made later in this same turn already carries it.
         await attempt(async () => await session.mergeBackfill(), { added: [], dropped: [] })
         const env = await envOf($, id)
-        const text = session.reminder(env)
+        // ToolSearch 的结果行里，引擎在重载后重排 "Tool loaded." 和紧跟的追加文本，
+        // 这一行变了，它之后的缓存就全部失效。所以提醒留到下一次工具调用再追加。
+        const text = String(e.tool) === 'ToolSearch' ? null : session.reminder(env)
         if (text !== null) {
           await $.session.append({
             message: { type: 'user', content: [{ type: 'text', text }] },
