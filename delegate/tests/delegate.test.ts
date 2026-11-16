@@ -1059,6 +1059,18 @@ describe('jobs', () => {
     expect(t.submitted).toHaveLength(2)
   })
 
+  test('two recoveries racing each other announce a finished job once', { timeoutMs: 10_000 }, async ($, on) => {
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    t.store.set('job:bg-race', {
+      jobId: 'bg-race', sessionId: 'sid-r', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
+      background: true, status: 'done', at: Date.now() - 60_000, summary: 'race', owner: 'sess-me', notified: false,
+    })
+    t.files.set(`${ROOT}/bg-race/result.json`, JSON.stringify({ ok: true, text: 'race result', sessionId: 'sid-r', turns: 1 }))
+    await Promise.all([startSession($ as never), startSession($ as never)])
+    expect(t.submitted.filter(x => x.includes('bg-race'))).toHaveLength(1)
+  })
+
   test('a job started a moment ago with no status file yet is not taken for an orphan', { timeoutMs: 10_000 }, async ($, on) => {
     ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
     const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })

@@ -1833,7 +1833,18 @@ const notifyDone = async ($: EngineInterface, rec: JobRecord): Promise<boolean> 
   return await deliver($, `${saved !== undefined && saved !== '' ? `【delegate 后台任务 ${rec.jobId} ${endWord(rec.status, askTimeout)}】` : head}\n${lead}${body}${changes}${where}${next}`)
 }
 
+// 会话启动和计时器都会补发：同一时刻只跑一遍，后到的等前一遍的结果，免得同一条通知发两次。
+let recovering: Promise<boolean> | undefined
 const recoverJobs = async ($: EngineInterface): Promise<boolean> => {
+  if (recovering !== undefined) return await recovering
+  recovering = recoverOnce($).finally(() => {
+    recovering = undefined
+  })
+
+  return await recovering
+}
+
+const recoverOnce = async ($: EngineInterface): Promise<boolean> => {
   const records = await listJobs($)
   if (records.length === 0) return true
   const root = await rootOf($)
@@ -1881,6 +1892,9 @@ const recoverJobs = async ($: EngineInterface): Promise<boolean> => {
   let allSent = true
   for (const rec of pending.filter(r => me !== undefined && r.owner === me && fresh(r)).slice(0, 5)) {
     try {
+      // 发之前按 store 里的最新记录再确认一次：别处可能刚通知过。
+      const latest = await loadJob($, rec.jobId)
+      if (latest?.notified === true) continue
       if (!(await notifyDone($, rec))) {
         allSent = false
         continue
