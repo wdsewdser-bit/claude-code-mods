@@ -1861,6 +1861,24 @@ const recoverJobs = async ($: EngineInterface): Promise<boolean> => {
   return await recovering
 }
 
+// 在后台补发，不 await：prompt.submit 要等会话空闲才返回，等在 session.start 或计时器里会让
+// 计时器起不来或整拍卡住（面板、请示播报、之后的通知全停）。没补完的一分钟后由计时器再来。
+const kickRecovery = ($: EngineInterface): void => {
+  const retry = (): void => {
+    pendingNotify = true
+    nextNotifyAt = Date.now() + 60_000
+  }
+  void recoverJobs($).then(
+    ok => {
+      if (!ok) retry()
+    },
+    error => {
+      retry()
+      $.ui.log(`delegate: 补发出错：${messageOf(error)}`, { to: 'debug' })
+    },
+  )
+}
+
 const recoverOnce = async ($: EngineInterface): Promise<boolean> => {
   const records = await listJobs($)
   if (records.length === 0) return true
@@ -2209,13 +2227,10 @@ const ensureLiveTimer = ($: EngineInterface): void => {
           pendingNotify = true
         }
         if (!liveJobsRunning && !livePaneOpen && !pendingNotify) return
-        if (pendingNotify && Date.now() >= nextNotifyAt) {
+        if (pendingNotify && Date.now() >= nextNotifyAt && recovering === undefined) {
           // 结束了的作业由这里发通知；没送进去的每分钟再试，送到为止。
           pendingNotify = false
-          if (!(await recoverJobs($))) {
-            pendingNotify = true
-            nextNotifyAt = Date.now() + 60_000
-          }
+          kickRecovery($)
         }
         const all = await listJobs($)
         const running = all.filter(r => r.status === 'running')
@@ -2346,15 +2361,22 @@ export const register: Register = on => {
         // 前台 delegate 调用会把主模型卡在工具调用上，取消只能靠人在这里下命令。
         immediate: true,
       })
+    } catch (error) {
+      $.ui.log(`delegate: ${messageOf(error)}`, { to: 'debug' })
+    }
+    // 计时器最先起，且不等任何可能卡住的步骤：通知、请示播报、孤儿收尾全靠它。
+    // 以前这里先 await recoverJobs —— 里面的 prompt.submit 要等会话空闲才返回，热重载撞上
+    // 忙着的会话、又恰好有待补发的作业时，计时器就一直起不来，之后所有完成通知都发不出去。
+    // 现在只置位，由计时器下一拍在后台补发（重启后补发、标孤儿也在那里做）。
+    ensureLiveTimer($)
+    kickRecovery($)
+    try {
       await describeTool($, await loadConfig($))
       await describeGpt($)
       await describeAgy($)
       await describeJobTools($)
-      // 重启后：补发没发出去的后台通知，把进程没了的 running 标成 orphaned（仍可 resume）。
-      await recoverJobs($)
       // 重启后把今天（和还在跑的）DS 作业的 usage 从 result / status 补进日账本。
       await syncDsUsage($)
-      ensureLiveTimer($)
       await redraw($) // 会话就绪后补画一次按钮栏
     } catch (error) {
       $.ui.log(`delegate: ${messageOf(error)}`, { to: 'debug' })

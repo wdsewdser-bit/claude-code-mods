@@ -590,7 +590,9 @@ const main = async () => {
     }
     if ((!res || res.status !== 'SUCCESS') && !recovered) {
       const why = res?.error ?? res?.status ?? `agy 退出 ${r.code}，没有 result 事件`
-      const err = String(r.stderr ?? '').replace(/\s+/g, ' ').trim().slice(-400)
+      let err = String(r.stderr ?? '').replace(/\s+/g, ' ').trim().slice(-400)
+      // 找不到 agy.exe 时 agyExe 退回裸名 'agy'，报错只剩一句 ENOENT：点明查的路径和常见原因。
+      if (/ENOENT/.test(err) && agyExe() === 'agy') err += `（没找到 ${path.join(process.env.LOCALAPPDATA ?? '%LOCALAPPDATA%', 'agy', 'bin', 'agy.exe')}：runner 若在 Claude 应用包外启动就看不到包内的 AppData）`
       return done({ ok: false, error: `${typeof why === 'string' ? why : JSON.stringify(why)}${err ? `：${err}` : ''}${retrySuffix(stepsOf(conversation), startStep)}`, text: fallbackText, sessionId: conversation, turns: tr.turns, terminal: terminalOf(fallbackText) }, 1)
     }
     if (turnText.trim() === '') {

@@ -655,7 +655,8 @@ type Files = Map<string, string>
 const jobSetup = (
   on: never,
   reply: Record<string, unknown>,
-  opts: { files?: Files; alive?: number[]; git?: string; mtimes?: Record<string, number>; dropSubmit?: boolean } = {},
+  opts: { files?: Files; alive?: number[]; git?: string; mtimes?: Record<string, number>; dropSubmit?: boolean
+  hangSubmit?: boolean } = {},
 ) => {
   const store = new Map<string, unknown>([
     ['cfg', normalize(undefined)],
@@ -713,6 +714,10 @@ const jobSetup = (
     return { value: { kind, size: 0, mtimeMs: 0, isLink: false } }
   })
   o('prompt.submit', (_$, e: { text: string }) => {
+    if (opts.hangSubmit === true) {
+      submitted.push(e.text)
+      return new Promise(() => undefined) // 会话一直不空闲：submit 永不返回
+    }
     if (opts.dropSubmit === true) return { drop: 'busy' }
     submitted.push(e.text)
     return { text: e.text }
@@ -765,12 +770,17 @@ const jobSetup = (
 const jobCall = ($: never, tool: string, args: Record<string, unknown>) =>
   ($ as { tool: { call: (i: never) => Promise<unknown> } }).tool.call({ tool, ...args } as never)
 
-const startSession = ($: never) =>
-  ($ as { session: { start: (i: never) => Promise<unknown> } }).session.start({
+// session.start 只把补发放到后台（不等 prompt.submit）：等它跑完再看结果。
+const settle = () => new Promise(r => setTimeout(r, 150))
+const startSession = async ($: never) => {
+  const out = await ($ as { session: { start: (i: never) => Promise<unknown> } }).session.start({
     cwd: '/work',
     surface: null,
     isInteractive: true,
   } as never)
+  await settle()
+  return out
+}
 
 const text = (v: unknown): string => JSON.stringify(v)
 
@@ -1063,6 +1073,28 @@ describe('jobs', () => {
     // 再来一个会话：不重复补发
     await startSession($ as never)
     expect(t.submitted).toHaveLength(2)
+  })
+
+  test('a submit that never returns does not hold up session.start or the sweep timer', { timeoutMs: 10_000 }, async ($, on) => {
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    let timers = 0
+    ;(on as (name: string, fn: () => unknown) => void)('clock.every', () => {
+      timers++
+      return { value: { cancel: () => undefined } }
+    })
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map(), hangSubmit: true })
+    t.store.set('job:bg-busy', {
+      jobId: 'bg-busy', sessionId: 'sid-b', tier: 'gpt', model: 'm', cwd: '/work', mode: 'work', ptc: 'only',
+      background: true, status: 'done', at: Date.now() - 60_000, summary: 'busy', owner: 'sess-me', notified: false,
+    })
+    t.files.set(`${ROOT}/bg-busy/result.json`, JSON.stringify({ ok: true, text: 'busy result', sessionId: 'sid-b', turns: 1 }))
+    // 以前 session.start 会一直等在 prompt.submit 上，计时器永远起不来；现在必须准时返回。
+    const started = await Promise.race([startSession($ as never).then(() => 'ok'), new Promise(r => setTimeout(() => r('hung'), 3000))])
+    expect(started).toBe('ok')
+    expect(timers).toBe(1)
+    expect(t.submitted.filter(x => x.includes('bg-busy'))).toHaveLength(1)
+    // 已先记成已通知：卡住的那次送到后不会再发第二遍
+    expect(jobOf(t.store, 'bg-busy').notified).toBe(true)
   })
 
   test('two recoveries racing each other announce a finished job once', { timeoutMs: 10_000 }, async ($, on) => {
