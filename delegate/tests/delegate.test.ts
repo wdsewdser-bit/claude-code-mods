@@ -315,6 +315,12 @@ describe('delegate tool', () => {
       files.set(e.path, e.text)
       return { value: undefined }
     })
+    o('store.keys', () => ({ value: [...store.keys()] }))
+    o('fs.read', (_$, e: { path: string }) => {
+      const text = files.get(e.path)
+      if (text === undefined) throw new Error('ENOENT')
+      return { value: text }
+    })
     const paths = new Map<string, 'dir' | 'file'>([
       ['/work', 'dir'],
       ['/proj', 'dir'],
@@ -616,11 +622,15 @@ describe('delegate tool', () => {
 
   test('background returns at once and reports through a prompt when done', { timeoutMs: 10_000 }, async ($, on) => {
     const jobs = setup(on as never, 'k-1', { ok: true, text: 'late result', sessionId: 'sid-9', turns: 3, ms: 5000 })
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
     await start($ as never)
     const ran = await call($ as never, { task: 'long job', background: true })
     expect(JSON.stringify(ran)).toContain('后台任务 bg-')
     expect(JSON.stringify(ran)).not.toContain('late result')
     await new Promise(resolve => setTimeout(resolve, 100))
+    // 派活钩子的 $ 不发通知：交给会话级的计时器 / session.start 补发。
+    expect(jobs.submitted).toHaveLength(0)
+    await start($ as never)
     expect(jobs.submitted).toHaveLength(1)
     expect(jobs.submitted[0]).toContain('完成')
     expect(jobs.submitted[0]).toContain('late result')
@@ -700,6 +710,7 @@ const jobSetup = (
     return { text: e.text }
   })
   o('clock.sleep', () => ({ value: undefined }))
+  o('ui.log', () => ({ value: undefined }))
   o('process.run', (_$, e: { argv?: string[]; init?: { stdin?: string }; stdin?: string }) => {
     const argv = e.argv ?? []
     if (argv[0] === 'tasklist') {
@@ -991,8 +1002,10 @@ describe('jobs', () => {
   test('session.start marks a dead running job orphaned and re-sends a missed notification once', { timeoutMs: 10_000 }, async ($, on) => {
     const files: Files = new Map()
     const t = jobSetup(on as never, { ok: true, text: 'x' }, { files })
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
     const at = Date.now() - 60_000
     t.store.set('job:bg-dead', {
+      owner: 'sess-me',
       jobId: 'bg-dead',
       sessionId: 'sid-dead',
       tier: 'flash',
@@ -1005,7 +1018,11 @@ describe('jobs', () => {
       at,
       summary: 'was still running',
     })
+    // 无主作业（派活时没拿到会话 id）和别的会话的作业：都不补发到这里。
+    t.store.set('job:bg-stray', { jobId: 'bg-stray', sessionId: 'sid-stray', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only', background: true, status: 'orphaned', at, summary: 'no owner' })
+    t.store.set('job:bg-other', { owner: 'sess-other', jobId: 'bg-other', sessionId: 'sid-o', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only', background: true, status: 'orphaned', at, summary: 'other session' })
     t.store.set('job:bg-late', {
+      owner: 'sess-me',
       jobId: 'bg-late',
       sessionId: 'sid-late',
       tier: 'gpt',
@@ -1023,14 +1040,54 @@ describe('jobs', () => {
     t.files.set(`${ROOT}/bg-late/result.json`, JSON.stringify({ ok: true, text: 'late finding', sessionId: 'sid-late', turns: 4 }))
     await startSession($ as never)
     expect(jobOf(t.store, 'bg-dead').status).toBe('orphaned')
-    expect(t.submitted).toHaveLength(1)
-    expect(t.submitted[0]).toContain('重启后补发')
-    expect(t.submitted[0]).toContain('late finding')
-    expect(t.submitted[0]).toContain('sid-late')
+    expect(t.submitted).toHaveLength(2)
+    const dead = t.submitted.find(s => s.includes('bg-dead')) ?? ''
+    const late = t.submitted.find(s => s.includes('bg-late')) ?? ''
+    expect(dead).toContain('宿主重启中断')
+    expect(late).toContain('完成')
+    expect(t.submitted.some(s => s.includes('bg-stray') || s.includes('bg-other'))).toBe(false)
+    expect(late).toContain('late finding')
+    expect(late).toContain('sid-late')
     expect(jobOf(t.store, 'bg-late').notified).toBe(true)
     // 再来一个会话：不重复补发
     await startSession($ as never)
+    expect(t.submitted).toHaveLength(2)
+  })
+
+  test('a job that ended on an unanswered ask says so, and does not read like a normal finish', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    t.store.set('job:bg-ask', {
+      owner: 'sess-me', jobId: 'bg-ask', sessionId: 'sid-ask', tier: 'gpt', model: 'gpt-6.1-sol', cwd: '/work', mode: 'work', ptc: 'only',
+      background: true, status: 'done', at: Date.now() - 60_000, turns: 3, summary: 'asked', notified: false,
+    })
+    t.files.set(`${ROOT}/bg-ask/result.json`, JSON.stringify({ ok: true, text: '【请示】要不要继续？', sessionId: 'sid-ask', turns: 3, askTimeout: true }))
+    await startSession($ as never)
     expect(t.submitted).toHaveLength(1)
+    expect(t.submitted[0]).toContain('以请示结束，需要你回复')
+    expect(t.submitted[0]).not.toContain('bg-ask 完成')
+    expect(t.submitted[0]).toContain('要不要继续')
+    expect(t.submitted[0]).toContain('resume')
+  })
+
+  test('an interrupted foreground job is announced with a hint to check the working tree', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    t.store.set('job:fg-cut', {
+      owner: 'sess-me', jobId: 'fg-cut', sessionId: 'sid-cut', tier: 'gpt', model: 'gpt-6.1-sol', cwd: '/work', mode: 'work', ptc: 'only',
+      background: false, status: 'failed', at: Date.now() - 60_000, turns: 92, summary: 'long', notified: false,
+      error: 'delegate: $.process.spawn(node) aborted',
+    })
+    // 普通失败的前台作业（没有 notified: false）不补发。
+    t.store.set('job:fg-plain', {
+      owner: 'sess-me', jobId: 'fg-plain', sessionId: 'sid-p', tier: 'gpt', model: 'm', cwd: '/work', mode: 'work', ptc: 'only',
+      background: false, status: 'failed', at: Date.now() - 60_000, summary: 'plain', error: 'boom',
+    })
+    await startSession($ as never)
+    expect(t.submitted).toHaveLength(1)
+    expect(t.submitted[0]).toContain('前台作业 fg-cut 被中断')
+    expect(t.submitted[0]).toContain('git status')
+    expect(jobOf(t.store, 'fg-cut').notified).toBe(true)
   })
 
   test('a live job is left running by session.start', { timeoutMs: 10_000 }, async ($, on) => {

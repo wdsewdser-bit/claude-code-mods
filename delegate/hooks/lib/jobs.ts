@@ -202,7 +202,7 @@ export const normalizeRecord = (raw: unknown, jobId: string): JobRecord | undefi
     ...(num(raw.turns) === undefined ? {} : { turns: num(raw.turns) }),
     ...(str(raw.error) === '' ? {} : { error: str(raw.error) }),
     summary: str(raw.summary),
-    ...(raw.notified === true ? { notified: true } : {}),
+    ...(typeof raw.notified === 'boolean' ? { notified: raw.notified } : {}),
     ...(str(raw.owner) === '' ? {} : { owner: str(raw.owner) }),
     ...(str(raw.effort) === '' ? {} : { effort: str(raw.effort) }),
   }

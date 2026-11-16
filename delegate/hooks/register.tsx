@@ -691,7 +691,7 @@ const mirrorLegacy = async ($: EngineInterface, rec: JobRecord): Promise<void> =
       summary: rec.summary,
       sessionId: rec.sessionId,
       ...(rec.endedAt === undefined ? {} : { endedAt: rec.endedAt }),
-      ...(rec.notified === true ? { notified: true } : {}),
+      ...(typeof rec.notified === 'boolean' ? { notified: rec.notified } : {}),
     }
     const kept = Object.entries(table)
       .sort((a, b) => Number(b[1].at ?? 0) - Number(a[1].at ?? 0))
@@ -1055,8 +1055,11 @@ const SESSION_ID_WAIT_MS = 300
 // 折中：模块级只记「上一次成功拿到的 id」，且只在本次 300ms 超时时兜底；拿到新 id 立刻覆盖。
 // 代价：桌面端多会话共用一个进程时，超时窗口内可能返回另一个会话的 id（最多 300ms，且下一次调用就纠正）。
 const SESSION_FALLBACK_MS = 5_000
+// 派活不画界面，可以多等：owner 拿不到的代价是重启后的通知没处可发。
+const OWNER_WAIT_MS = 3_000
 let lastSessionId: { id: string; at: number } | undefined
-const sessionOf = async ($: EngineInterface): Promise<string | undefined> => {
+// 派活写 owner 时传更长的 waitMs：拿不到 id 的作业会变成「无主」，重启补发时不知道该发给谁。
+const sessionOf = async ($: EngineInterface, waitMs = SESSION_ID_WAIT_MS): Promise<string | undefined> => {
   const id = await new Promise<string | undefined>(resolve => {
     let settled = false
     let timer: { cancel: () => void } | undefined
@@ -1069,7 +1072,7 @@ const sessionOf = async ($: EngineInterface): Promise<string | undefined> => {
       resolve(value)
     }
     try {
-      timer = $.clock.after(SESSION_ID_WAIT_MS, () => settle(undefined))
+      timer = $.clock.after(waitMs, () => settle(undefined))
     } catch {
       settle(undefined)
     }
@@ -1404,8 +1407,9 @@ const callTool = async (
     at,
     summary: summarize(task),
   }
-  const owner = await sessionOf($)
+  const owner = await sessionOf($, OWNER_WAIT_MS)
   if (owner !== undefined) record.owner = owner
+  else $.ui.log(`delegate: ${jobId} 没拿到会话 id，作业无主：重启后不会自动补发通知`, { to: 'debug' })
   await saveJob($, record)
   await showLive($, jobId)
   const wire: Record<string, unknown> = {
@@ -1430,7 +1434,17 @@ const callTool = async (
   running += 1
   $.ui.status(`◆ 委派 ${label} · 运行中`)
   try {
-    return await settle($, record, await runJob($, wire))
+    const done = await settle($, record, await runJob($, wire))
+    // 调用被打断（新消息插进来、用户中止）时模型看到的是“被拒”，这份失败结果它根本收不到：
+    // 另外往会话里补一条通知，带上改动摘要，免得它当成没跑起来又派一次。
+    if (done.isError === true && /aborted/i.test(record.error ?? '')) {
+      // 计时器补一条“被中断”的通知，附改动摘要。
+      record.notified = false
+      await saveJob($, record).catch(() => undefined)
+      pendingNotify = true
+      nextNotifyAt = 0
+    }
+    return done
   } finally {
     running -= 1
     if (running === 0) $.ui.status(undefined)
@@ -1441,7 +1455,7 @@ const settle = async (
   $: EngineInterface,
   record: JobRecord,
   reply: JobReply,
-): Promise<{ result: string; isError?: true }> => {
+): Promise<{ result: string; isError?: true; askTimeout?: true }> => {
   // 成功分支的 sessionId 可能是流里收集的（runner 会回退到 sid），所以以回复为准，其次才用计划里的 id。
   const sessionId =
     typeof reply.sessionId === 'string' && reply.sessionId !== '' ? reply.sessionId : (record.sessionId ?? '')
@@ -1474,14 +1488,65 @@ const settle = async (
       ? ''
       : `\n⚠ 有 ${left.length} 个子进程在作业结束后还在运行：${left.map(p => `${p.pid} ${p.name} ${p.cmd}`.trim()).join('，')}，确认没用了就 taskkill //PID <pid> //F`
   if (!reply.ok) {
-    return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${tail}${leftoverNote}${usageNote === '' ? '' : `\n${usageNote}`}`, isError: true }
+    const changes = record.mode === 'work' && reply.error !== 'cancelled' ? await changesIn($, record.cwd) : ''
+    return { result: `${head}\n失败：${reply.error ?? reply.text ?? '未知原因'}${changes}${tail}${leftoverNote}${usageNote === '' ? '' : `\n${usageNote}`}`, isError: true }
   }
   const text = reply.text ?? ''
   // 请示没等到回复就结束了：通知里点明，别当成正常完成。
-  const askNote = reply.askTimeout === true ? '请示未获回复，作业已按请示内容结束；要接着做就 resume。\n' : ''
+  const askNote = reply.askTimeout === true ? ASK_END_NOTE : ''
 
   return {
+    ...(reply.askTimeout === true ? { askTimeout: true as const } : {}),
     result: `${head}\n${askNote}${text.length > MAX_REPLY ? `${text.slice(0, MAX_REPLY)}\n…（已截断）` : text}${tail}${usageNote === '' ? '' : `\n${usageNote}`}`,
+  }
+}
+
+// 终态通知只由 session.start 起的计时器发（它的 $ 跟会话一样长）：派活钩子的 $ 在钩子返回、
+// 调用被打断或热重载之后，prompt.submit 可能不报错却送不进会话，记成已通知就再也补不回来。
+let pendingNotify = false
+let nextNotifyAt = 0
+
+/** 把一条通知送进会话；被钩子 drop 或抛错都算没送到。 */
+const deliver = async ($: EngineInterface, text: string): Promise<boolean> => {
+  try {
+    const entered = await $.prompt.submit({ text })
+    if (typeof entered === 'object' && entered !== null && 'drop' in entered) {
+      $.ui.log(`delegate: 通知被丢弃：${String((entered as { drop?: unknown }).drop)}`, { to: 'debug' })
+      return false
+    }
+    return true
+  } catch (error) {
+    $.ui.log(`delegate: 通知没送出去：${messageOf(error)}`, { to: 'debug' })
+    return false
+  }
+}
+
+/** 终态的说法：以请示结束的不能看起来像正常完成。 */
+const endWord = (status: string, askTimeout: boolean): string =>
+  status === 'done'
+    ? askTimeout
+      ? '以请示结束，需要你回复'
+      : '完成'
+    : status === 'cancelled'
+      ? '已取消'
+      : status === 'orphaned'
+        ? '宿主重启中断'
+        : '失败'
+
+const ASK_END_NOTE = '它发了请示、等不到回复就结束了，下面是请示内容。用 resume 把你的决定发给同一个 agent 让它接着做。\n'
+
+/** cwd 下的改动摘要：失败或中止的作业可能已经写了文件。 */
+const changesIn = async ($: EngineInterface, cwd: string): Promise<string> => {
+  try {
+    const ran = await $.process.run(['git', 'status', '--short'], { cwd, timeoutMs: 15_000 })
+    if (ran.exitCode !== 0) return `\n⚠ 子进程可能已经改了 ${cwd} 下的文件（不是 git 仓库，列不出改动），重派前先自己检查。`
+    const lines = ran.stdout.split('\n').filter(l => l.trim() !== '')
+    if (lines.length === 0) return `\n${cwd} 的 git status 是干净的：没有未提交的改动。`
+    const more = lines.length > 30 ? `\n…还有 ${lines.length - 30} 处` : ''
+
+    return `\n⚠ 子进程可能已经改了文件：${cwd} 现有 ${lines.length} 处未提交改动（git status --short），重派前先看：\n${lines.slice(0, 30).join('\n')}${more}`
+  } catch {
+    return `\n⚠ 子进程可能已经改了 ${cwd} 下的文件，重派前先看 git status。`
   }
 }
 
@@ -1493,26 +1558,18 @@ const runBackground = async (
 ): Promise<void> => {
   try {
     const done = await settle($, record, await runJob($, job))
-    let where = ''
+    // 完整结果写进 results/<id>.md，计时器补发通知时照它发。
     try {
       const home = await homeOf($)
       if (home !== undefined) {
         const file = `${home.replace(/\\/g, '/')}/.claude/delegate/results/${record.jobId}.md`
         await $.fs.write(file, done.result)
-        where = `\n完整结果：${file}`
       }
-    } catch {
-      where = ''
-    }
-    const body =
-      done.result.length > BG_INLINE
-        ? `${done.result.slice(0, BG_INLINE)}\n…（已截断）`
-        : done.result
-    await $.prompt.submit({
-      text: `【delegate 后台任务 ${record.jobId} ${done.isError === true ? '失败' : '完成'}】\n${body}${where}`,
-    })
-    // 通知发出去才算数：没发出去的，session.start 会在重启后补发一次。
-    record.notified = true
+    } catch {}
+    // 交给计时器投递：它用会话级的 $，送不进去会每分钟再试。先置位，存盘失败也会补。
+    pendingNotify = true
+    nextNotifyAt = 0
+    record.notified = false
     await saveJob($, record)
   } catch (error) {
     $.ui.log(`delegate: background job ${record.jobId} failed: ${messageOf(error)}`, { to: 'debug' })
@@ -1731,26 +1788,39 @@ const sendAction = async (
 }
 
 // 重启后补一件事：把“已完成但没通知”的后台作业补发一条，把“还在 running 但进程已经没了”的标成 orphaned。
-const notifyDone = async ($: EngineInterface, rec: JobRecord): Promise<void> => {
+const notifyDone = async ($: EngineInterface, rec: JobRecord): Promise<boolean> => {
   const root = await rootOf($)
   const dir = root === undefined ? undefined : jobDir(root, rec.jobId)
   const result = dir === undefined ? undefined : await readResult($, dir)
   const status = dir === undefined ? undefined : await readStatus($, dir)
   const text = result?.text ?? status?.lastText ?? result?.error ?? ''
   const agent = result?.sessionId ?? rec.sessionId
-  const body = text.length > BG_INLINE ? `${text.slice(0, BG_INLINE)}\n…（已截断）` : text
-  const state = rec.status === 'done' ? '完成' : rec.status === 'cancelled' ? '已取消' : '失败'
+  const askTimeout = (result as { askTimeout?: unknown } | undefined)?.askTimeout === true
+  // 后台作业结束时已把完整结果（带头行和额度）写进 results/<id>.md：有就照它发。
+  const home = await homeOf($).catch(() => undefined)
+  const file = home === undefined ? undefined : `${home.replace(/\\/g, '/')}/.claude/delegate/results/${rec.jobId}.md`
+  const saved = file === undefined ? undefined : await $.fs.read(file).then(r => (typeof r === 'string' ? r : String((r as { text?: unknown }).text ?? ''))).catch(() => undefined)
+  const full = saved !== undefined && saved !== '' ? saved : text
+  const body = full.length > BG_INLINE ? `${full.slice(0, BG_INLINE)}\n…（已截断）` : full
+  const where = saved !== undefined && saved !== '' ? `\n完整结果：${file}` : ''
   // 给人看的模型名：GPT 走自定义供应商时默认不带前缀。
   const config = await loadConfig($).catch(() => undefined)
   const model = rec.model === '' ? '' : rec.tier === 'gpt' && config !== undefined ? gptShownModel(config, rec.model) : rec.model
-  const head = `【delegate 后台任务 ${rec.jobId} ${state}（重启后补发）】\n[agent ${agent ?? '?'} · ${rec.turns ?? '?'} 轮 · ${rec.tier} / ${model === '' ? '?' : model} · ${rec.mode}]`
+  const title = rec.background
+    ? `【delegate 后台任务 ${rec.jobId} ${endWord(rec.status, askTimeout)}】`
+    : `【delegate 前台作业 ${rec.jobId} 被中断】这次调用虽然显示被拒或中断，作业其实已经跑过一段（现已停止）。`
+  const head = `${title}\n[agent ${agent ?? '?'} · ${rec.turns ?? '?'} 轮 · ${rec.tier} / ${model === '' ? '?' : model} · ${rec.mode}]`
   const next = agent === null || agent === undefined ? '' : `\n要接着做就用 resume ${agent}`
-  await $.prompt.submit({ text: `${head}\n${body}${next}` })
+  const changes =
+    rec.mode === 'work' && (rec.status === 'failed' || rec.status === 'orphaned') && !(saved ?? '').includes('git status') ? await changesIn($, rec.cwd) : ''
+  const lead = saved !== undefined && saved !== '' ? '' : askTimeout ? ASK_END_NOTE : ''
+
+  return await deliver($, `${saved !== undefined && saved !== '' ? `【delegate 后台任务 ${rec.jobId} ${endWord(rec.status, askTimeout)}】` : head}\n${lead}${body}${changes}${where}${next}`)
 }
 
-const recoverJobs = async ($: EngineInterface): Promise<void> => {
+const recoverJobs = async ($: EngineInterface): Promise<boolean> => {
   const records = await listJobs($)
-  if (records.length === 0) return
+  if (records.length === 0) return true
   const root = await rootOf($)
   const me = await sessionOf($)
   const pending: JobRecord[] = []
@@ -1774,25 +1844,36 @@ const recoverJobs = async ($: EngineInterface): Promise<void> => {
         rec.status = 'orphaned'
         rec.endedAt = status?.updatedAt ?? status?.endedAt ?? Date.now()
         await saveJob($, rec)
+        if (rec.background) pending.push(rec)
       }
     } else if (
-      rec.background &&
-      rec.notified !== true &&
-      (rec.status === 'done' || rec.status === 'failed' || rec.status === 'cancelled')
+      // 后台作业没通知过就补；前台作业只补被中断的（结束时显式记了 notified: false）。
+      (rec.background ? rec.notified !== true : rec.notified === false) &&
+      (rec.status === 'done' || rec.status === 'failed' || rec.status === 'cancelled' || rec.status === 'orphaned')
     ) {
       pending.push(rec)
     }
   }
   // 别的会话派的作业不在这里补发：那边恢复时自己会补。
-  for (const rec of pending.filter(r => r.owner === undefined || r.owner === me).slice(0, 5)) {
+  // 无主作业（派活时没拿到会话 id）也不补：否则谁先恢复就发给谁，会投到无关会话里；它们仍在面板「全部会话」里可见。
+  // 一天以前结束的不再补：早就没人等它了。
+  let allSent = true
+  const fresh = (r: JobRecord): boolean => Date.now() - (r.endedAt ?? r.at) < 86_400_000
+  for (const rec of pending.filter(r => me !== undefined && r.owner === me && fresh(r)).slice(0, 5)) {
     try {
-      await notifyDone($, rec)
+      if (!(await notifyDone($, rec))) {
+        allSent = false
+        continue
+      }
       rec.notified = true
       await saveJob($, rec)
     } catch (error) {
+      allSent = false
       $.ui.log(`delegate: 补发 ${rec.jobId} 的通知失败：${messageOf(error)}`, { to: 'debug' })
     }
   }
+
+  return allSent
 }
 
 // ── 实时面板：左边作业列表，右边选中作业的进度、事件流、插话和取消 ──
@@ -2064,7 +2145,15 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         await refreshAgyQuota($)
         // 面板没开、本进程也没有作业在跑：这一轮不读 store。新派的作业 saveJob 会置 liveJobsRunning，
         // 打开面板会置 livePaneOpen，下一轮自动接上，不用重建计时器。
-        if (!liveJobsRunning && !livePaneOpen) return
+        if (!liveJobsRunning && !livePaneOpen && !pendingNotify) return
+        if (pendingNotify && Date.now() >= nextNotifyAt) {
+          // 结束了的作业由这里发通知；没送进去的每分钟再试，送到为止。
+          pendingNotify = false
+          if (!(await recoverJobs($))) {
+            pendingNotify = true
+            nextNotifyAt = Date.now() + 60_000
+          }
+        }
         const all = await listJobs($)
         const running = all.filter(r => r.status === 'running')
         // 作业结束了就不再惦记它的请示。
