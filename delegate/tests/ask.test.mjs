@@ -177,6 +177,10 @@ test('请示 → 回复 → 再请示 → 回复：phase 变 asking，回复送�
   assert.equal(reply.ok, true)
   assert.equal(reply.text, 'FINAL: 按回复做完了')
   assert.equal(reply.askTimeout, undefined)
+  // 最后一次请示已经答复：status.json 里不能再挂着它，否则外部会以为还在等回复。
+  const end = statusOf(s.jobs, jobId)
+  assert.equal(end.ask, null)
+  assert.notEqual(end.phase, 'asking')
 
   const argv = logOf(s.log).find((e) => e.name === 'argv').argv
   const at = argv.filter((a) => a === '--append-system-prompt')

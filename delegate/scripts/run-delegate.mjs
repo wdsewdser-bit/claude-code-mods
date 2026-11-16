@@ -926,11 +926,13 @@ const main = async () => {
             try { control.append(JSON.stringify({ type: 'dropped', at: Date.now(), reason: 'job is not in stream mode' })) } catch (e) { noteError('append:dropped', e) }
           }
         }
-        // 回复送到了：宽限回到 2 秒，阶段回到 working；ask 留着（主会话靠 seq 去重）。
+        // 回复送到了：宽限回到 2 秒，阶段回到 working，请示一并清掉——外部按 status.json 判断时
+        // 不能还看到一条已答复的请示。下一次请示的 seq 照样递增（askSeq 不归零），主会话去重不受影响。
         if (wrote) {
           graceMs = SEND_GRACE_MS
           askPending = false
           if (control.state.phase === 'asking') control.state.phase = 'working'
+          control.state.ask = null
         }
         if (messages.length > 0) control.write(true)
         if (!cancelled && control.isCancelled()) {
