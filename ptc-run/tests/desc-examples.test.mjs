@@ -20,7 +20,7 @@ const BOOT = 'const s=require("fs").readFileSync(0,"utf8"),k=s.indexOf(String.fr
 
 // DESC_PARTS exactly the way build.cjs reads it.
 const tpl = fs.readFileSync(path.join(root, 'src/register.tpl.ts'), 'utf8')
-const m = /const DESC_PARTS = \[([\s\S]*?)\]\n/.exec(tpl)
+const m = /const DESC_PARTS = \[([\s\S]*?)\]\r?\n/.exec(tpl)
 assert.ok(m, 'DESC_PARTS not found in src/register.tpl.ts')
 const PARTS = eval('[' + m[1] + ']')
 const at = PARTS.findIndex((p) => p.startsWith('// Examples'))

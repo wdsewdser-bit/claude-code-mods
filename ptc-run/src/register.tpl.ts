@@ -78,7 +78,7 @@ const DESC_PARTS = [
   // 0: what the tool is, and the shape of a program
   'Run a JavaScript async-function body in a sandbox: tools.* are synchronous, only console.log output and the return value come back. Use for batch work (loops, grep+aggregate, edits). timeoutMs = whole-program timeout (default 300000, max 600000); root:"D:/abs/dir" is the base for relative paths, path-less glob/grep and cwd-less bash (tools.root). Details: tools.help(topic); tools.help() lists them.',
   // 1: two examples the tests really run (tests/desc-examples.test.mjs)
-  '// Examples — locate, change, verify; print a summary:\nconst hit = tools.grep({pattern:"oldName", glob:"src/**/*.ts"});\nconst w = tools.replace({pattern:"oldName", replacement:"newName", glob:"src/**/*.ts"});\nconst t = tools.sh("npm test", {tail:15});\nconsole.log(hit.total, w.changed, t.code === 0 ? "ok" : t.text);\n// A flow used twice becomes a shortcut:\nlib.def("check", "(tools, dir) => tools.sh(\'npm test\', {cwd:dir, tail:15}).text", "跑测试看结尾");\nconsole.log(lib.check("."));',
+  '// Examples — locate, change, verify; print a summary:\nconst hit = tools.grep({pattern:"oldName", glob:"src/**/*.ts"});\nconst w = tools.replace({pattern:"oldName", replacement:"newName", glob:"src/**/*.ts"});\nconst t = tools.sh("npm test", {tail:15});\nconsole.log(hit.total, w.changed, t.code === 0 ? "ok" : t.text);\n// A flow used twice (tests, diff, push) -> lib.def:\nlib.def("check", "(tools, dir) => tools.sh(\'npm test\', {cwd:dir, tail:15}).text", "跑测试看结尾");\nconsole.log(lib.check("."));',
   // 2: paths and error codes
   'Paths: relative to cwd/root; on big trees give glob/grep a path or pattern. Errors carry .code/.nextAction and a "[CODE]" prefix: INVALID_ARGUMENT NOT_FOUND NOT_UNIQUE COUNT_MISMATCH STALE LOCKED EXISTS POLICY_DENIED BUSY OUTPUT_LIMIT RG_UNAVAILABLE RESULT_UNKNOWN.',
   // 3: read; dedup is only named here, the detail is tools.help("read")
@@ -174,7 +174,7 @@ const RUN_CODE_NAME = 'mcp__ptc-run__run_code'
 const isDispatchTool = (tool: string): boolean =>
   tool === 'Agent' || tool === 'Task' || tool === 'SendMessage' || tool.startsWith('mcp__delegate__')
 const nudgeText = (n: number): string =>
-  'ptc-run：已连续 ' + n + ' 次单步调用。把接下来能预见的步骤写进一个 run_code 程序（依赖上一步结果的用 if 判断），一次做完；重复出现的流程用 lib.def 登记。'
+  'ptc-run：已连续 ' + n + ' 次单步调用。把接下来能预见的步骤写进一个 run_code 程序（依赖上一步结果的用 if 判断），一次做完；重复出现的流程用 lib.def 登记；已有的快捷函数直接 lib.xxx() 调用，lib.help() 查清单。'
 const resetNudge = (s: NudgeState): void => {
   s.streak = 0
   s.lastAt = 0
@@ -278,11 +278,13 @@ const writeOverflow = async ($: unknown, text: string): Promise<string | undefin
 // tool description, and at the end this part was cut off and never seen.
 const DESC_APPEND_MAX = 450
 const SHORT_HELP = ' Shorthand: tools.sh(command,{tail?=60,cwd?,timeoutMs?})->{code,text} (last lines of stdout+stderr); tools.peek(path,pattern,{context?=2,limit?=20})->matching lines with real line numbers.'
-const LIB_HINT = ' 重复用到的多步流程用 lib.def 登记成快捷函数，之后一次调用；lib.help() 看全部。'
+const LIB_HINT = ' 同一套多步流程第二次出现（跑某个 mod 的测试、导出 diff、提交推送）就用 lib.def 登记，之后一次调用；登记前先看 lib.help() 和下面的全局库，有现成的直接 lib.xxx()。'
+// Delegated executors (delegate's ptc-only, read-only sandboxes) do one-off work: they may call the global library, never register.
+const LIB_HINT_DELEGATED = ' lib.help() 列出全局库现有函数，可直接 lib.xxx() 调用。'
 const LIB_REMAINDER = ' 其余用 lib.help()'
 type LibDoc = { name: string; doc: string }
-const descAppend = (entries: readonly LibDoc[]): string => {
-  const base = SHORT_HELP + LIB_HINT
+const descAppend = (entries: readonly LibDoc[], delegated = false): string => {
+  const base = SHORT_HELP + (delegated ? LIB_HINT_DELEGATED : LIB_HINT)
   if (entries.length === 0) return base
   const room = Math.max(0, DESC_APPEND_MAX - base.length)
   let listing = ' 全局库：'
@@ -361,7 +363,7 @@ export const register: Register = (on, options) => {
     const baseDesc = ro ? (sdkInPrompt ? descShortRo(roRoots) : descRo(roRoots)) : sdkInPrompt ? DESC_SHORT : DESC
     await $.tool.register({
       name: 'run_code',
-      description: descAppend(await readLibDocs($)).trimStart() + ' ' + baseDesc,
+      description: descAppend(await readLibDocs($), sdkInPrompt || ro).trimStart() + ' ' + baseDesc,
       isDeferred: false,
       inputSchema: {
         type: 'object',
@@ -610,6 +612,7 @@ export const __test = {
   bashClip,
   clipMarker,
   descAppend,
+  LIB_HINT_DELEGATED,
   DEFAULTS,
   SHORT_HELP,
   LIB_HINT,

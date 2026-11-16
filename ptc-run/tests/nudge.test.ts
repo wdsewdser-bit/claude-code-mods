@@ -122,7 +122,8 @@ describe('single-step reminder: counting rules', () => {
 
   test('the reminder asks for lib.def at the end', () => {
     expect(__test.nudgeText(3)).toContain('run_code')
-    expect(__test.nudgeText(3).endsWith('重复出现的流程用 lib.def 登记。')).toBe(true)
+    expect(__test.nudgeText(3)).toContain('重复出现的流程用 lib.def 登记')
+    expect(__test.nudgeText(3).endsWith('已有的快捷函数直接 lib.xxx() 调用，lib.help() 查清单。')).toBe(true)
   })
 })
 

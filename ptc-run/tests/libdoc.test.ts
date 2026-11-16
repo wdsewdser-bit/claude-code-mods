@@ -48,6 +48,15 @@ describe('the appended description', () => {
     expect(add).toContain('tools.sh')
     expect(add).toContain('tools.peek')
     expect(add).toContain('lib.def')
+    expect(add).toContain('第二次出现')
+    expect(add).toContain('lib.help()')
+    expect(add.length).toBeLessThanOrEqual(__test.DESC_APPEND_MAX)
+  })
+
+  test('delegated executors are told to call the global library, never to register', () => {
+    const add = __test.descAppend([{ name: 'check', doc: '跑测试' }], true)
+    expect(add).toBe(__test.SHORT_HELP + __test.LIB_HINT_DELEGATED + ' 全局库：check — 跑测试')
+    expect(add).not.toContain('lib.def')
     expect(add.length).toBeLessThanOrEqual(__test.DESC_APPEND_MAX)
   })
 
@@ -77,6 +86,15 @@ describe('the description the tool is registered with', () => {
     expect(t.desc.slice(0, i)).toContain('check — 跑测试')
     expect(t.desc.slice(0, i)).toContain('lib.def')
     expect(t.desc.endsWith('that returns them')).toBe(true)
+  })
+
+  test('delegate ptc-only and read-only sandboxes get no lib.def hint in the prefix', { timeoutMs: 20000 }, async () => {
+    for (const env of [{ USERPROFILE: 'C:/home', PTC_RUN_SDK_IN_PROMPT: '1' }, { USERPROFILE: 'C:/home', PTC_RUN_READONLY: '1' }]) {
+      const t = await startWith(lib({ check: '跑测试' }), env)
+      expect(t.desc).not.toContain('lib.def')
+      expect(t.desc).toContain(__test.LIB_HINT_DELEGATED.trim())
+      expect(t.desc).toContain('check — 跑测试')
+    }
   })
 
   test('the global file is the one read, once', { timeoutMs: 20000 }, async () => {

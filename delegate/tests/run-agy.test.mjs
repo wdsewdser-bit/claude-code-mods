@@ -25,6 +25,11 @@ test('agent files drop agy defaults and route work through ptc run_code', () => 
   assert.doesNotMatch(read, /^tools:|^mcpServers:/m)
   assert.doesNotMatch(read, /@@SDK@@/)
   assert.match(agentFileOf('work'), /cc-delegate-work/)
+  // 派出去的活是一次性的：不教 lib.def 登记，只说可调用全局库
+  for (const k of ['read', 'work']) {
+    assert.doesNotMatch(agentFileOf(k), /lib\.def/)
+    assert.match(agentFileOf(k), /lib\.help\(\) 列出全局库现有函数/)
+  }
 })
 
 test('the first prompt names the working directory; follow-ups are bare', () => {
@@ -154,6 +159,25 @@ const callPtc = (cwd, code, readonly) => new Promise((resolve, reject) => {
   })
   child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'run_code', arguments: { description: '示例', code } } }) + '\n')
 })
+test('the ptc MCP server describes run_code without lib.def', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-desc-'))
+  try {
+    const server = path.resolve(import.meta.dirname, '..', '..', 'ptc-run', 'mcp', 'server.mjs')
+    const out = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [server], { cwd: dir, env: { ...process.env, PTC_MCP_CWD: dir }, windowsHide: true })
+      let s = ''
+      child.stdout.on('data', d => { s += d })
+      child.on('error', reject)
+      child.on('close', () => resolve(s))
+      child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) + '\n')
+    })
+    const desc = JSON.parse(out.split('\n').find(Boolean)).result.tools[0].description
+    assert.doesNotMatch(desc, /lib\.def/)
+    assert.match(desc, /lib\.help\(\) 列出全局库现有函数/)
+    assert.match(desc, /tools\.grep/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
 const codeBlocks = text => [...text.matchAll(/```js\n([\s\S]*?)```/g)].map(m => m[1])
 
 test('the run_code examples in the agent prompts run in the ptc sandbox', { timeout: 120000 }, async () => {

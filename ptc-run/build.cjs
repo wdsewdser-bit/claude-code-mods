@@ -7,6 +7,6 @@ const broker = fs.readFileSync(__dirname + "/src/broker.js", "utf8");
 const tpl = fs.readFileSync(__dirname + "/src/register.tpl.ts", "utf8");
 const out = tpl.replace("__BROKER__", () => JSON.stringify(broker)).replace("__RUNNER__", () => JSON.stringify(runner)).split("\r").join("") + NL;
 fs.writeFileSync(__dirname + "/hooks/register.ts", out);
-const m = /const DESC_PARTS = \[([\s\S]*?)\]\n/.exec(tpl);
+const m = /const DESC_PARTS = \[([\s\S]*?)\]\r?\n/.exec(tpl);
 if (m) console.log("DESC chars (approx): " + eval("[" + m[1] + "]").join(" ").length);
 console.log("built hooks/register.ts (" + out.length + " bytes)");

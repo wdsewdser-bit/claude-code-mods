@@ -63,11 +63,13 @@ const AGENTS_DIR = process.env.DELEGATE_AGY_AGENTS_DIR || path.join(home, '.gemi
 const PTC_SERVER = path.resolve(here, '..', '..', 'ptc-run', 'mcp', 'server.mjs')
 
 // run_code 的 SDK 说明：和主会话 run_code 的工具说明同一份（ptc-run/src/register.tpl.ts 的 DESC_PARTS）。
+// 派出去的活是一次性的：去掉 lib.def 登记示例，只留一句可调用全局库（全局库对每个会话都加载，会话库按作业各自独立）。
+export const forDelegate = s => s.replace(/\n\/\/[^\n]*\nlib\.def\([^\n]*\nconsole\.log\(lib\.[^\n]*/, '') + ' lib.help() 列出全局库现有函数，可直接 lib.xxx() 调用。'
 const sdkText = () => {
   try {
     const tpl = fs.readFileSync(path.resolve(here, '..', '..', 'ptc-run', 'src', 'register.tpl.ts'), 'utf8')
-    const m = /const DESC_PARTS = \[([\s\S]*?)\]\n/.exec(tpl)
-    if (m) return (0, eval)('[' + m[1] + ']').join(' ')
+    const m = /const DESC_PARTS = \[([\s\S]*?)\]\r?\n/.exec(tpl)
+    if (m) return forDelegate((0, eval)('[' + m[1] + ']').join(' '))
   } catch {}
   return 'tools.* 都是同步的（不要 .then）：tools.read/write/edit/replace/glob/grep/peek/batch/bash/sh/parallel，ref.*，lib.*；tools.help() 列出主题。'
 }

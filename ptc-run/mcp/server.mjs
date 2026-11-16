@@ -28,11 +28,13 @@ const scope = (env.PTC_MCP_SCOPE || 'mcp').replace(/[^A-Za-z0-9_.-]/g, '_').slic
 const readRoots = ro ? (env.PTC_RUN_READ_ROOTS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean) : []
 
 // 工具说明和主会话的 run_code 同一份：从 src/register.tpl.ts 的 DESC_PARTS 取（build.cjs 也是这样读的）。
+// 这里只给 delegate 派出的执行者用：去掉 lib.def 登记示例，只留一句可调用全局库（与 delegate/scripts/run-agy.mjs 同一条规则）。
+const forDelegate = s => s.replace(/\n\/\/[^\n]*\nlib\.def\([^\n]*\nconsole\.log\(lib\.[^\n]*/, '') + ' lib.help() 列出全局库现有函数，可直接 lib.xxx() 调用。'
 const descParts = () => {
   try {
     const tpl = fs.readFileSync(path.join(root, 'src', 'register.tpl.ts'), 'utf8')
-    const m = /const DESC_PARTS = \[([\s\S]*?)\]\n/.exec(tpl)
-    if (m) return (0, eval)('[' + m[1] + ']').join(' ')
+    const m = /const DESC_PARTS = \[([\s\S]*?)\]\r?\n/.exec(tpl)
+    if (m) return forDelegate((0, eval)('[' + m[1] + ']').join(' '))
   } catch {}
   return 'Run a JavaScript async-function body in a sandbox: tools.* are synchronous (no .then); only console.log output and the return value come back. tools.help() lists the SDK topics.'
 }

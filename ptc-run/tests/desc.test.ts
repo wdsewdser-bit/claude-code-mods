@@ -20,6 +20,7 @@ describe('the tool description fits the host budget', () => {
 
   test('the prefix itself never exceeds its cap', () => {
     expect((__test.SHORT_HELP + __test.LIB_HINT).length).toBeLessThanOrEqual(__test.DESC_APPEND_MAX)
+    expect((__test.SHORT_HELP + __test.LIB_HINT_DELEGATED).length).toBeLessThanOrEqual(__test.DESC_APPEND_MAX)
   })
 
   test('the examples and the tools.help pointer are there', () => {
