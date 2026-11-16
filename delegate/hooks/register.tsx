@@ -1434,7 +1434,8 @@ const callTool = async (
   running += 1
   $.ui.status(`◆ 委派 ${label} · 运行中`)
   try {
-    const done = await settle($, record, await runJob($, wire))
+    ownJobs.add(record.jobId)
+    const done = await settle($, record, await runJob($, wire)).finally(() => ownJobs.delete(record.jobId))
     // 调用被打断（新消息插进来、用户中止）时模型看到的是“被拒”，这份失败结果它根本收不到：
     // 另外往会话里补一条通知，带上改动摘要，免得它当成没跑起来又派一次。
     if (done.isError === true && /aborted/i.test(record.error ?? '')) {
@@ -1504,6 +1505,10 @@ const settle = async (
 // 终态通知只由 session.start 起的计时器发（它的 $ 跟会话一样长）：派活钩子的 $ 在钩子返回、
 // 调用被打断或热重载之后，prompt.submit 可能不报错却送不进会话，记成已通知就再也补不回来。
 let pendingNotify = false
+// 本进程正在跑的作业：runner 还没写出 status.json 时也不能当成孤儿。
+const ownJobs = new Set<string>()
+// 刚派出的作业给 runner 留这么久写出 status.json。
+const START_GRACE_MS = 5 * 60_000
 const NOTIFY_WINDOW_MS = 2 * 3_600_000
 let nextNotifyAt = 0
 
@@ -1566,7 +1571,8 @@ const runBackground = async (
   job: Record<string, unknown>,
 ): Promise<void> => {
   try {
-    const done = await settle($, record, await runJob($, job))
+    ownJobs.add(record.jobId)
+    const done = await settle($, record, await runJob($, job)).finally(() => ownJobs.delete(record.jobId))
     // 完整结果写进 results/<id>.md，计时器补发通知时照它发。
     try {
       const home = await homeOf($)
@@ -1837,7 +1843,10 @@ const recoverJobs = async ($: EngineInterface): Promise<boolean> => {
   const fresh = (r: JobRecord): boolean => Date.now() - (r.endedAt ?? r.at) < NOTIFY_WINDOW_MS
   for (const rec of records) {
     if (rec.status === 'running') {
+      if (ownJobs.has(rec.jobId)) continue
       const status = root === undefined ? undefined : await readStatus($, jobDir(root, rec.jobId))
+      // 还没有 pid 的新作业：runner 可能只是还没写出 status.json。
+      if (status?.pid === undefined && Date.now() - rec.at < START_GRACE_MS) continue
       const alive = status?.pid === undefined ? false : await isAlive($, status.pid)
       if (alive) continue
       const result = root === undefined ? undefined : await readResult($, jobDir(root, rec.jobId))

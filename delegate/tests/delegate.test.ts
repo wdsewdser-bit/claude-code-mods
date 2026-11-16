@@ -1059,6 +1059,18 @@ describe('jobs', () => {
     expect(t.submitted).toHaveLength(2)
   })
 
+  test('a job started a moment ago with no status file yet is not taken for an orphan', { timeoutMs: 10_000 }, async ($, on) => {
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    t.store.set('job:bg-new', {
+      jobId: 'bg-new', sessionId: '', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
+      background: true, status: 'running', at: Date.now() - 2_000, summary: 'new', owner: 'sess-me',
+    })
+    await startSession($ as never)
+    expect(jobOf(t.store, 'bg-new').status).toBe('running')
+    expect(t.submitted).toHaveLength(0)
+  })
+
   test('a job orphaned long ago is marked notified without a prompt, and is never announced later', { timeoutMs: 10_000 }, async ($, on) => {
     const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
     const at = Date.now() - 11 * 3_600_000
