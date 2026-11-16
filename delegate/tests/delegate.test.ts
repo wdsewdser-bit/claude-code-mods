@@ -650,7 +650,7 @@ type Files = Map<string, string>
 const jobSetup = (
   on: never,
   reply: Record<string, unknown>,
-  opts: { files?: Files; alive?: number[] } = {},
+  opts: { files?: Files; alive?: number[]; git?: string; mtimes?: Record<string, number> } = {},
 ) => {
   const store = new Map<string, unknown>([
     ['cfg', normalize(undefined)],
@@ -701,6 +701,8 @@ const jobSetup = (
   ])
   o('fs.stat', (_$, e: { path: string }) => {
     const key = e.path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '').toLowerCase()
+    const mtime = opts.mtimes?.[key]
+    if (mtime !== undefined) return { value: { kind: 'file', size: 0, mtimeMs: mtime, isLink: false } }
     const kind = kinds.get(key)
     if (kind === undefined) throw new Error('ENOENT')
     return { value: { kind, size: 0, mtimeMs: 0, isLink: false } }
@@ -724,6 +726,9 @@ const jobSetup = (
           isStderrTruncated: false,
         },
       }
+    }
+    if (argv[0] === 'git' && opts.git !== undefined) {
+      return { value: { exitCode: 0, stdout: opts.git, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     if (argv[0] === 'taskkill') {
       killed.push(argv.join(' '))
@@ -1054,6 +1059,22 @@ describe('jobs', () => {
     expect(t.submitted).toHaveLength(2)
   })
 
+  test('a job orphaned long ago is marked notified without a prompt, and is never announced later', { timeoutMs: 10_000 }, async ($, on) => {
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    const at = Date.now() - 11 * 3_600_000
+    t.store.set('job:bg-old', {
+      jobId: 'bg-old', sessionId: 'sid-old', tier: 'agy', model: 'm', cwd: '/work', mode: 'work', ptc: 'only',
+      background: true, status: 'running', at, summary: 'old', owner: 'sess-me',
+    })
+    t.files.set(`${ROOT}/bg-old/status.json`, JSON.stringify({ jobId: 'bg-old', pid: 7778, phase: 'working', startedAt: at, updatedAt: at + 60_000 }))
+    await startSession($ as never)
+    expect(jobOf(t.store, 'bg-old').status).toBe('orphaned')
+    expect(jobOf(t.store, 'bg-old').notified).toBe(true)
+    expect(t.submitted).toHaveLength(0)
+    await startSession($ as never)
+    expect(t.submitted).toHaveLength(0)
+  })
+
   test('a job that ended on an unanswered ask says so, and does not read like a normal finish', { timeoutMs: 10_000 }, async ($, on) => {
     const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
     ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
@@ -1071,7 +1092,7 @@ describe('jobs', () => {
   })
 
   test('an interrupted foreground job is announced with a hint to check the working tree', { timeoutMs: 10_000 }, async ($, on) => {
-    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map(), git: ' M old.rs\n M new.rs\n', mtimes: { '/work/old.rs': 1, '/work/new.rs': Date.now() } })
     ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
     t.store.set('job:fg-cut', {
       owner: 'sess-me', jobId: 'fg-cut', sessionId: 'sid-cut', tier: 'gpt', model: 'gpt-6.1-sol', cwd: '/work', mode: 'work', ptc: 'only',
@@ -1087,6 +1108,9 @@ describe('jobs', () => {
     expect(t.submitted).toHaveLength(1)
     expect(t.submitted[0]).toContain('前台作业 fg-cut 被中断')
     expect(t.submitted[0]).toContain('git status')
+    // 只算作业开始后改过的文件：之前就在的改动不归它。
+    expect(t.submitted[0]).toContain('new.rs')
+    expect(t.submitted[0]).not.toContain('old.rs')
     expect(jobOf(t.store, 'fg-cut').notified).toBe(true)
   })
 
