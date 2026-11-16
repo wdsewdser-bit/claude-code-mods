@@ -1502,12 +1502,87 @@ test('a cold cache holds another session\'s message too, and re-submits it frame
   expect(heldLeft(w)).toEqual([])
 })
 
-test('a task notification is not held by a cold cache', async ($, on) => {
-  const w = world(on, 's-held-task', { CTX_MOD: '1' })
+for (const [origin, label] of [
+  [{ kind: 'task-notification' }, '后台任务的完成通知'],
+  [{ kind: 'plugin', name: 'cache-keeper' }, '插件 cache-keeper 发来的消息'],
+  [{ kind: 'plugin', name: 'delegate', asUser: true }, '插件 delegate 发来的消息'],
+  [{ kind: 'unclassified' }, '来源不明的消息'],
+  [{ kind: 'auto-continuation' }, '自动续跑的提示'],
+  [{ kind: 'observer' }, '观察者发来的消息'],
+  [{ kind: 'something-new' }, '来源为 something-new 的消息'],
+] as const) {
+  test(`a cold cache holds a ${origin.kind} message too and re-submits it framed under its origin`, async ($, on) => {
+    const w = world(on, `s-held-${origin.kind}`, { CTX_MOD: '1' })
+    await boot($)
+    await goCold($, w)
+    const result = await $.prompt.submit({ text: '后台跑完了', wait: false, origin } as never)
+    expect(isDropped(result)).toBe(true)
+    expect(heldLeft(w)).toEqual(['后台跑完了'])
+
+    await w.clock.advance(300)
+    await w.clock.settle()
+    expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
+    expect(w.resubmits).toHaveLength(1)
+    expect(w.resubmits[0]).toContain(`换窗口前收到的${label}，不是用户本人的话`)
+    expect(w.resubmitAsUser).toEqual([false])
+    expect(heldLeft(w)).toEqual([])
+  })
+}
+
+test('what this mod submits itself is never held, cold cache or not', async ($, on) => {
+  const w = world(on, 's-held-ours', { CTX_MOD: '1' })
   await boot($)
   await goCold($, w)
-  const result = await $.prompt.submit({ text: '<task-notification>done</task-notification>', wait: false, origin: { kind: 'task-notification' } } as never)
+  const result = await $.prompt.submit({ text: 'ctx-mod：已换到新的上下文窗口。', wait: false, origin: { kind: 'plugin', name: 'ctx-mod' } } as never)
   expect(isDropped(result)).toBe(false)
+  expect(heldLeft(w)).toEqual([])
+})
+
+test('a backlog from mixed origins while cold asks for one compaction and goes in in order', async ($, on) => {
+  const w = world(on, 's-held-mixed', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  expect(isDropped(await $.prompt.submit({ text: '额度重置了', wait: false, origin: { kind: 'plugin', name: 'cache-keeper' } } as never))).toBe(true)
+  expect(isDropped(await $.prompt.submit({ text: '任务完成', wait: false, origin: { kind: 'task-notification' } } as never))).toBe(true)
+  expect(isDropped(await sayWhileCold($, '我回来了'))).toBe(true)
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
+  expect(w.resubmits).toHaveLength(3)
+  expect(w.resubmits[0]).toContain('额度重置了')
+  expect(w.resubmits[1]).toContain('任务完成')
+  expect(w.resubmits[2]).toBe('我回来了')
+  expect(w.resubmitAsUser).toEqual([false, false, true])
+})
+
+test('a manual switch asked for while a cold switch runs does not compact a second time', async ($, on) => {
+  const w = world(on, 's-held-manual-race', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  expect(isDropped(await sayWhileCold($, '先说一句'))).toBe(true)
+  expect(await runCommand($, 'switch')).toContain('已经在换窗口了')
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
+  expect(w.resubmits).toEqual(['先说一句'])
+})
+
+test('a cold message that comes while a manual switch is pending waits for it instead of compacting again', async ($, on) => {
+  const w = world(on, 's-held-after-manual', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  expect(await runCommand($, 'switch')).toContain('正在换到新窗口')
+  const result = await sayWhileCold($, '换窗时到的')
+  expect(String((result as { drop?: unknown }).drop)).toContain('排在后面')
+
+  await w.clock.advance(300)
+  await w.clock.settle()
+  await w.clock.advance(300)
+  await w.clock.settle()
+  expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
+  expect(w.resubmits).toEqual(['换窗时到的'])
   expect(heldLeft(w)).toEqual([])
 })
 

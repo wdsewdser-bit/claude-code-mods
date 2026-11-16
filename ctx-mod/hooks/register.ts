@@ -49,6 +49,8 @@ let config: Config = DEFAULTS
 let switchReason: string | null = null
 /** Set by `session.compact` when this mod answered a compaction, so `turn.complete` sees it. */
 let committed = false
+/** When this process last committed a switch: a window not yet requested since is not cold. */
+let lastCommitAt = 0
 /** Whether a held-prompt switch is under way: later prompts queue behind it instead of starting another. */
 let isHoldingFlow = false
 /** The next main-thread request is the first of a new window: note its prefix. */
@@ -350,7 +352,7 @@ const deliverHeld = async ($: EngineInterface, session: Session): Promise<void> 
     const body = notes.length === 0 ? item.text : `${item.text}\n\n${notes.join('\n')}`
     // Someone else's message goes back framed under this plugin, labelled with where it came from:
     // re-submitted as the person's own it would read, and be booked, as the user's words.
-    const outside = item.from === undefined ? undefined : (OUTSIDE_KINDS[item.from] ?? item.from)
+    const outside = item.from === undefined ? undefined : fromLabel(item.from)
     const text = outside === undefined ? body : `（换窗口前收到的${outside}，不是用户本人的话，原文如下）\n\n${body}`
     let isDelivered = false
     try {
@@ -638,9 +640,38 @@ const OUTSIDE_KINDS: Record<string, string> = {
   channel: '频道转来的消息',
   'slack-ping': 'Slack 上的呼叫',
   'scheduled-trigger': '定时任务触发的提示',
+  'task-notification': '后台任务的完成通知',
+  'auto-continuation': '自动续跑的提示',
+  observer: '观察者发来的消息',
+  unclassified: '来源不明的消息',
 }
 
-const isOutsideOrigin = (origin: { kind: string }): boolean => origin.kind in OUTSIDE_KINDS
+/**
+ * Where a held message came from, kept on disk beside it: none for the person's own
+ * words, the plugin's name for another plugin's, the origin's kind for anything else.
+ */
+const heldFrom = (origin: { kind: string }): string | undefined => {
+  if (isPersonOrigin(origin)) return undefined
+  const name = (origin as { name?: unknown }).name
+  if (origin.kind === 'plugin' && typeof name === 'string' && name !== '') return `plugin:${name}`
+
+  return origin.kind
+}
+
+/** How a held message's origin is named when it goes back in. */
+const fromLabel = (from: string): string => {
+  if (from.startsWith('plugin:')) return `插件 ${from.slice('plugin:'.length)} 发来的消息`
+  if (from === 'plugin') return '插件发来的消息'
+
+  return OUTSIDE_KINDS[from] ?? `来源为 ${from} 的消息`
+}
+
+/** Anything this mod itself submitted: a held message going back in, a switch notice. */
+const isOurs = (origin: { kind: string }): boolean => {
+  const plugin = origin as { kind: string; name?: unknown }
+
+  return plugin.kind === 'plugin' && plugin.name === COMMAND
+}
 
 /** A prompt this mod itself re-submitted as the person's own words. */
 const isOurUser = (origin: { kind: string }): boolean => {
@@ -728,9 +759,12 @@ const manualSwitch = ($: EngineInterface, session: Session): CommandRunResult =>
   if (session.latestPersonSeq() === null && session.latestRelaySeq() === null) {
     return { text: 'ctx-mod：还没有可交接的内容，不换窗口。' }
   }
+  // A switch for an expired cache is already on its way: a second one would find nothing to hand over.
+  if (isHoldingFlow || switchReason !== null) return { text: 'ctx-mod：已经在换窗口了，不再重复换。' }
+  // Claimed now, not when the timer fires: a message that comes in between waits for this switch instead of starting its own.
+  switchReason = 'manual-switch'
   $.clock.after(300, () => {
     void (async () => {
-      switchReason = 'manual-switch'
       try {
         await $.command.run({ command: 'compact' })
       } catch (error) {
@@ -1817,6 +1851,7 @@ export const register: Register = (on, options) => {
           tokensBefore: env.tokens,
           handoffText: text,
         })
+        lastCommitAt = Date.now()
         committed = true
         awaitingPrefix = true
         armAttachments($)
@@ -1842,6 +1877,7 @@ export const register: Register = (on, options) => {
           tokensBefore: env.tokens,
           handoffText: text,
         })
+        lastCommitAt = Date.now()
         // When the disk check sent a switch the model asked for down this path, `turn.complete` still has to see it happened.
         if (mine) committed = true
         awaitingPrefix = true
@@ -1866,10 +1902,15 @@ export const register: Register = (on, options) => {
     try {
       const session = await sessionOf($)
       const id = await idOf($)
-      if (session !== undefined && id !== undefined && (isPersonOrigin(e.origin) || isOutsideOrigin(e.origin))) {
+      // Every turn but the mod's own writes the whole cache: the person's, another session's,
+      // another plugin's, a task's notification. Only what this mod submits itself goes by.
+      if (session !== undefined && id !== undefined && !isOurs(e.origin)) {
         // During a switch every such message waits its turn; otherwise only a cold cache holds one.
-        let wants = isHoldingFlow
-        if (!wants) {
+        // A switch already running (asked for by hand or by the model) is the one this message
+        // waits for; one already made, with no request since, left a window that is not cold.
+        let wants = isHoldingFlow || switchReason !== null
+        const isFresh = lastCommitAt > (session.lastRequestAt() ?? 0)
+        if (!wants && !isFresh) {
           const env = await envOf($, id)
           // A restarted process has no fill of its own before its first request, so the
           // keeper's cached prefix — kept across restarts — stands in for it: the cache
@@ -1888,7 +1929,7 @@ export const register: Register = (on, options) => {
         const attachments = e.attachments ?? []
         const images =
           wants && attachments.length > 0 ? await pastedImages($, attachments, id) : []
-        const from = isOutsideOrigin(e.origin) ? e.origin.kind : undefined
+        const from = heldFrom(e.origin)
         const heldId = wants ? await session.hold(e.text, attachments, images, from) : null
         if (heldId !== null) {
           holds = true
@@ -1924,6 +1965,10 @@ export const register: Register = (on, options) => {
         void (async () => {
           try {
             // Only a message held for the expired cache calls for a switch: one that queued behind a switch which has since ended just goes in.
+            // A switch already under way when the message came is left to finish; the message goes in after it.
+            for (let waited = 0; switchReason !== null && switchReason !== 'cold' && waited < 300; waited++) {
+              await new Promise<void>(resolve => $.clock.after(200, resolve))
+            }
             if (isExpired) {
               // The last keepalive saw the conversation while the cache was still warm: book
               // what it found still open before the history is replaced.
@@ -1998,6 +2043,7 @@ export const register: Register = (on, options) => {
     // is module-wide, and a new session id is all that separates them.
     switchReason = null
     committed = false
+    lastCommitAt = 0
     isHoldingFlow = false
     awaitingPrefix = false
     lastStep = null
