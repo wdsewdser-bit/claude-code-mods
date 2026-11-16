@@ -719,6 +719,18 @@ const invalidateJobs = (): void => {
 const copyJobs = (list: JobRecord[]): JobRecord[] =>
   list.map(rec => (rec.readPaths === undefined ? { ...rec } : { ...rec, readPaths: [...rec.readPaths] }))
 
+/** 只写作业本身那一条，写成功才返回 true（失效的 $ 会被宿主拒绝）。 */
+const claimJob = async ($: EngineInterface, rec: JobRecord): Promise<boolean> => {
+  try {
+    await $.store.set(jobKey(rec.jobId), rec)
+    invalidateJobs()
+
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** 一条作业一个 key：两个会话同时派活也不会互相覆盖。 */
 const saveJob = async ($: EngineInterface, rec: JobRecord): Promise<void> => {
   try {
@@ -1895,11 +1907,19 @@ const recoverOnce = async ($: EngineInterface): Promise<boolean> => {
       // 发之前按 store 里的最新记录再确认一次：别处可能刚通知过。
       const latest = await loadJob($, rec.jobId)
       if (latest?.notified === true) continue
-      if (!(await notifyDone($, rec))) {
+      // 先记成已通知再发：prompt.submit 要等会话空闲才返回，其间热重载会让这个 $ 失效，
+      // 事后再记就写不进去，新实例会把同一条再发一遍。记不进去就不发，交给新实例。
+      rec.notified = true
+      if (!(await claimJob($, rec))) {
         allSent = false
         continue
       }
-      rec.notified = true
+      if (!(await notifyDone($, rec))) {
+        rec.notified = false
+        await saveJob($, rec)
+        allSent = false
+        continue
+      }
       await saveJob($, rec)
     } catch (error) {
       allSent = false

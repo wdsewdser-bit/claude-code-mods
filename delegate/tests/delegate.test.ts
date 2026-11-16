@@ -650,7 +650,7 @@ type Files = Map<string, string>
 const jobSetup = (
   on: never,
   reply: Record<string, unknown>,
-  opts: { files?: Files; alive?: number[]; git?: string; mtimes?: Record<string, number> } = {},
+  opts: { files?: Files; alive?: number[]; git?: string; mtimes?: Record<string, number>; dropSubmit?: boolean } = {},
 ) => {
   const store = new Map<string, unknown>([
     ['cfg', normalize(undefined)],
@@ -708,6 +708,7 @@ const jobSetup = (
     return { value: { kind, size: 0, mtimeMs: 0, isLink: false } }
   })
   o('prompt.submit', (_$, e: { text: string }) => {
+    if (opts.dropSubmit === true) return { drop: 'busy' }
     submitted.push(e.text)
     return { text: e.text }
   })
@@ -1069,6 +1070,18 @@ describe('jobs', () => {
     t.files.set(`${ROOT}/bg-race/result.json`, JSON.stringify({ ok: true, text: 'race result', sessionId: 'sid-r', turns: 1 }))
     await Promise.all([startSession($ as never), startSession($ as never)])
     expect(t.submitted.filter(x => x.includes('bg-race'))).toHaveLength(1)
+  })
+
+  test('a notice that is dropped leaves the job un-notified so it is tried again', { timeoutMs: 10_000 }, async ($, on) => {
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map(), dropSubmit: true })
+    t.store.set('job:bg-drop', {
+      jobId: 'bg-drop', sessionId: 'sid-d', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
+      background: true, status: 'done', at: Date.now() - 60_000, summary: 'drop', owner: 'sess-me', notified: false,
+    })
+    t.files.set(`${ROOT}/bg-drop/result.json`, JSON.stringify({ ok: true, text: 'dropped', sessionId: 'sid-d', turns: 1 }))
+    await startSession($ as never)
+    expect(jobOf(t.store, 'bg-drop').notified).toBe(false)
   })
 
   test('a job started a moment ago with no status file yet is not taken for an orphan', { timeoutMs: 10_000 }, async ($, on) => {
