@@ -10,6 +10,33 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// 由 launch.mjs 脱离插件进程树启动时：任务在 --input 文件里（附带宿主的环境变量），最终结果另写一份到 --reply 文件。
+// 这样插件热重载、宿主退出都杀不到 runner。直接用 stdin 启动的老方式照旧可用。
+const argAfter = flag => {
+  const i = process.argv.indexOf(flag)
+  return i === -1 ? undefined : process.argv[i + 1]
+}
+const REPLY_FILE = argAfter('--reply')
+let INPUT_JOB
+{
+  const inputFile = argAfter('--input')
+  if (inputFile !== undefined) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(inputFile, 'utf8'))
+      for (const [k, v] of Object.entries(raw.env ?? {})) if (typeof v === 'string') process.env[k] = v
+      INPUT_JOB = JSON.stringify(raw.job ?? {})
+    } catch {}
+    try { fs.rmSync(inputFile, { force: true }) } catch {}
+  }
+}
+const writeReply = value => {
+  if (REPLY_FILE === undefined) return
+  try {
+    fs.writeFileSync(REPLY_FILE + '.tmp', JSON.stringify(value))
+    fs.renameSync(REPLY_FILE + '.tmp', REPLY_FILE)
+  } catch {}
+}
+
 const here = path.dirname(fileURLToPath(import.meta.url))
 
 const home = os.homedir()
@@ -38,12 +65,14 @@ const terminalOf = text => {
 }
 
 const finish = (value, code = 0) => {
+  writeReply(value)
   process.stdout.write(JSON.stringify(value) + '\n')
   process.exit(code)
 }
 
 const readStdin = () =>
   new Promise((resolve, reject) => {
+    if (INPUT_JOB !== undefined) return resolve(INPUT_JOB)
     let s = ''
     process.stdin.setEncoding('utf8')
     process.stdin.on('data', d => (s += d))

@@ -298,6 +298,7 @@ describe('delegate tool', () => {
     const jobs: Record<string, unknown>[] = []
     const files = new Map<string, string>()
     const submitted: string[] = []
+    const launched: string[] = []
     const o = on as (name: string, fn: (_$: unknown, e: never) => unknown) => void
     o('session.start', (_$, e: { cwd: string }) => ({ cwd: e.cwd }))
     o('tool.call', () => ({ deny: 'no such tool' }))
@@ -340,6 +341,7 @@ describe('delegate tool', () => {
     o('process.run', (_$, e: { argv?: string[]; init?: { stdin?: string } }) => {
       // GPT 作业结束时会查一次额度，那不是派活。
       const quota = e.argv?.some(a => a.endsWith('gpt-quota.mjs')) === true
+      if (!quota) launched.push(e.argv?.[1] ?? '')
       if (!quota) jobs.push(JSON.parse(e.init?.stdin ?? '{}'))
       return {
         value: {
@@ -352,7 +354,7 @@ describe('delegate tool', () => {
       }
     })
 
-    return Object.assign(jobs, { files, submitted, store })
+    return Object.assign(jobs, { files, submitted, store, launched })
   }
 
   const call = ($: never, input: Record<string, unknown>) =>
@@ -634,6 +636,9 @@ describe('delegate tool', () => {
     expect(jobs.submitted).toHaveLength(1)
     expect(jobs.submitted[0]).toContain('完成')
     expect(jobs.submitted[0]).toContain('late result')
+    // runner 由启动器交给 WMI 起，不挂在插件模块下：热重载杀不到它。
+    expect(jobs.launched.length).toBeGreaterThan(0)
+    expect(jobs.launched.every(a => a.endsWith('/scripts/launch.mjs'))).toBe(true)
     expect(jobs.submitted[0]).toContain('agent sid-9')
     expect([...jobs.files.values()][0]).toContain('late result')
   })

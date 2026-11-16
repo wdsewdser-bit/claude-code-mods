@@ -418,7 +418,9 @@ const runJob = async (
   $: EngineInterface,
   job: Record<string, unknown>,
 ): Promise<JobReply> => {
-  const script = `${$.plugin.root}/scripts/${job.agy === true ? 'run-agy.mjs' : 'run-delegate.mjs'}`
+  // 起的是启动器：它把 runner 交给 WMI，脱离插件的进程树。$.process.spawn 的子进程会随模块卸载被杀，
+  // runner 直接挂在这里的话，任何一次热重载都会把所有会话正在跑的作业一起杀掉。
+  const script = `${$.plugin.root}/scripts/launch.mjs`
   const input = JSON.stringify(job)
   try {
     let stdout = ''
@@ -1517,6 +1519,9 @@ const settle = async (
 // 终态通知只由 session.start 起的计时器发（它的 $ 跟会话一样长）：派活钩子的 $ 在钩子返回、
 // 调用被打断或热重载之后，prompt.submit 可能不报错却送不进会话，记成已通知就再也补不回来。
 let pendingNotify = false
+// 每分钟巡检一次：runner 结束了、或者死了，都由这里收尾和补发，不依赖发起作业的那次调用还活着。
+const SWEEP_MS = 60_000
+let nextSweepAt = 0
 // 本进程正在跑的作业：runner 还没写出 status.json 时也不能当成孤儿。
 const ownJobs = new Set<string>()
 // 刚派出的作业给 runner 留这么久写出 status.json。
@@ -2199,6 +2204,10 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         await refreshAgyQuota($)
         // 面板没开、本进程也没有作业在跑：这一轮不读 store。新派的作业 saveJob 会置 liveJobsRunning，
         // 打开面板会置 livePaneOpen，下一轮自动接上，不用重建计时器。
+        if (Date.now() >= nextSweepAt) {
+          nextSweepAt = Date.now() + SWEEP_MS
+          pendingNotify = true
+        }
         if (!liveJobsRunning && !livePaneOpen && !pendingNotify) return
         if (pendingNotify && Date.now() >= nextNotifyAt) {
           // 结束了的作业由这里发通知；没送进去的每分钟再试，送到为止。
