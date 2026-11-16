@@ -418,7 +418,7 @@ const runJob = async (
   $: EngineInterface,
   job: Record<string, unknown>,
 ): Promise<JobReply> => {
-  // 起的是启动器：它把 runner 交给 WMI，脱离插件的进程树。$.process.spawn 的子进程会随模块卸载被杀，
+  // 起的是启动器：它经一个立即退出的中转进程以 detached 方式起 runner，脱离插件的进程树。$.process.spawn 的子进程会随模块卸载被杀，
   // runner 直接挂在这里的话，任何一次热重载都会把所有会话正在跑的作业一起杀掉。
   const script = `${$.plugin.root}/scripts/launch.mjs`
   const input = JSON.stringify(job)

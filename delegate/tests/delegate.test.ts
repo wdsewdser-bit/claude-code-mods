@@ -636,7 +636,7 @@ describe('delegate tool', () => {
     expect(jobs.submitted).toHaveLength(1)
     expect(jobs.submitted[0]).toContain('完成')
     expect(jobs.submitted[0]).toContain('late result')
-    // runner 由启动器交给 WMI 起，不挂在插件模块下：热重载杀不到它。
+    // runner 由启动器以 detached 方式起，不挂在插件模块下：热重载杀不到它。
     expect(jobs.launched.length).toBeGreaterThan(0)
     expect(jobs.launched.every(a => a.endsWith('/scripts/launch.mjs'))).toBe(true)
     expect(jobs.submitted[0]).toContain('agent sid-9')
