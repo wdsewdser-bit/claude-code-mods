@@ -3,6 +3,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { agentFileOf, agentKindOf, argsOf, createTranslator, promptOf, recoveredTurn, retrySuffix, nextRetryState } from '../scripts/run-agy.mjs'
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
 
 test('each mode runs its own agent with permissions auto-approved; resume passes the conversation', () => {
   const work = argsOf({ mode: 'work', model: 'gemini-4-hydrogen-medium' }, 'do it', null)
@@ -133,4 +136,46 @@ test('最后一步是只发工具调用的中间回复（没有正文）：不�
 
 test('被取消的作业即使历史里有断流记录，也不判成恢复', () => {
   assert.equal(recoveredTurn(fixtureSteps, 0, FAILED, true), null)
+})
+
+
+// 提示词里的 run_code 示例在 ptc MCP 服务器里真跑：read 模式的走只读沙箱，work 模式的走可写沙箱。
+const callPtc = (cwd, code, readonly) => new Promise((resolve, reject) => {
+  const server = path.resolve(import.meta.dirname, '..', '..', 'ptc-run', 'mcp', 'server.mjs')
+  const env = { ...process.env, PTC_MCP_CWD: cwd, PTC_MCP_SCOPE: 'agy-ex-test' }
+  if (readonly) env.PTC_RUN_READONLY = '1'; else delete env.PTC_RUN_READONLY
+  const child = spawn(process.execPath, [server], { cwd, env, windowsHide: true })
+  let out = ''
+  child.stdout.on('data', d => { out += d })
+  child.on('error', reject)
+  child.on('close', () => {
+    const msg = out.split('\n').filter(Boolean).map(l => JSON.parse(l)).find(m => m.id === 1)
+    resolve(msg?.result)
+  })
+  child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'run_code', arguments: { description: '示例', code } } }) + '\n')
+})
+const codeBlocks = text => [...text.matchAll(/```js\n([\s\S]*?)```/g)].map(m => m[1])
+
+test('the run_code examples in the agent prompts run in the ptc sandbox', { timeout: 120000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-ex-'))
+  fs.mkdirSync(path.join(dir, 'src'))
+  fs.writeFileSync(path.join(dir, 'src', 'config.mjs'), 'export function parseConfig () {\n  return { timeout: 30 }\n}\n// TODO: env\n')
+  fs.writeFileSync(path.join(dir, 'src', 'app.mjs'), "import { parseConfig } from './config.mjs'\nexport async function main () { return parseConfig() }\n")
+  fs.writeFileSync(path.join(dir, 'src', 'config.test.mjs'), "import test from 'node:test'\nimport assert from 'node:assert'\nimport { parseConfig } from './config.mjs'\ntest('t', () => assert.ok(parseConfig().timeout > 0))\n")
+  try {
+    for (const [kind, readonly] of [['read', true], ['work', false]]) {
+      const blocks = codeBlocks(agentFileOf(kind))
+      assert.equal(blocks.length, kind === 'read' ? 2 : 3, kind)
+      for (const code of blocks) {
+        const r = await callPtc(dir, code, readonly)
+        // 只读沙箱读不到会话库时会多一行 [lib] 提示（程序照常运行），与示例无关
+        const text = (r?.content?.map(c => c.text).join('') ?? '').split('\n').filter(l => !l.startsWith('[lib]')).join('\n')
+        assert.ok(r && !r.isError, `${kind} 示例失败：${code.split('\n')[0]}\n${text}`)
+        assert.doesNotMatch(text, /Error|POLICY_DENIED|失败/, text)
+        if (code.includes('示例 1')) assert.match(text, /文件 3 个[\s\S]*config\.mjs:1 export function parseConfig[\s\S]*TODO: src\/config\.mjs=1/)
+        if (code.includes('示例 2')) assert.match(text, /app\.mjs:1> import \{ parseConfig \}/)
+        if (code.includes('示例 3')) assert.match(text, /改 1 处；测试 通过；残留 0/)
+      }
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })

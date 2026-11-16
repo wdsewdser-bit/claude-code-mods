@@ -72,6 +72,36 @@ const sdkText = () => {
   return 'tools.* 都是同步的（不要 .then）：tools.read/write/edit/replace/glob/grep/peek/batch/bash/sh/parallel，ref.*，lib.*；tools.help() 列出主题。'
 }
 
+// run_code 示例：read 模式只给只读的，work 模式再加一个"改+验证"。示例在 delegate/tests/run-agy.test.mjs 里真跑一遍。
+const EX_SURVEY = [
+  '// 示例 1：首次摸项目，独立的查询放进同一个程序',
+  'const files = tools.glob({ pattern: "**/*.mjs", path: "src" })',
+  'const fns = tools.grep({ pattern: "export (async )?function \\\\w+", path: "src" })',
+  'const todo = tools.grep({ pattern: "TODO|FIXME", path: "src", outputMode: "count" })',
+  'console.log(`文件 ${files.total} 个`)',
+  'for (const h of fns.items) console.log(`${h.file}:${h.line} ${h.text.trim()}`)',
+  'console.log("TODO:", todo.items.map(i => `${i.file}=${i.count}`).join(" "))',
+]
+const EX_LOCATE = [
+  '// 示例 2：找出一个名字的全部位置，每处带上下文，只打印摘录',
+  'const hits = tools.grep({ pattern: "\\\\bparseConfig\\\\b", path: "src", before: 2, after: 2 })',
+  'for (const h of hits.items) console.log(`${h.file}:${h.line}${h.context ? " " : ">"} ${h.text}`)',
+  'const sizes = files => files.map(f => [f, tools.read({ path: f }).split("\\n").length]).sort((a, b) => b[1] - a[1])',
+  'console.log(sizes(tools.glob({ pattern: "*.mjs", path: "src" }).items).slice(0, 3))',
+]
+const EX_CHANGE = [
+  '// 示例 3：一个阶段的全部改动 + 验证，只打印结论',
+  'const e = tools.edit({ path: "src/config.mjs", old: "timeout: 30", new: "timeout: 60" })',
+  'const t = tools.sh("node --test", { tail: 20 })',
+  'const left = tools.grep({ pattern: "timeout: 30", path: "src" })',
+  'console.log(`改 ${e.replaced} 处；测试 ${t.code === 0 ? "通过" : "失败"}；残留 ${left.total}`)',
+  'if (t.code !== 0) console.log(t.text)',
+]
+const block = lines => ['```js', ...lines, '```']
+const EX_NOTES = '- tools.* 同步返回，不要 await/.then；read 返回字符串，numbered:true 时每行带 "N: " 前缀，正则别用 ^ 锚定行首。'
+export const EXAMPLES = { read: [EX_SURVEY, EX_LOCATE], work: [EX_SURVEY, EX_LOCATE, EX_CHANGE] }
+const examplesOf = kind => ['', '## run_code 示例', EX_NOTES, ...EXAMPLES[kind].flatMap(block)]
+
 const COMMON_RULES = [
   '你是主会话派出的执行代理，在 Windows 上工作。按任务说明做，不扩大范围，不再派给别人。',
   '',
@@ -106,11 +136,11 @@ const NATIVE_RULES = [
 const AGENTS = {
   work: {
     name: 'cc-delegate-work',
-    body: [...COMMON_RULES, '- 你可以改文件、跑命令（tools.bash / tools.sh 跑的是 cmd/PowerShell 环境下的命令）；改完要读文件或跑命令核实结果。'],
+    body: [...COMMON_RULES, '- 你可以改文件、跑命令（tools.bash / tools.sh 跑的是 cmd/PowerShell 环境下的命令）；改完要读文件或跑命令核实结果。', ...examplesOf('work')],
   },
   read: {
     name: 'cc-delegate-read',
-    body: [...COMMON_RULES, '- 这是只读任务：run_code 是只读沙箱，只能 read/glob/grep/peek 和 ref.*，写文件和跑命令会返回 POLICY_DENIED；不要尝试改动，需要改的写进报告。'],
+    body: [...COMMON_RULES, '- 这是只读任务：run_code 是只读沙箱，只能 read/glob/grep/peek 和 ref.*，写文件和跑命令会返回 POLICY_DENIED；不要尝试改动，需要改的写进报告。', ...examplesOf('read')],
   },
   // 不带 ptc 的对照组：不写 run_code 相关提示，启动时也不设 PTC_* 环境变量，所以 ptc 服务器不会暴露工具。
   native: {
