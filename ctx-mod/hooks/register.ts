@@ -1899,6 +1899,8 @@ export const register: Register = (on, options) => {
     let isExpired = false
     let heldSession: Session | undefined
     let heldIdOf = 0
+    // A switch committed after this moment already replaced the cold window this message saw.
+    const heldAt = Date.now()
     try {
       const session = await sessionOf($)
       const id = await idOf($)
@@ -1969,7 +1971,7 @@ export const register: Register = (on, options) => {
             for (let waited = 0; switchReason !== null && switchReason !== 'cold' && waited < 300; waited++) {
               await new Promise<void>(resolve => $.clock.after(200, resolve))
             }
-            if (isExpired) {
+            if (isExpired && lastCommitAt < heldAt) {
               // The last keepalive saw the conversation while the cache was still warm: book
               // what it found still open before the history is replaced.
               await bookSnapshot($, session)

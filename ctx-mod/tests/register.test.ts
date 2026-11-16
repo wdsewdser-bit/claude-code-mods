@@ -1556,6 +1556,29 @@ test('a backlog from mixed origins while cold asks for one compaction and goes i
   expect(w.resubmitAsUser).toEqual([false, false, true])
 })
 
+test('a backlog that arrives all at once after a restart asks for one compaction, every message delivered once in order', async ($, on) => {
+  const w = world(on, 's-held-burst', { CTX_MOD: '1' })
+  await boot($)
+  await goCold($, w)
+  const results = await Promise.all([
+    $.prompt.submit({ text: '补发一', wait: false, origin: { kind: 'plugin', name: 'cache-keeper' } } as never),
+    $.prompt.submit({ text: '补发二', wait: false, origin: { kind: 'task-notification' } } as never),
+    $.prompt.submit({ text: '补发三', wait: false, origin: { kind: 'peer' } } as never),
+    $.prompt.submit({ text: '补发四', wait: false, origin: { kind: 'unclassified' } } as never),
+  ])
+  expect(results.every(isDropped)).toBe(true)
+  expect(results.filter(r => String((r as { drop?: unknown }).drop).includes('缓存已过期'))).toHaveLength(1)
+  expect(heldLeft(w)).toEqual(['补发一', '补发二', '补发三', '补发四'])
+
+  for (let i = 0; i < 3; i++) {
+    await w.clock.advance(300)
+    await w.clock.settle()
+  }
+  expect(w.runs.filter(run => run === 'compact')).toHaveLength(1)
+  expect(w.resubmits.map(text => text.split('\n').pop())).toEqual(['补发一', '补发二', '补发三', '补发四'])
+  expect(heldLeft(w)).toEqual([])
+})
+
 test('a manual switch asked for while a cold switch runs does not compact a second time', async ($, on) => {
   const w = world(on, 's-held-manual-race', { CTX_MOD: '1' })
   await boot($)
