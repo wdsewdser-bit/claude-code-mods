@@ -228,12 +228,12 @@ describe('config', () => {
 })
 
 describe('gpt', () => {
-  test('defaults to gpt-6.1-sol and refuses an unknown model instead of swapping it', () => {
-    expect(gptModelOf(undefined)).toBe('gpt-6.1-sol')
-    expect(gptModelOf('')).toBe('gpt-6.1-sol')
-    expect(gptModelOf(' gpt-6-astra ')).toBe('gpt-6-astra')
-    expect(GPT_DEFAULT_MODEL).toBe('gpt-6.1-sol')
-    expect(GPT_MODELS).toContain('gpt-6-astra')
+  test('defaults to gpt-6.2-sol and refuses an unknown model instead of swapping it', () => {
+    expect(gptModelOf(undefined)).toBe('gpt-6.2-sol')
+    expect(gptModelOf('')).toBe('gpt-6.2-sol')
+    expect(gptModelOf(' gpt-6.2-astra ')).toBe('gpt-6.2-astra')
+    expect(GPT_DEFAULT_MODEL).toBe('gpt-6.2-sol')
+    expect(GPT_MODELS).toContain('gpt-6.2-astra')
     expect(GPT_MODELS).not.toContain('gpt-6.1-terra')
     const bad = gptModelOf('gpt-9')
     expect(typeof bad === 'object' && 'error' in bad && bad.error.includes('未知的 GPT 模型')).toBe(true)
@@ -241,9 +241,9 @@ describe('gpt', () => {
 
   test('the label shows the subscription and the model', () => {
     expect(gptLabel(GPT_DEFAULT_MODEL, { background: false, work: true })).toBe(
-      'gpt · ChatGPT 订阅 / gpt-6.1-sol · 前台 · 可改文件',
+      'gpt · ChatGPT 订阅 / gpt-6.2-sol · 前台 · 可改文件',
     )
-    expect(gptLabel('gpt-6-astra', { background: true, work: false })).toContain('后台 · 只读')
+    expect(gptLabel('gpt-6.2-astra', { background: true, work: false })).toContain('后台 · 只读')
   })
 
   test('the description names the hard tasks, the subscription and astra as the rare choice', () => {
@@ -251,19 +251,19 @@ describe('gpt', () => {
     expect(d).toContain('后端实现')
     expect(d).toContain('代码审查')
     expect(d).toContain('ChatGPT 订阅')
-    expect(d).toContain('gpt-6-astra')
+    expect(d).toContain('gpt-6.2-astra')
     expect(d).toContain('高难')
     expect(d).not.toContain('deepseek')
   })
 
   test('a custom source sends "<provider id>/<model>" to CPA and keeps the subscription bare', () => {
-    expect(gptWireModel('mypool-resp', 'gpt-6.1-sol')).toBe('mypool-resp/gpt-6.1-sol')
+    expect(gptWireModel('mypool-resp', 'gpt-6.2-sol')).toBe('mypool-resp/gpt-6.2-sol')
     expect(gptWireModel(' mypool-chat ', 'gpt-6-sol')).toBe('mypool-chat/gpt-6-sol')
-    expect(gptWireModel('', 'gpt-6.1-sol')).toBe('gpt-6.1-sol')
+    expect(gptWireModel('', 'gpt-6.2-sol')).toBe('gpt-6.2-sol')
   })
 
   test('a custom source accepts any model its provider lists, and lists them when refusing', () => {
-    const models = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-5.6-terra']
+    const models = ['gpt-6-sol', 'gpt-6.2-sol', 'gpt-5.6-terra']
     expect(gptSourceModelOf('', models)).toBe(GPT_DEFAULT_MODEL)
     expect(gptSourceModelOf(' gpt-5.6-terra ', models)).toBe('gpt-5.6-terra')
     const bad = gptSourceModelOf('gpt-9', models)
@@ -274,16 +274,16 @@ describe('gpt', () => {
   })
 
   test('displayed model names drop the provider prefix unless the switch is off', () => {
-    expect(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', true)).toBe('gpt-6.1-sol')
-    expect(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', undefined)).toBe('gpt-6.1-sol')
-    expect(gptDisplayModel('mypool-resp/gpt-6.1-sol', 'mypool-resp', true)).toBe('gpt-6.1-sol')
-    expect(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', false)).toBe('mypool-resp/gpt-6.1-sol')
-    expect(gptDisplayModel('gpt-6.1-sol', '', false)).toBe('gpt-6.1-sol')
+    expect(gptDisplayModel('gpt-6.2-sol', 'mypool-resp', true)).toBe('gpt-6.2-sol')
+    expect(gptDisplayModel('gpt-6.2-sol', 'mypool-resp', undefined)).toBe('gpt-6.2-sol')
+    expect(gptDisplayModel('mypool-resp/gpt-6.2-sol', 'mypool-resp', true)).toBe('gpt-6.2-sol')
+    expect(gptDisplayModel('gpt-6.2-sol', 'mypool-resp', false)).toBe('mypool-resp/gpt-6.2-sol')
+    expect(gptDisplayModel('gpt-6.2-sol', '', false)).toBe('gpt-6.2-sol')
   })
 
   test('the label names the source instead of the subscription', () => {
-    expect(gptLabel('gpt-6.1-sol', { background: false, work: true }, 'Pool resp')).toBe(
-      'gpt · Pool resp / gpt-6.1-sol · 前台 · 可改文件',
+    expect(gptLabel('gpt-6.2-sol', { background: false, work: true }, 'Pool resp')).toBe(
+      'gpt · Pool resp / gpt-6.2-sol · 前台 · 可改文件',
     )
   })
 })
@@ -557,7 +557,7 @@ describe('delegate tool', () => {
     await start($ as never)
     const ran = await call($ as never, { task: 'fix the parser', tier: 'gpt', mode: 'work' })
     expect(JSON.stringify(ran)).toContain('gpt did it')
-    expect(jobs[0]).toMatchObject({ gpt: true, model: 'gpt-6.1-sol', mode: 'work' })
+    expect(jobs[0]).toMatchObject({ gpt: true, model: 'gpt-6.2-sol', mode: 'work' })
     expect(jobs[0]).not.toHaveProperty('url')
     expect(jobs[0]).not.toHaveProperty('key')
     expect(JSON.stringify(ran)).toContain('gpt')
@@ -574,8 +574,8 @@ describe('delegate tool', () => {
   test('gpt takes astra when asked, passes effort, and refuses an unknown model', { timeoutMs: 10_000 }, async ($, on) => {
     const jobs = setup(on as never, 'k-1', { ok: true, text: 'hard one', sessionId: 'sid-a', turns: 1, ms: 1 })
     await start($ as never)
-    await call($ as never, { task: 'think', tier: 'gpt', model: 'gpt-6-astra', effort: 'max' })
-    expect(jobs[0]).toMatchObject({ model: 'gpt-6-astra', effort: 'max' })
+    await call($ as never, { task: 'think', tier: 'gpt', model: 'gpt-6.2-astra', effort: 'max' })
+    expect(jobs[0]).toMatchObject({ model: 'gpt-6.2-astra', effort: 'max' })
     const bad = await call($ as never, { task: 'x', tier: 'gpt', model: 'gpt-9' })
     expect(JSON.stringify(bad)).toContain('未知的 GPT 模型')
     expect(jobs).toHaveLength(1)
@@ -586,17 +586,17 @@ describe('delegate tool', () => {
     await start($ as never)
     await call($ as never, { task: 'a', tier: 'gpt', cwd: '/proj', mode: 'work' })
     await call($ as never, { task: 'b', tier: 'gpt', resume: 'sid-g2' })
-    expect(jobs[1]).toMatchObject({ gpt: true, resume: 'sid-g2', cwd: '/proj', mode: 'work', model: 'gpt-6.1-sol' })
+    expect(jobs[1]).toMatchObject({ gpt: true, resume: 'sid-g2', cwd: '/proj', mode: 'work', model: 'gpt-6.2-sol' })
   })
 
   test('resume keeps the gpt model and effort unless new ones are passed', { timeoutMs: 10_000 }, async ($, on) => {
     const jobs = setup(on as never, 'k-1', { ok: true, text: 'done', sessionId: 'sid-g3', turns: 1, ms: 1 })
     await start($ as never)
-    await call($ as never, { task: 'a', tier: 'gpt', model: 'gpt-6-astra', effort: 'xhigh' })
+    await call($ as never, { task: 'a', tier: 'gpt', model: 'gpt-6.2-astra', effort: 'xhigh' })
     await call($ as never, { task: 'b', tier: 'gpt', resume: 'sid-g3' })
-    expect(jobs[1]).toMatchObject({ resume: 'sid-g3', model: 'gpt-6-astra', effort: 'xhigh' })
-    await call($ as never, { task: 'c', tier: 'gpt', resume: 'sid-g3', model: 'gpt-6.1-sol', effort: 'high' })
-    expect(jobs[2]).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' })
+    expect(jobs[1]).toMatchObject({ resume: 'sid-g3', model: 'gpt-6.2-astra', effort: 'xhigh' })
+    await call($ as never, { task: 'c', tier: 'gpt', resume: 'sid-g3', model: 'gpt-6.2-sol', effort: 'high' })
+    expect(jobs[2]).toMatchObject({ model: 'gpt-6.2-sol', effort: 'high' })
   })
 
   test('a gpt result carries the subscription quota, a ds result does not', { timeoutMs: 10_000 }, async ($, on) => {
@@ -1049,7 +1049,7 @@ describe('jobs', () => {
       jobId: 'bg-late',
       sessionId: 'sid-late',
       tier: 'gpt',
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.2-sol',
       cwd: '/work',
       mode: 'work',
       ptc: 'only',
@@ -1123,6 +1123,44 @@ describe('jobs', () => {
     expect(jobOf(t.store, 'bg-drop').notified).toBe(false)
   })
 
+  test('a finished job whose notice never went out is still announced hours later', { timeoutMs: 10_000 }, async ($, on) => {
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    // 实测：投递计时器停了约 5 小时，恢复时按两小时窗口把它当历史永久跳过。
+    const ended = Date.now() - 5 * 3_600_000
+    t.store.set('job:bg-stale', {
+      jobId: 'bg-stale', sessionId: 'sid-s', tier: 'gpt', model: 'm', cwd: '/work', mode: 'work', ptc: 'only',
+      background: true, status: 'done', at: ended - 600_000, endedAt: ended, summary: 'stale', owner: 'sess-me', notified: false,
+    })
+    t.files.set(`${ROOT}/bg-stale/result.json`, JSON.stringify({ ok: true, text: 'stale result', sessionId: 'sid-s', turns: 1 }))
+    await startSession($ as never)
+    expect(t.submitted.filter(x => x.includes('bg-stale'))).toHaveLength(1)
+    expect(jobOf(t.store, 'bg-stale').notified).toBe(true)
+  })
+
+  test('a notice that cannot get in rides back on the next delegate tool result, once', { timeoutMs: 10_000 }, async ($, on) => {
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map(), dropSubmit: true })
+    const ended = Date.now() - 10 * 60_000
+    t.store.set('job:bg-unsent', {
+      jobId: 'bg-unsent', sessionId: 'sid-u', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
+      background: true, status: 'done', at: ended - 60_000, endedAt: ended, summary: 'unsent', owner: 'sess-me', notified: false,
+    })
+    // 别的会话的作业不能附到这里。
+    t.store.set('job:bg-theirs', {
+      jobId: 'bg-theirs', sessionId: 'sid-t', tier: 'agy', model: 'm', cwd: '/work', mode: 'read', ptc: 'only',
+      background: true, status: 'done', at: ended - 60_000, endedAt: ended, summary: 'theirs', owner: 'sess-other', notified: false,
+    })
+    await startSession($ as never)
+    expect(jobOf(t.store, 'bg-unsent').notified).toBe(false)
+    const first = text(await jobCall($ as never, 'mcp__delegate__delegate_list', {}))
+    expect(first).toContain('bg-unsent 完成：完成通知没送到')
+    expect(first).not.toContain('bg-theirs 完成：')
+    expect(jobOf(t.store, 'bg-unsent').notified).toBe(true)
+    const second = text(await jobCall($ as never, 'mcp__delegate__delegate_list', {}))
+    expect(second).not.toContain('完成通知没送到')
+  })
+
   test('a job started a moment ago with no status file yet is not taken for an orphan', { timeoutMs: 10_000 }, async ($, on) => {
     ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
     const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
@@ -1155,7 +1193,7 @@ describe('jobs', () => {
     const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
     ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
     t.store.set('job:bg-ask', {
-      owner: 'sess-me', jobId: 'bg-ask', sessionId: 'sid-ask', tier: 'gpt', model: 'gpt-6.1-sol', cwd: '/work', mode: 'work', ptc: 'only',
+      owner: 'sess-me', jobId: 'bg-ask', sessionId: 'sid-ask', tier: 'gpt', model: 'gpt-6.2-sol', cwd: '/work', mode: 'work', ptc: 'only',
       background: true, status: 'done', at: Date.now() - 60_000, turns: 3, summary: 'asked', notified: false,
     })
     t.files.set(`${ROOT}/bg-ask/result.json`, JSON.stringify({ ok: true, text: '【请示】要不要继续？', sessionId: 'sid-ask', turns: 3, askTimeout: true }))
@@ -1171,7 +1209,7 @@ describe('jobs', () => {
     const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map(), git: ' M old.rs\n M new.rs\n', mtimes: { '/work/old.rs': 1, '/work/new.rs': Date.now() } })
     ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
     t.store.set('job:fg-cut', {
-      owner: 'sess-me', jobId: 'fg-cut', sessionId: 'sid-cut', tier: 'gpt', model: 'gpt-6.1-sol', cwd: '/work', mode: 'work', ptc: 'only',
+      owner: 'sess-me', jobId: 'fg-cut', sessionId: 'sid-cut', tier: 'gpt', model: 'gpt-6.2-sol', cwd: '/work', mode: 'work', ptc: 'only',
       background: false, status: 'failed', at: Date.now() - 60_000, turns: 92, summary: 'long', notified: false,
       error: 'delegate: $.process.spawn(node) aborted',
     })

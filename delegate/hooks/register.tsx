@@ -294,7 +294,7 @@ const describeGpt = async ($: EngineInterface): Promise<void> => {
           // 不设 enum：来源可能是任意 CPA 供应商，可用模型随它变（见 gptSourceModelOf）。
           model: {
             type: 'string',
-            description: `默认 ${GPT_DEFAULT_MODEL}，日常都用它。走 ChatGPT 订阅时可用：${GPT_MODELS.join('、')}；只有真正高难的问题才传 'gpt-6-astra'（更慢，别当默认）。走自定义供应商（/delegate 面板『GPT』卡的来源）时，可用该供应商模型列表里的任意模型，传别的会被拒绝并列出可用项`,
+            description: `默认 ${GPT_DEFAULT_MODEL}，日常都用它。走 ChatGPT 订阅时可用：${GPT_MODELS.join('、')}；只有真正高难的问题才传 'gpt-6.2-astra'（更慢，别当默认）。走自定义供应商（/delegate 面板『GPT』卡的来源）时，可用该供应商模型列表里的任意模型，传别的会被拒绝并列出可用项`,
           },
           mode: {
             type: 'string',
@@ -1307,7 +1307,7 @@ const callTool = async (
     cwdNote = `（原目录 ${old?.cwd ?? '?'} 已不存在，改用 ${fallback}）`
   }
   const config = await loadConfig($)
-  // gpt has no slot: this call picks the model (default gpt-6.1-sol) and the runner gets the endpoint from CPA.
+  // gpt has no slot: this call picks the model (default gpt-6.2-sol) and the runner gets the endpoint from CPA.
   // 来源是自定义供应商时，可用的模型由那个供应商的列表决定，wire 里写成 '<供应商id>/<模型>'。
   const gptSource = target === 'gpt' ? gptSourceOf(config) : ''
   const gptProvider = gptSource === '' ? undefined : await cpaProviderById($, gptSource)
@@ -1857,21 +1857,27 @@ const notifyDone = async ($: EngineInterface, rec: JobRecord): Promise<boolean> 
 }
 
 // 只让同一会话的补发单飞，A 等待 submit 时不能挡住 B。
-const recovering = new Map<string, Promise<boolean>>()
+// prompt.submit 可能永远不返回：卡住超过 STUCK_MS 的那次不再挡路（claimJob 已先记已通知，不会重发同一条）。
+const STUCK_MS = 15 * 60_000
+const recovering = new Map<string, { promise: Promise<boolean>; at: number }>()
+const recoveryRunning = (me: string): boolean => {
+  const current = recovering.get(me)
+  return current !== undefined && Date.now() - current.at < STUCK_MS
+}
 const recoverJobs = async ($: EngineInterface, me: string): Promise<boolean> => {
   const current = recovering.get(me)
-  if (current !== undefined) return await current
+  if (current !== undefined && Date.now() - current.at < STUCK_MS) return await current.promise
   const recovery = recoverOnce($, me).finally(() => {
-    if (recovering.get(me) === recovery) recovering.delete(me)
+    if (recovering.get(me)?.promise === recovery) recovering.delete(me)
   })
-  recovering.set(me, recovery)
+  recovering.set(me, { promise: recovery, at: Date.now() })
   return await recovery
 }
 
 type DeliveryState = { pending: boolean; generation: number; nextNotifyAt: number }
 // 不等 submit 返回：面板刷新、别的会话、之后的请示都不该被它挡住。
 const kickRecovery = ($: EngineInterface, me: string, state: DeliveryState, fail: (error: unknown) => void): void => {
-  if (recovering.has(me)) return
+  if (recoveryRunning(me)) return
   state.pending = false
   const retry = (): void => {
     state.pending = true
@@ -1885,7 +1891,45 @@ const kickRecovery = ($: EngineInterface, me: string, state: DeliveryState, fail
   })
 }
 
-const freshNotice = (r: JobRecord): boolean => Date.now() - (r.endedAt ?? r.at) < NOTIFY_WINDOW_MS
+// 运行中结束、明确记了没送达（notified: false）的后台作业放宽到一天：投递路径停过几小时（实测 16:00→21:04），
+// 按两小时算会在恢复时被当成历史永久跳过。孤儿和别的仍按两小时，免得重启时刷出旧作业。
+const UNSENT_WINDOW_MS = 24 * 3_600_000
+/**
+ * 兜底：投递计时器停了或卡住时（只有 session.start 能重建它，工具调用的 $ 发不了可靠的 submit），
+ * 本会话结束超过 LATE_MS 仍没送达的后台作业，随下一次 delegate 工具调用的结果带回去。先记成已通知再附上，不会和计时器重发。
+ */
+const LATE_MS = 5 * 60_000
+const unsentNotes = async ($: EngineInterface): Promise<string> => {
+  try {
+    const me = await sessionOf($, SESSION_ID_WAIT_MS, false)
+    if (me === undefined) return ''
+    const late = (await listJobs($))
+      .filter(r => r.owner === me && r.background && r.notified === false && r.status !== 'running' && freshNotice(r) && Date.now() - (r.endedAt ?? r.at) > LATE_MS)
+      .slice(0, 3)
+    const home = late.length === 0 ? undefined : await homeOf($).catch(() => undefined)
+    const parts: string[] = []
+    for (const rec of late) {
+      const latest = await loadJob($, rec.jobId)
+      if (latest === undefined || latest.notified !== false) continue
+      latest.notified = true
+      if (!(await claimJob($, latest))) continue
+      const file = home === undefined ? undefined : `${home.replace(/\\/g, '/')}/.claude/delegate/results/${rec.jobId}.md`
+      const saved = file === undefined ? '' : await $.fs.read(file).then(r => (typeof r === 'string' ? r : String((r as { text?: unknown }).text ?? ''))).catch(() => '')
+      const body = saved.length > 1_500 ? `${saved.slice(0, 1_500)}\n…（已截断）` : saved
+      parts.push(`【delegate 后台任务 ${rec.jobId} ${endWord(rec.status, false)}：完成通知没送到，补在这里】（agent ${latest.sessionId ?? '?'}）\n${body === '' ? `用 delegate_status("${rec.jobId}") 看结果。` : body}${file === undefined || saved === '' ? '' : `\n完整结果：${file}`}`)
+    }
+    return parts.length === 0 ? '' : `\n\n${parts.join('\n\n')}`
+  } catch {
+    return ''
+  }
+}
+const withUnsent = async <T,>($: EngineInterface, out: T): Promise<T> => {
+  const extra = await unsentNotes($)
+  if (extra === '' || typeof out !== 'object' || out === null || typeof (out as { result?: unknown }).result !== 'string') return out
+  return { ...out, result: (out as unknown as { result: string }).result + extra }
+}
+const freshNotice = (r: JobRecord): boolean =>
+  Date.now() - (r.endedAt ?? r.at) < (r.background && r.notified === false && r.status !== 'orphaned' ? UNSENT_WINDOW_MS : NOTIFY_WINDOW_MS)
 // 只有不含 submit 的磁盘维护共享单飞，避免两会话同时收尾同一记录、覆盖 notified。
 let collectingRecovery: Promise<JobRecord[]> | undefined
 const collectRecovery = async ($: EngineInterface): Promise<JobRecord[]> => {
@@ -2238,6 +2282,8 @@ const paneOpen = async ($: EngineInterface): Promise<boolean> => {
 // Map 只存控制器，不存 $（宿主不允许把 $ 当普通值保存）。
 type DeliveryTimer = { serial: number; cancel: () => void }
 const deliveryTimers = new Map<string, DeliveryTimer>()
+// 每个会话正在播报请示的开始时间（单飞，卡住超过 STUCK_MS 让下一次接上）。
+const askingFor = new Map<string, number>()
 let deliverySerial = 0
 const ensureLiveTimer = ($: EngineInterface): void => {
   let timer: { cancel: () => void } | undefined
@@ -2252,8 +2298,17 @@ const ensureLiveTimer = ($: EngineInterface): void => {
     if (registeredId !== undefined && deliveryTimers.get(registeredId) === control) deliveryTimers.delete(registeredId)
   } }
   const fail = (error: unknown): void => {
-    if (invalidSession(error)) control.cancel()
-    else {
+    // 文案像“会话失效”不等于真失效（别的读写报的错也可能带 closed/ended）：误取消后这条会话再也没有投递，
+    // 直到下一次 session.start。先问一次会话 id，问不到才停。
+    if (invalidSession(error)) {
+      void sessionOf($, 1_000, false).then(
+        id => {
+          if (id === undefined) control.cancel()
+          else try { $.ui.log(`delegate: 投递计时遇到像失效的错误，但会话还在，继续：${messageOf(error)}`, { to: 'debug' }) } catch { control.cancel() }
+        },
+        () => control.cancel(),
+      )
+    } else {
       try { $.ui.log(`delegate: 投递计时出错：${messageOf(error)}`, { to: 'debug' }) } catch { control.cancel() }
     }
   }
@@ -2293,7 +2348,13 @@ const ensureLiveTimer = ($: EngineInterface): void => {
         const st = root === undefined ? undefined : await readStatus($, jobDir(root, rec.jobId))
         if (st !== undefined) statuses[rec.jobId] = st
       }
-      if (!stopped) await notifyAsks($, running, statuses)
+      // 不在这里等 submit：它要等会话空闲，卡住时 busy 一直为真，之后的补发也全被跳过。
+      const asking = askingFor.get(me)
+      if (!stopped && (asking === undefined || Date.now() - asking > STUCK_MS)) {
+        const stamp = Date.now()
+        askingFor.set(me, stamp)
+        void notifyAsks($, running, statuses).catch(fail).finally(() => { if (askingFor.get(me) === stamp) askingFor.delete(me) })
+      }
     })().catch(fail).finally(() => { busy = false })
   }
   const panelTick = (): void => {
@@ -2502,7 +2563,7 @@ export const register: Register = on => {
   for (const tier of TIERS) {
     on('tool.call', { tool: toolOf(tier) }, async ($, e) => {
       try {
-        return await callTool($, tier, e as unknown as Record<string, unknown>)
+        return await withUnsent($, await callTool($, tier, e as unknown as Record<string, unknown>))
       } catch (error) {
         return { result: `delegate: ${messageOf(error)}`, isError: true as const }
       }
@@ -2531,7 +2592,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__delegate__delegate_list' }, async ($, e) => {
     try {
-      return await listAction($, e as unknown as Record<string, unknown>)
+      return await withUnsent($, await listAction($, e as unknown as Record<string, unknown>))
     } catch (error) {
       return { result: `delegate: ${messageOf(error)}`, isError: true as const }
     }
@@ -2539,7 +2600,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__delegate__delegate_status' }, async ($, e) => {
     try {
-      return await statusAction($, e as unknown as Record<string, unknown>)
+      return await withUnsent($, await statusAction($, e as unknown as Record<string, unknown>))
     } catch (error) {
       return { result: `delegate: ${messageOf(error)}`, isError: true as const }
     }
@@ -2547,7 +2608,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__delegate__delegate_cancel' }, async ($, e) => {
     try {
-      return await cancelAction($, e as unknown as Record<string, unknown>)
+      return await withUnsent($, await cancelAction($, e as unknown as Record<string, unknown>))
     } catch (error) {
       return { result: `delegate: ${messageOf(error)}`, isError: true as const }
     }
@@ -2555,7 +2616,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__delegate__delegate_send' }, async ($, e) => {
     try {
-      return await sendAction($, e as unknown as Record<string, unknown>)
+      return await withUnsent($, await sendAction($, e as unknown as Record<string, unknown>))
     } catch (error) {
       return { result: `delegate: ${messageOf(error)}`, isError: true as const }
     }
@@ -2563,7 +2624,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: AGY_TOOL }, async ($, e) => {
     try {
-      return await callTool($, 'agy', e as unknown as Record<string, unknown>)
+      return await withUnsent($, await callTool($, 'agy', e as unknown as Record<string, unknown>))
     } catch (error) {
       return { result: `delegate: ${messageOf(error)}`, isError: true as const }
     }
@@ -2590,7 +2651,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: GPT_TOOL }, async ($, e) => {
     try {
-      return await callTool($, 'gpt', e as unknown as Record<string, unknown>)
+      return await withUnsent($, await callTool($, 'gpt', e as unknown as Record<string, unknown>))
     } catch (error) {
       return { result: `delegate: ${messageOf(error)}`, isError: true as const }
     }
@@ -3283,7 +3344,7 @@ export const register: Register = on => {
         })} />
         {sourceRows}
         {gptSource === '' ? undefined : keepaliveRow}
-        <Select key="gpt-prefix" label="隐藏供应商前缀" options={[{ label: '开 · 只显示 gpt-6.1-sol', value: 'on' }, { label: '关 · 显示 mypool-resp/gpt-6.1-sol', value: 'off' }]} value={config.gptHidePrefix === false ? 'off' : 'on'} onSelect={(v: string) => changeAction($, c => setGptHidePrefix(c, v === 'on'), v === 'on' ? 'GPT 模型名只显示裸名' : 'GPT 模型名显示完整前缀')} />
+        <Select key="gpt-prefix" label="隐藏供应商前缀" options={[{ label: '开 · 只显示 gpt-6.2-sol', value: 'on' }, { label: '关 · 显示 mypool-resp/gpt-6.2-sol', value: 'off' }]} value={config.gptHidePrefix === false ? 'off' : 'on'} onSelect={(v: string) => changeAction($, c => setGptHidePrefix(c, v === 'on'), v === 'on' ? 'GPT 模型名只显示裸名' : 'GPT 模型名显示完整前缀')} />
       </Box>)}
       {card('ds', 'DS 每日用量', <Box flexDirection="column" overflow="hidden" gap={1}>
         <Text wrap="truncate-end">{dsTodayLine() === '' ? '今天还没有 DS 用量' : dsTodayLine()}</Text>

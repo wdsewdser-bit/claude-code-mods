@@ -32,7 +32,7 @@ const now = 1_700_000_000_000
 
 // 一条真实请求的样子：system / tools / messages / model / thinking / output_config 都在。
 const originalBody = () => ({
-  model: 'mypool-resp/gpt-6.1-sol',
+  model: 'mypool-resp/gpt-6.2-sol',
   max_tokens: 128000,
   stream: true,
   system: [{ type: 'text', text: 'you are a delegate', cache_control: { type: 'ephemeral' } }],
@@ -130,7 +130,7 @@ test('费用按缓存读 $0.02/百万、输入 $0.4/百万、输出 $2/百万', 
 test('日志里没有 key，也没有 headers', () => {
   const root = tmp()
   const secret = 'sk-ant-SECRET-do-not-log-0123456789'
-  const entry = logEntryOf({ jobId: 'fg-1', model: 'mypool-resp/gpt-6.1-sol', status: 200, usage: { input_tokens: 5, cache_read_input_tokens: 60000, output_tokens: 1 }, now })
+  const entry = logEntryOf({ jobId: 'fg-1', model: 'mypool-resp/gpt-6.2-sol', status: 200, usage: { input_tokens: 5, cache_read_input_tokens: 60000, output_tokens: 1 }, now })
   appendLog(root, entry)
   const text = fs.readFileSync(logPathOf(root), 'utf8')
   assert.doesNotMatch(text, /SECRET/)
@@ -156,7 +156,7 @@ test('转发：流式原样传回，请求体存成 <jobId>.json，用量跟着�
     req.on('data', c => (body += c))
     req.on('end', () => {
       assert.equal(req.url, '/v1/messages')
-      assert.equal(JSON.parse(body).model, 'mypool-resp/gpt-6.1-sol')
+      assert.equal(JSON.parse(body).model, 'mypool-resp/gpt-6.2-sol')
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 2000, cache_read_input_tokens: 148000, output_tokens: 0 } } }) + '\n\n')
       res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'OK' } }) + '\n\n')

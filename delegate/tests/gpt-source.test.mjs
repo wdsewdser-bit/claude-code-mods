@@ -51,14 +51,14 @@ test('setGptSource 只认已有供应商，空串回到订阅', () => {
 })
 
 test('发给 CPA 的 model 带供应商前缀（CPA 靠它路由）', () => {
-  assert.equal(gptWireModel('mypool-resp', 'gpt-6.1-sol'), 'mypool-resp/gpt-6.1-sol')
+  assert.equal(gptWireModel('mypool-resp', 'gpt-6.2-sol'), 'mypool-resp/gpt-6.2-sol')
   assert.equal(gptWireModel(' mypool-chat ', 'gpt-6-sol'), 'mypool-chat/gpt-6-sol')
   // 走订阅：不加任何前缀
-  assert.equal(gptWireModel('', 'gpt-6.1-sol'), 'gpt-6.1-sol')
+  assert.equal(gptWireModel('', 'gpt-6.2-sol'), 'gpt-6.2-sol')
 })
 
 test('走自定义供应商时可用该供应商的任意模型，其余报错并列出可用项', () => {
-  const models = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-5.6-terra']
+  const models = ['gpt-6-sol', 'gpt-6.2-sol', 'gpt-5.6-terra']
   assert.equal(gptSourceModelOf('', models), GPT_DEFAULT_MODEL)
   assert.equal(gptSourceModelOf(' gpt-5.6-terra ', models), 'gpt-5.6-terra')
   const bad = gptSourceModelOf('gpt-9', models)
@@ -69,12 +69,12 @@ test('走自定义供应商时可用该供应商的任意模型，其余报错�
 })
 
 test('显示名默认去前缀，关掉开关才显示完整前缀', () => {
-  assert.equal(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', true), 'gpt-6.1-sol')
-  assert.equal(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', undefined), 'gpt-6.1-sol')
-  assert.equal(gptDisplayModel('mypool-resp/gpt-6.1-sol', 'mypool-resp', true), 'gpt-6.1-sol')
-  assert.equal(gptDisplayModel('gpt-6.1-sol', 'mypool-resp', false), 'mypool-resp/gpt-6.1-sol')
+  assert.equal(gptDisplayModel('gpt-6.2-sol', 'mypool-resp', true), 'gpt-6.2-sol')
+  assert.equal(gptDisplayModel('gpt-6.2-sol', 'mypool-resp', undefined), 'gpt-6.2-sol')
+  assert.equal(gptDisplayModel('mypool-resp/gpt-6.2-sol', 'mypool-resp', true), 'gpt-6.2-sol')
+  assert.equal(gptDisplayModel('gpt-6.2-sol', 'mypool-resp', false), 'mypool-resp/gpt-6.2-sol')
   // 订阅没有前缀可加
-  assert.equal(gptDisplayModel('gpt-6.1-sol', '', false), 'gpt-6.1-sol')
+  assert.equal(gptDisplayModel('gpt-6.2-sol', '', false), 'gpt-6.2-sol')
 })
 
 test('runner 原样透传带前缀的 gpt model，不按模型名做判断', () => {
@@ -88,11 +88,11 @@ test('runner 原样透传带前缀的 gpt model，不按模型名做判断', () 
 
 test('gptLabel 用来源名，订阅仍显示 ChatGPT 订阅', () => {
   assert.equal(
-    gptLabel('gpt-6.1-sol', { background: false, work: true }, 'Pool resp'),
-    'gpt · Pool resp / gpt-6.1-sol · 前台 · 可改文件',
+    gptLabel('gpt-6.2-sol', { background: false, work: true }, 'Pool resp'),
+    'gpt · Pool resp / gpt-6.2-sol · 前台 · 可改文件',
   )
   assert.equal(
-    gptLabel('gpt-6.1-sol', { background: false, work: true }),
-    'gpt · ChatGPT 订阅 / gpt-6.1-sol · 前台 · 可改文件',
+    gptLabel('gpt-6.2-sol', { background: false, work: true }),
+    'gpt · ChatGPT 订阅 / gpt-6.2-sol · 前台 · 可改文件',
   )
 })

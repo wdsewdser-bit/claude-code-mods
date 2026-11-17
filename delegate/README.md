@@ -6,7 +6,7 @@
 
 - `delegate_flash` / `delegate_pro`：DS 快档 / 强档。`mode` 为 `read`（只读）或 `work`（可改文件），支持 `background`、`resume`（续用同一子代理，沿用上次的 mode/ptc/模型/档位）、`effort`。
 - `delegate_agy`：AGY 执行（Antigravity 订阅，官方 `agy` CLI 无界面运行，不经 CPA）。`model` 默认 `4h`（gemini-4-hydrogen-<effort>），`4a` 为 Gemini 4 Argon，也可传 `agy models` 列出的完整名；子代理用自建 agent（`~/.gemini/config/agents/cc-delegate-work|read`，去掉 agy 默认提示词和内置工具），唯一的工具是 ptc-run 的 `run_code`（`ptc-run/mcp/server.mjs` 以 MCP 提供，首次运行自动 `agy mcp add ptc`，只在 delegate 启动的会话里暴露工具）；read 走 ptc 只读沙箱；支持 background / resume（agy 会话 id）/ send / cancel。用量不计入 DS 日账本。
-- `delegate_gpt`：GPT 执行，默认 `gpt-6.1-sol`，可选 `gpt-6-astra`；档位最低 medium。
+- `delegate_gpt`：GPT 执行，默认 `gpt-6.2-sol`，可选 `gpt-6.2-astra`；档位最低 medium。
 - `delegate_send` / `delegate_status` / `delegate_list` / `delegate_cancel`：后台任务插话、查看、列表、取消。任务状态落盘在 `~/.claude/delegate/jobs/`，重启后仍能找回并续用。
 - `/delegate`：管理供应商、协议（chat / responses / anthropic）、key 和模型列表。
 
