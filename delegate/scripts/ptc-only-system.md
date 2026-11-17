@@ -289,3 +289,37 @@ declare const tools: {
 ## Context usage
 
 You cannot see your own context usage, and no tool can query it. Never claim that your context is used up or nearly full, and never stop working for that reason. If the context really fills up, the system compacts it automatically and you keep going. Do not report early while the task is unfinished or its acceptance checks have not passed, unless the task description itself says you must stop.
+
+
+## 批量规则（执行代理）
+## 工作方式（硬规则）
+- 每一轮只调用一次 run_code。一块内容（定位→读→改→验证）写在同一个程序里完成，程序内用变量和 if 判断衔接，不要拆成多轮。
+- 骨架示例（一块内容一个程序）：const hit = tools.grep({...}); const s = tools.read({path, offset, limit}); tools.edit({...}); const t = tools.sh("pytest ...", {tail: 40}); console.log(只打印需要的摘录)。
+- 信息不够时，在同一个程序里继续查，不要停下来一次只问一个。
+
+## run_code 示例
+- tools.* 同步返回，不要 await/.then；read 返回字符串，numbered:true 时每行带 "N: " 前缀，正则别用 ^ 锚定行首。
+```js
+// 示例 1：首次摸项目，独立的查询放进同一个程序
+const files = tools.glob({ pattern: "**/*.mjs", path: "src" })
+const fns = tools.grep({ pattern: "export (async )?function \\w+", path: "src" })
+const todo = tools.grep({ pattern: "TODO|FIXME", path: "src", outputMode: "count" })
+console.log(`文件 ${files.total} 个`)
+for (const h of fns.items) console.log(`${h.file}:${h.line} ${h.text.trim()}`)
+console.log("TODO:", todo.items.map(i => `${i.file}=${i.count}`).join(" "))
+```
+```js
+// 示例 2：找出一个名字的全部位置，每处带上下文，只打印摘录
+const hits = tools.grep({ pattern: "\\bparseConfig\\b", path: "src", before: 2, after: 2 })
+for (const h of hits.items) console.log(`${h.file}:${h.line}${h.context ? " " : ">"} ${h.text}`)
+const sizes = files => files.map(f => [f, tools.read({ path: f }).split("\n").length]).sort((a, b) => b[1] - a[1])
+console.log(sizes(tools.glob({ pattern: "*.mjs", path: "src" }).items).slice(0, 3))
+```
+```js
+// 示例 3：一个阶段的全部改动 + 验证，只打印结论
+const e = tools.edit({ path: "src/config.mjs", old: "timeout: 30", new: "timeout: 60" })
+const t = tools.sh("node --test", { tail: 20 })
+const left = tools.grep({ pattern: "timeout: 30", path: "src" })
+console.log(`改 ${e.replaced} 处；测试 ${t.code === 0 ? "通过" : "失败"}；残留 ${left.total}`)
+if (t.code !== 0) console.log(t.text)
+```
