@@ -2,6 +2,7 @@
 // Started detached when a handoff is built; it never changes the handoff. Input on stdin (JSON):
 //   { dir, window, input, candidates: [{ id, kind, shown, text }] }
 // Output: one line appended to <dir>/decision-shadow.jsonl with ids, kinds, scores and timing (never the texts or keys).
+// Off by default: set CTX_MOD_DECISION_SHADOW=1 to run it.
 // Keys: the same GEMINI_API_KEY, GEMINI_API_KEY_2 … user variables Harness reads (or its decision_api.api_key_env prefix).
 import fs from 'node:fs'
 import os from 'node:os'

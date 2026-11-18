@@ -406,7 +406,9 @@ const openSession = async ($: EngineInterface, id: string): Promise<Session> => 
     cwd: () => $.session.cwd(),
     shadow: job => {
       void (async () => {
-        if ((await attempt(async () => await $.env.get('CTX_MOD_DECISION_SHADOW'), undefined)) === '0') return
+        // Off unless asked for: an offline replay on two real sessions found the scores ranked open tasks worse
+        // than recency (scripts/decision-replay.mjs), so the run is kept only as an opt-in experiment.
+        if ((await attempt(async () => await $.env.get('CTX_MOD_DECISION_SHADOW'), undefined)) !== '1') return
         const child = $.process.spawn({ argv: ['node', `${$.plugin.root}/scripts/decision-shadow.mjs`], input: JSON.stringify({ dir, ...job }) })
         for await (const piece of child) {
           if (piece.stream === 'stderr') logError($, 'decision-shadow', piece.text)
