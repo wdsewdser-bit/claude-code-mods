@@ -1183,16 +1183,37 @@ const tailEvents = async ($: EngineInterface, dir: string, count: number): Promi
 }
 
 // 按 pid 问一句，不按进程名或命令行搜（那会杀到别人的 claude）。
-const isAlive = async ($: EngineInterface, pid: number): Promise<boolean> => {
+/**
+ * 进程在不在：查不出来（tasklist 超时、报错、$.process.run 被中止）是 unknown，不能当成死了。
+ * 以前一律当死，负载高时把还在跑的 GPT 作业判成「宿主重启中断」，resume 后新旧两个 runner 同时改一个目录。
+ */
+type Liveness = 'alive' | 'dead' | 'unknown'
+const liveness = async ($: EngineInterface, pid: number): Promise<Liveness> => {
   try {
     const run = await $.process.run(['tasklist', '/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
       timeoutMs: 10_000,
     })
-
-    return new RegExp(`"${pid}"`).test(run.stdout)
+    if (new RegExp(`"${pid}"`).test(run.stdout)) return 'alive'
+    // 只有 tasklist 正常跑完、明确说没有这个进程才算死。
+    return run.exitCode === 0 && /INFO:|信息:/i.test(`${run.stdout}${run.stderr ?? ''}`) ? 'dead' : 'unknown'
   } catch {
-    return false
+    return 'unknown'
   }
+}
+const isAlive = async ($: EngineInterface, pid: number): Promise<boolean> => (await liveness($, pid)) === 'alive'
+// runner 每处理一条事件就刷新 status.json 的 updatedAt：这么久以内刷新过就当它还活着，不用看 pid。
+const LIVE_STATUS_MS = 3 * 60_000
+const recentlyUpdated = (status: JobStatusFile | undefined): boolean =>
+  status?.updatedAt !== undefined && status.endedAt === undefined && Date.now() - status.updatedAt < LIVE_STATUS_MS
+/** 这条作业的 runner 是不是可能还在跑（resume 前用）：结束了或明确死了才放行。 */
+const runnerMayBeAlive = async ($: EngineInterface, rec: JobRecord): Promise<{ pid?: number } | undefined> => {
+  if (rec.status !== 'running' && rec.status !== 'orphaned') return undefined
+  const root = await rootOf($)
+  const status = root === undefined ? undefined : await readStatus($, jobDir(root, rec.jobId))
+  if (status?.endedAt !== undefined) return undefined
+  if (recentlyUpdated(status)) return { pid: status?.pid }
+  if (status?.pid === undefined || !pidMatches(status, rec)) return undefined
+  return (await liveness($, status.pid)) === 'dead' ? undefined : { pid: status.pid }
 }
 
 const sessionCwd = async ($: EngineInterface): Promise<string | undefined> => {
@@ -1294,6 +1315,16 @@ const callTool = async (
   }
   const coldNotice = await coldResumeNotice($, target, old, task)
   if (coldNotice !== undefined) return { result: coldNotice, isError: true }
+  // 旧 runner 还活着就不能 resume：两个进程会同时改同一个目录、同一个会话。
+  if (old !== undefined) {
+    const busy = await runnerMayBeAlive($, old)
+    if (busy !== undefined) {
+      return {
+        result: `delegate: 不能 resume：这个 agent 的上一个作业 ${old.jobId} 的 runner 还在运行或无法确认已退出${busy.pid === undefined ? '' : `（pid ${busy.pid}）`}。等它结束，或先 delegate_cancel("${old.jobId}") 停掉它，再 resume。`,
+        isError: true,
+      }
+    }
+  }
   const given = typeof input.cwd === 'string' && input.cwd !== '' ? input.cwd : undefined
   let cwd = given ?? old?.cwd
   let cwdNote = ''
@@ -1951,8 +1982,10 @@ const collectRecoveryOnce = async ($: EngineInterface): Promise<JobRecord[]> => 
       const status = root === undefined ? undefined : await readStatus($, jobDir(root, rec.jobId))
       // 还没有 pid 的新作业：runner 可能只是还没写出 status.json。
       if (status?.pid === undefined && Date.now() - rec.at < START_GRACE_MS) continue
-      const alive = status?.pid === undefined ? false : await isAlive($, status.pid)
-      if (alive) continue
+      // 状态文件刚刷新过、或进程查不出死活：都不判孤儿，下一轮再看（误判会让人 resume 出第二个 runner）。
+      if (recentlyUpdated(status)) continue
+      const alive = status?.pid === undefined ? 'dead' : await liveness($, status.pid)
+      if (alive !== 'dead') continue
       const result = root === undefined ? undefined : await readResult($, jobDir(root, rec.jobId))
       if (result !== undefined) {
         // runner 在宿主死后自己跑完了：按它留下的 result.json 收尾，再补一条通知。
@@ -2000,13 +2033,18 @@ const recoverOnce = async ($: EngineInterface, me: string): Promise<boolean> => 
         allSent = false
         continue
       }
-      if (!(await notifyDone($, rec))) {
+      // 不等 submit 返回：它的 promise 不可靠（实测 compact 换窗口时提示 22:50:44 已送进会话，promise 却一直不返回），
+      // 等它会把这条会话之后的补发全挡在单飞后面（bg-mwlacewg-4 晚了整整一个 STUCK_MS）。
+      // 已先占位，不会重发；送不进去才回滚成未通知，下一次巡检再补。
+      const unclaim = async (why: string): Promise<void> => {
         rec.notified = false
-        await saveJob($, rec)
-        allSent = false
-        continue
+        await saveJob($, rec).catch(() => undefined)
+        try { $.ui.log(`delegate: 补发 ${rec.jobId} 的通知没送到：${why}`, { to: 'debug' }) } catch {}
       }
-      await saveJob($, rec)
+      void notifyDone($, rec).then(
+        ok => (ok ? undefined : unclaim('被丢弃或失败')),
+        error => unclaim(messageOf(error)),
+      )
     } catch (error) {
       allSent = false
       rec.notified = false
@@ -2248,15 +2286,17 @@ const notifyAsks = async (
     // 先占位，submit 等待期间的新计时器也不能重复发同一 seq；失败才回滚。
     const previous = askNotified.get(rec.jobId)
     askNotified.set(rec.jobId, ask.seq)
-    let sent = false
-    try {
-      sent = await deliver($, `【delegate 后台任务 ${rec.jobId} 请示】（agent ${agent}）\n${body}\n用 delegate_send("${rec.jobId}", "你的决定") 回复，它会在原进程里接着做；${askMinutesOf(st)} 分钟内没有回复，它会结束，之后可以用 resume 续做。`)
-    } finally {
-      if (!sent && askNotified.get(rec.jobId) === ask.seq) {
+    // 同补发：不等 submit 返回，占位后发出去，送不进去再回滚，后面的请示不被一条卡住的挡住。
+    const rollback = (): void => {
+      if (askNotified.get(rec.jobId) === ask.seq) {
         if (previous === undefined) askNotified.delete(rec.jobId)
         else askNotified.set(rec.jobId, previous)
       }
     }
+    void deliver($, `【delegate 后台任务 ${rec.jobId} 请示】（agent ${agent}）\n${body}\n用 delegate_send("${rec.jobId}", "你的决定") 回复，它会在原进程里接着做；${askMinutesOf(st)} 分钟内没有回复，它会结束，之后可以用 resume 续做。`).then(
+      sent => { if (!sent) rollback() },
+      () => rollback(),
+    )
   }
 }
 

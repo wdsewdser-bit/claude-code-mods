@@ -1059,7 +1059,8 @@ describe('jobs', () => {
       turns: 4,
       summary: 'finished before the restart',
     })
-    t.files.set(`${ROOT}/bg-dead/status.json`, JSON.stringify({ jobId: 'bg-dead', pid: 7777, phase: 'working', startedAt: at, updatedAt: at }))
+    // 状态文件 5 分钟没刷新：超过判活窗口，才看 pid。
+    t.files.set(`${ROOT}/bg-dead/status.json`, JSON.stringify({ jobId: 'bg-dead', pid: 7777, phase: 'working', startedAt: at, updatedAt: Date.now() - 5 * 60_000 }))
     t.files.set(`${ROOT}/bg-late/result.json`, JSON.stringify({ ok: true, text: 'late finding', sessionId: 'sid-late', turns: 4 }))
     await startSession($ as never)
     expect(jobOf(t.store, 'bg-dead').status).toBe('orphaned')
@@ -1097,6 +1098,28 @@ describe('jobs', () => {
     expect(t.submitted.filter(x => x.includes('bg-busy'))).toHaveLength(1)
     // 已先记成已通知：卡住的那次送到后不会再发第二遍
     expect(jobOf(t.store, 'bg-busy').notified).toBe(true)
+  })
+
+  test('a submit that never returns does not hold back the next job\'s notice', { timeoutMs: 10_000 }, async ($, on) => {
+    // 实测：compact 换窗口时 bg-mwl971s9-1 的提示已送进会话，submit 却一直不返回；
+    // 随后结束的 bg-mwlacewg-4 被挡在单飞后面 15 分钟。
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map(), hangSubmit: true })
+    const job = (id: string) => ({
+      jobId: id, sessionId: `sid-${id}`, tier: 'gpt', model: 'm', cwd: '/work', mode: 'work', ptc: 'only',
+      background: true, status: 'done', at: Date.now() - 60_000, endedAt: Date.now() - 30_000, summary: id, owner: 'sess-me', notified: false,
+    })
+    t.store.set('job:bg-first', job('bg-first'))
+    t.files.set(`${ROOT}/bg-first/result.json`, JSON.stringify({ ok: true, text: 'first', sessionId: 'sid-bg-first', turns: 1 }))
+    await startSession($ as never)
+    expect(t.submitted.filter(x => x.includes('bg-first'))).toHaveLength(1)
+    t.store.set('job:bg-second', job('bg-second'))
+    t.files.set(`${ROOT}/bg-second/result.json`, JSON.stringify({ ok: true, text: 'second', sessionId: 'sid-bg-second', turns: 1 }))
+    // 直接写 store 绕过了 saveJob 的缓存失效：等作业列表缓存过期。
+    await new Promise(r => setTimeout(r, 1_700))
+    await startSession($ as never)
+    expect(t.submitted.filter(x => x.includes('bg-second'))).toHaveLength(1)
+    expect(t.submitted.filter(x => x.includes('bg-first'))).toHaveLength(1)
   })
 
   test('two recoveries racing each other announce a finished job once', { timeoutMs: 10_000 }, async ($, on) => {
@@ -1159,6 +1182,27 @@ describe('jobs', () => {
     expect(jobOf(t.store, 'bg-unsent').notified).toBe(true)
     const second = text(await jobCall($ as never, 'mcp__delegate__delegate_list', {}))
     expect(second).not.toContain('完成通知没送到')
+  })
+
+  test('a runner whose status is still being written is not taken for an orphan, even when tasklist cannot tell', { timeoutMs: 10_000 }, async ($, on) => {
+    // 实测：tasklist 查不出（超时/报错）时被当成死了，还在跑的 GPT 作业被标成宿主重启中断，resume 出了第二个 runner。
+    ;(on as (name: string, fn: () => unknown) => void)('session.id', () => ({ value: 'sess-me' }))
+    const t = jobSetup(on as never, { ok: true, text: 'x' }, { files: new Map() })
+    const at = Date.now() - 20 * 60_000
+    const rec = (id: string) => ({
+      jobId: id, sessionId: `sid-${id}`, tier: 'gpt', model: 'm', cwd: '/work', mode: 'work', ptc: 'only',
+      background: true, status: 'running', at, summary: id, owner: 'sess-me',
+    })
+    // 刚刷新过状态文件，pid 不在 tasklist 里也算活着。
+    t.store.set('job:bg-fresh', rec('bg-fresh'))
+    t.files.set(`${ROOT}/bg-fresh/status.json`, JSON.stringify({ jobId: 'bg-fresh', pid: 7781, phase: 'working', startedAt: at, updatedAt: Date.now() - 20_000 }))
+    await startSession($ as never)
+    expect(jobOf(t.store, 'bg-fresh').status).toBe('running')
+    expect(t.submitted).toHaveLength(0)
+    // 旧 runner 可能还活着：resume 同一个 agent 被拒，不起第二个 runner。
+    const out = text(await jobCall($ as never, 'mcp__delegate__delegate_gpt', { task: 'go on', resume: 'bg-fresh', background: true }))
+    expect(out).toContain('不能 resume')
+    expect(out).toContain('delegate_cancel')
   })
 
   test('a job started a moment ago with no status file yet is not taken for an orphan', { timeoutMs: 10_000 }, async ($, on) => {
