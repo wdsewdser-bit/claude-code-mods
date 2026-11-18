@@ -2257,6 +2257,10 @@ const AF = Object.getPrototypeOf(async function () {}).constructor;
   if (libNotes.length) body = libNotes.join(NL) + (body ? NL + NL + body : "");
   let text = body;
   if (!err) { const w = multiText(); if (w) text = w + (body ? NL + NL + body : ""); }
+  // Every write that took effect closes a successful result too: ctx-mod reads this list to know which files the
+  // session changed, since a path held in a variable or matched by a glob is not visible in the program text.
+  // The multi-place warning above already names its files, so only the rest are listed here.
+  if (!err && writeOps.size) { const rest = [...writeOps.values()].filter((e) => !(e.places > 1)); if (rest.length) text += (text ? NL + NL : "") + "本程序已生效的写操作：" + NL + rest.slice(0, 50).map((e) => "- " + e.op + " " + e.path + (e.count > 1 ? " ×" + e.count : "")).join(NL) + (rest.length > 50 ? NL + "- …等 " + rest.length + " 项" : ""); }
   if (err) {
     let m;
     if (err && err.name === "ToolCallError") m = "ToolCallError (" + err.toolName + "): " + err.message;

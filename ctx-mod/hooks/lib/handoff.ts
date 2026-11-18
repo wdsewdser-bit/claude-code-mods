@@ -125,6 +125,10 @@ export type HandoffInput = {
   tools?: string
   /** What the ledger does not cover, already rendered; never cut, because the actions that would show it can be. */
   coverage?: string
+  /** This session's own files git still shows as changed: never cut, so an edit is never forgotten. */
+  uncommitted?: string
+  /** History pointers for identifiers in the latest requests: dropped with the recent actions when space runs out. */
+  hints?: string
   /** The file working set and the snippets taken from disk at the switch. */
   workset: string
   actions: readonly HandoffAction[]
@@ -194,10 +198,11 @@ export const assemble = (input: HandoffInput, config: Config): string => {
   const loadReason = input.loadReason ?? ''
   const coverage = input.coverage ?? ''
   const decisions = input.decisions ?? ''
-  const join = (workset: string, actions: string): string =>
-    [opening, input.home, decisions, reply, agents, loadReason, tools, coverage, workset, actions].filter(part => part !== '').join('\n\n')
+  const uncommitted = input.uncommitted ?? ''
+  const join = (workset: string, actions: string, hints = ''): string =>
+    [opening, input.home, decisions, reply, agents, loadReason, tools, coverage, uncommitted, workset, hints, actions].filter(part => part !== '').join('\n\n')
   const actions = renderActions(input.actions)
-  const whole = join(input.workset, actions)
+  const whole = join(input.workset, actions, input.hints ?? '')
   if (estimateTokens(whole) <= config.handoffTokens) return whole
   const withoutActions = join(input.workset, '')
   if (estimateTokens(withoutActions) <= config.handoffTokens) return withoutActions

@@ -108,7 +108,27 @@ export type Io = {
    * relative to it; what is stored on disk keeps the absolute paths. Left out, paths stay as they are.
    */
   cwd?: () => string | undefined | Promise<string | undefined>
+  /**
+   * Runs git in a directory, for the handoff's list of files this session changed and has not committed.
+   * Left out, that list is not built; a failure or timeout marks the files as unchecked, never as clean.
+   */
+  git?: (args: readonly string[], cwd: string) => Promise<{ code: number; stdout: string; stderr?: string }>
+  /**
+   * Hands the handoff's candidates to a scorer that only logs (the decision-API shadow run). Fire and
+   * forget: it never changes the handoff, and its absence or failure changes nothing either.
+   */
+  shadow?: (job: ShadowJob) => void
 }
+
+/** What a shadow scorer is given: the latest requests and the items the handoff chose among. */
+export type ShadowJob = {
+  window: number
+  input: string
+  candidates: { id: string; kind: 'task' | 'history'; shown: boolean; text: string }[]
+}
+
+/** A file the session wrote, kept apart from the reads so no window filter or eviction loses it. */
+export type WriteNote = { path: string; window: number; seq: number; ts: number }
 
 export type Env = {
   /** The context tokens the engine last reported; unknown on the first request. */
@@ -379,6 +399,22 @@ const APPROVED =
 /** Activities kept in memory (and in meta): enough for the working set, not the whole session. */
 const MAX_ACTIVITIES = 500
 
+/** Words in a request too common to point at anything in the history. */
+const HINT_STOPWORDS = new Set(['https', 'http', 'claude', 'session', 'window', 'function', 'return', 'string', 'number', 'undefined', 'console', 'default', 'because', 'should', 'please', 'message'])
+
+/** How many request identifiers get history pointers, and how many pointers each. */
+const MAX_HINT_WORDS = 6
+const MAX_HINT_HITS = 3
+
+/** Files remembered as written by this session: one row per file, the oldest dropped first. */
+const MAX_WRITES = 300
+
+/** Directories git is asked about when a handoff is built: the most recently written first. */
+const MAX_GIT_DIRS = 40
+
+/** Rows of the uncommitted-files section before the rest are only counted. */
+const MAX_UNCOMMITTED_SHOWN = 20
+
 /** Subagents kept for the handoff; past this the oldest are dropped, which keeps meta.json small. */
 const MAX_ROSTER = 50
 
@@ -423,6 +459,8 @@ type State = {
   ledgerNudged: boolean
   archive: ArchivePage[]
   activities: FileActivity[]
+  /** Every file written, newest write per file: what the handoff checks against git. */
+  writes: WriteNote[]
   roster: AgentSeen[]
   /** Tool group -> the tokens its first load rewrote, the latest such load's; persisted, so a reloaded session still knows. */
   costlyLoads: Record<string, number>
@@ -451,7 +489,7 @@ type State = {
 
 export type Session = {
   record: (row: RecordInput) => Promise<HistoryRecord>
-  activity: (tool: string, input: Readonly<Record<string, unknown>>, seq: number, isError: boolean) => void
+  activity: (tool: string, input: Readonly<Record<string, unknown>>, seq: number, isError: boolean, result?: string) => void
   noteRequest: () => void
   reminder: (env: Env) => string | null
   ledgerAppend: (input: unknown, env: Env) => Promise<ToolResult>
@@ -556,6 +594,7 @@ const emptyState = (): State => ({
   ledgerNudged: false,
   archive: [],
   activities: [],
+  writes: [],
   roster: [],
   costlyLoads: {},
   pendingLoads: [],
@@ -794,6 +833,9 @@ const stateFrom = (raw: Record<string, unknown> | null): State => {
   state.lastRequestAt = typeof raw.lastRequestAt === 'number' && Number.isFinite(raw.lastRequestAt) ? raw.lastRequestAt : null
   state.archive = asRecordArray<ArchivePage>(raw.archive)
   state.activities = asRecordArray<FileActivity>(raw.activities)
+  state.writes = asRecordArray<WriteNote>(raw.writes).filter(
+    note => typeof note.path === 'string' && typeof note.seq === 'number' && typeof note.window === 'number',
+  )
   state.roster = rosterFrom(raw.roster)
   state.costlyLoads = costlyFrom(raw.costlyLoads)
   state.lastPrefix = typeof raw.lastPrefix === 'number' ? raw.lastPrefix : null
@@ -1191,6 +1233,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
       ledgerNudged: state.ledgerNudged,
       archive: state.archive,
       activities: state.activities,
+      writes: state.writes,
       roster: state.roster,
       costlyLoads: state.costlyLoads,
       lastRequestAt: state.lastRequestAt,
@@ -1517,10 +1560,23 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     return clipped
   }
 
-  const activity = (tool: string, input: Readonly<Record<string, unknown>>, seq: number, isError: boolean): void => {
+  const activity = (
+    tool: string,
+    input: Readonly<Record<string, unknown>>,
+    seq: number,
+    isError: boolean,
+    result?: string,
+  ): void => {
     // One call can name several files (a `run_code` program), so every activity it yields is kept.
-    const found = activitiesOf(tool, input, { seq, window: state.window, isError })
+    const found = activitiesOf(tool, input, { seq, window: state.window, isError }, result)
     if (found.length === 0) return
+    for (const one of found) {
+      if (one.isError || (one.op !== 'edit' && one.op !== 'write')) continue
+      const key = pathKey(one.path)
+      state.writes = state.writes.filter(note => pathKey(note.path) !== key)
+      state.writes.push({ path: one.path, window: one.window, seq: one.seq, ts: io.now() })
+    }
+    if (state.writes.length > MAX_WRITES) state.writes.splice(0, state.writes.length - MAX_WRITES)
     state.activities.push(...found)
     if (state.activities.length > MAX_ACTIVITIES) {
       state.activities.splice(0, state.activities.length - MAX_ACTIVITIES)
@@ -1814,7 +1870,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
           ...(isError ? { isError: true as const } : {}),
           text: use.text,
         })
-        activity(use.tool, input, row.seq, isError)
+        activity(use.tool, input, row.seq, isError, use.text)
         imported += 1
       }
     }
@@ -2749,6 +2805,149 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
    * (this mod's own calls are not work) that the entry did not cover. An entry from before
    * `through` existed is compared by time instead of by history number.
    */
+  /** The files this window wrote after its latest ledger entry: changes the ledger says nothing about. */
+  const unbookedWrites = (): WriteNote[] => {
+    let latest: LedgerEntry | null = null
+    for (const entry of state.page) {
+      if (entry.window === state.window && (latest === null || entry.seq > latest.seq)) latest = entry
+    }
+    const covered = latest
+
+    return state.writes.filter(note => {
+      if (note.window !== state.window) return false
+      if (covered === null) return true
+
+      return typeof covered.through === 'number' ? note.seq > covered.through : note.ts > covered.ts
+    })
+  }
+
+  /**
+   * The files this session wrote that git still shows as changed, checked when the handoff is built.
+   * Only the session's own writes are claimed; other changes in the same repositories are counted apart,
+   * so a new window neither forgets its own edits nor takes someone else's for them.
+   */
+  const uncommittedSection = async (base: string | undefined): Promise<string> => {
+    const git = io.git
+    if (git === undefined || state.writes.length === 0) return ''
+    const dirOf = (path: string): string => path.replace(/\\/g, '/').replace(/\/[^/]*$/, '')
+    const newest = [...state.writes].sort((left, right) => right.seq - left.seq)
+    const dirs: string[] = []
+    for (const note of newest) {
+      const dir = dirOf(note.path)
+      if (!dirs.some(seen => pathKey(seen) === pathKey(dir))) dirs.push(dir)
+      if (dirs.length >= MAX_GIT_DIRS) break
+    }
+    /** dir key -> repository top, null when not in a repository (or gone), 'fail' when git could not say. */
+    const topOf = new Map<string, string | null | 'fail'>()
+    for (const dir of dirs) {
+      try {
+        if (io.exists !== undefined && !(await io.exists(dir))) {
+          topOf.set(pathKey(dir), null)
+          continue
+        }
+        const ran = await git(['rev-parse', '--show-toplevel'], dir)
+        const top = ran.stdout.trim()
+        if (ran.code === 0 && top !== '') topOf.set(pathKey(dir), top)
+        else topOf.set(pathKey(dir), /not a git repository/i.test(`${ran.stderr ?? ''}${ran.stdout}`) ? null : 'fail')
+      } catch {
+        topOf.set(pathKey(dir), 'fail')
+      }
+    }
+    const dirty = new Map<string, Set<string> | 'fail'>()
+    for (const top of new Set([...topOf.values()].filter((top): top is string => typeof top === 'string' && top !== 'fail'))) {
+      try {
+        const ran = await git(['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall'], top)
+        if (ran.code !== 0) {
+          dirty.set(pathKey(top), 'fail')
+          continue
+        }
+        const files = new Set<string>()
+        for (const line of ran.stdout.split('\n')) {
+          if (line.trim().length < 4) continue
+          let rel = line.slice(3).trim()
+          const arrow = rel.indexOf(' -> ')
+          if (arrow !== -1) rel = rel.slice(arrow + 4)
+          if (rel.startsWith('"') && rel.endsWith('"')) rel = rel.slice(1, -1)
+          files.add(pathKey(`${top}/${rel}`))
+        }
+        dirty.set(pathKey(top), files)
+      } catch {
+        dirty.set(pathKey(top), 'fail')
+      }
+    }
+
+    const mine: WriteNote[] = []
+    const unchecked: WriteNote[] = []
+    const claimed = new Set<string>()
+    for (const note of newest) {
+      const top = topOf.get(pathKey(dirOf(note.path)))
+      if (top === undefined || top === null) continue
+      const files = top === 'fail' ? 'fail' : dirty.get(pathKey(top))
+      if (files === undefined) continue
+      if (files === 'fail') {
+        unchecked.push(note)
+        continue
+      }
+      if (files.has(pathKey(note.path))) {
+        mine.push(note)
+        claimed.add(pathKey(note.path))
+      }
+    }
+    if (mine.length === 0 && unchecked.length === 0) return ''
+    let others = 0
+    for (const top of new Set(mine.map(note => topOf.get(pathKey(dirOf(note.path)))))) {
+      const files = typeof top === 'string' && top !== 'fail' ? dirty.get(pathKey(top)) : undefined
+      if (files instanceof Set) for (const file of files) if (!claimed.has(file)) others += 1
+    }
+    const shown = (path: string): string => relativePath(path, base)
+    const lines = ['## 本会话改过、仍未提交的文件', '（交接时用 git status 核对过。这些是本会话自己写的：改动的原文用 history 按编号读，提交前先确认改动是否完成）']
+    for (const note of mine.slice(0, MAX_UNCOMMITTED_SHOWN)) {
+      lines.push(`- ${shown(note.path)}（第 ${note.window} 窗口 #${note.seq} 最后一次改）`)
+    }
+    if (mine.length > MAX_UNCOMMITTED_SHOWN) lines.push(`- 另有 ${mine.length - MAX_UNCOMMITTED_SHOWN} 个`)
+    if (unchecked.length > 0) {
+      const names = unchecked.slice(0, 10).map(note => `${shown(note.path)}（#${note.seq}）`).join('、')
+      lines.push(`- git 没能核对（报错或超时），可能仍未提交：${names}${unchecked.length > 10 ? ` 等 ${unchecked.length} 个` : ''}`)
+    }
+    if (others > 0) {
+      lines.push(`- 同样的仓库里另有 ${others} 个未提交改动不在本会话的写入记录里（可能是子代理、其他会话或用户改的）；认领之前先用 history 搜文件名`)
+    }
+
+    return lines.join('\n')
+  }
+
+  /**
+   * History pointers for the identifiers in the latest requests: rows from before the window being left
+   * that name them, so a fact settled long ago is a lookup away rather than something to be reminded of.
+   */
+  const historyHints = (rows: readonly HistoryRecord[], requests: readonly HistoryRecord[], found: HistoryRecord[] = []): string => {
+    const words = new Set<string>()
+    for (const request of requests.slice(-3)) {
+      for (const word of request.text.match(/[A-Za-z_][A-Za-z0-9_.-]{3,40}/g) ?? []) {
+        const clean = word.replace(/[.-]+$/, '')
+        const isSpecific = /[0-9_.-]/.test(clean) || /[a-z][A-Z]/.test(clean) || clean.length >= 7
+        if (isSpecific && !HINT_STOPWORDS.has(clean.toLowerCase())) words.add(clean)
+      }
+    }
+    if (words.size === 0) return ''
+    const lines: string[] = []
+    for (const word of [...words].slice(0, MAX_HINT_WORDS)) {
+      const needle = word.toLowerCase()
+      const hits: HistoryRecord[] = []
+      for (let at = rows.length - 1; at >= 0 && hits.length < MAX_HINT_HITS; at -= 1) {
+        const row = rows[at]
+        if (row === undefined || row.window >= state.window || row.door !== undefined) continue
+        if (row.text.toLowerCase().includes(needle) || (row.args ?? '').toLowerCase().includes(needle)) hits.push(row)
+      }
+      if (hits.length === 0) continue
+      found.push(...hits)
+      lines.push(`- ${word}：${hits.map(row => `#${row.seq}（第 ${row.window} 窗口）`).join('、')}`)
+    }
+    if (lines.length === 0) return ''
+
+    return ['## 更早窗口里提到过的关键词（按最近请求自动检索，先判断是否相关再用 history 读）', ...lines].join('\n')
+  }
+
   const tailOf = (): { steps: number; from: number | null; to: number | null; entrySeq: number | null } => {
     let latest: LedgerEntry | null = null
     for (const entry of state.page) {
@@ -2827,8 +3026,13 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
     const tail = tailOf()
     const isTailShort = tail.steps <= config.freshTailSteps
     let staleReason: string | undefined
+    const unbooked = unbookedWrites()
     if (!isFresh) {
       staleReason = '账本还不新：这个窗口里在最近一次用户请求之后还没有记过账。'
+    } else if (unbooked.length > 0) {
+      const names = unbooked.slice(0, 3).map(note => `${note.path}（#${note.seq}）`).join('、')
+      const more = unbooked.length > 3 ? ` 等 ${unbooked.length} 个文件` : ''
+      staleReason = `账本还不新：最近一次记账之后改了 ${names}${more}，账本里没有这些改动。先用 ledger_append 记下改了什么、是否已提交，下个窗口才不会把它当成别人留下的。`
     } else if (!isTailShort) {
       const range = tail.from === null || tail.to === null ? '' : `（#${tail.from}–#${tail.to}）`
       staleReason = `账本还不新：最近一次记账（#L${tail.entrySeq ?? 0}）之后又有 ${tail.steps} 个工具结果没有记进账本${range}。`
@@ -2838,7 +3042,7 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
         requestsSinceSwitch: state.requestsSinceSwitch,
         switchTimes: state.switchTimes,
         now,
-        hasFreshLedger: isFresh && isTailShort,
+        hasFreshLedger: isFresh && isTailShort && unbooked.length === 0,
         ...(staleReason === undefined ? {} : { staleReason }),
         level: env.tokens === undefined ? 'none' : levelOf(env.tokens, env.limit, config),
         judgement,
@@ -2965,6 +3169,26 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
       // No working directory known: the paths are shown as they are.
     }
     const workset = renderWorkset(filesOf(state.activities, state.window), snippets, inherited, base)
+    const uncommitted = await uncommittedSection(base)
+    const hinted: HistoryRecord[] = []
+    const hints = historyHints(rows, requests, hinted)
+    if (io.shadow !== undefined) {
+      try {
+        const candidates: ShadowJob['candidates'] = [
+          ...open.map((task, at) => ({
+            id: `task_${at}`,
+            kind: 'task' as const,
+            shown: true,
+            text: `${task.taskId}：${task.title}。最新：${task.latest.text.slice(0, 300)}`,
+          })),
+          ...hinted.map(row => ({ id: `hist_${row.seq}`, kind: 'history' as const, shown: true, text: row.text.slice(0, 300) })),
+        ]
+        const input = requests.slice(-3).map(request => request.text.slice(0, 2_000)).join('\n---\n')
+        io.shadow({ window, input, candidates })
+      } catch {
+        // A shadow run is optional: whatever goes wrong there leaves the handoff as it is.
+      }
+    }
     const tail = tailOf()
     // The whole uncovered stretch is listed (up to a cap), since the ledger holds nothing of it.
     const actions = recentActions(
@@ -2987,6 +3211,8 @@ export const createSession =(dir: string, io: Io, config: Config, ancestors: rea
         ...(decisions === '' ? {} : { decisions }),
         ...(loadReason === '' ? {} : { loadReason }),
         ...(coverage === '' ? {} : { coverage }),
+        ...(uncommitted === '' ? {} : { uncommitted }),
+        ...(hints === '' ? {} : { hints }),
         ...(agents === '' ? {} : { agents }),
         ...(tools === '' ? {} : { tools }),
         ...(lastReply === null ? {} : { lastReply }),

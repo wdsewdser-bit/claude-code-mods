@@ -404,6 +404,19 @@ const openSession = async ($: EngineInterface, id: string): Promise<Session> => 
     write: (path, text) => $.fs.write(path, text),
     exists: path => $.fs.exists(path),
     cwd: () => $.session.cwd(),
+    shadow: job => {
+      void (async () => {
+        if ((await attempt(async () => await $.env.get('CTX_MOD_DECISION_SHADOW'), undefined)) === '0') return
+        const child = $.process.spawn({ argv: ['node', `${$.plugin.root}/scripts/decision-shadow.mjs`], input: JSON.stringify({ dir, ...job }) })
+        for await (const piece of child) {
+          if (piece.stream === 'stderr') logError($, 'decision-shadow', piece.text)
+        }
+      })().catch(error => logError($, 'decision-shadow', error))
+    },
+    git: async (args, cwd) => {
+      const ran = await $.process.run(['git', ...args], { cwd, timeoutMs: 5_000 })
+      return { code: ran.exitCode ?? 1, stdout: ran.stdout ?? '', stderr: ran.stderr ?? '' }
+    },
     firstUser: async () => {
       const projects = home + '/.claude/projects'
       const cwd = await attempt(async () => await $.session.cwd(), undefined)
@@ -1691,7 +1704,7 @@ export const register: Register = (on, options) => {
             ...(loaded.length === 0 ? {} : { loaded }),
             text: note === '' ? body : body === '' ? note : `${body}\n${note}`,
           })
-          session.activity(tool, input, record.seq, isError)
+          session.activity(tool, input, record.seq, isError, text)
 
           // This mod's own results are recorded, never numbered.
           // A result that carries anything but text (ToolSearch's tool

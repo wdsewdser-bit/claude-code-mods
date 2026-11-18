@@ -39,6 +39,8 @@ const OLDER_NOTE_CHARS = 60
 /** Open tasks beyond the newest this many are shown as a short summary, so the home page has an upper bound. */
 const MAX_FULL_ACTIVE = 5
 const SHORT_FIELD_CHARS = 200
+/** The note kept on a stale task's single line. */
+const STALE_LINE_CHARS = 60
 const STATUSES: readonly TaskStatus[] = ['in_progress', 'done', 'superseded', 'blocked']
 
 const STATUS_LABEL: Record<TaskStatus, string> = {
@@ -697,10 +699,16 @@ export const renderHome = (
    * records only repeat an old snapshot is what a new window is most likely to misread as
    * current work, so past the thresholds it is marked — a hint, never a close.
    */
+  const isStaleTask = (task: TaskState): boolean => {
+    const last = task.lastSubstantive
+    const days = Math.max(0, Math.floor((now - last.ts) / 86_400_000))
+
+    return input.window - last.window >= config.staleWindows || days >= config.staleDays
+  }
   const headerOf = (task: TaskState): string => {
     const last = task.lastSubstantive
     const days = Math.max(0, Math.floor((now - last.ts) / 86_400_000))
-    const isStale = input.window - last.window >= config.staleWindows || days >= config.staleDays
+    const isStale = isStaleTask(task)
     const when = `最后实质更新：第 ${last.window} 窗口，${days} 天前${isStale ? '，可能已过时，提之前先确认' : ''}`
 
     return `- ${task.taskId}：${task.title}（${STATUS_LABEL[task.status]}；${when}）`
@@ -738,9 +746,13 @@ export const renderHome = (
     head.push('无')
   } else {
     // Newest first, so what is dropped to a summary is what was touched longest ago.
+    // A task untouched past the thresholds is most often finished elsewhere and never closed: it gets one
+    // line at the end, so it neither crowds out current work nor reads as current.
     const ordered = newestFirst(active)
-    const full = ordered.slice(0, MAX_FULL_ACTIVE)
-    const short = ordered.slice(MAX_FULL_ACTIVE)
+    const current = ordered.filter(task => !isStaleTask(task))
+    const stale = ordered.filter(isStaleTask)
+    const full = current.slice(0, MAX_FULL_ACTIVE)
+    const short = current.slice(MAX_FULL_ACTIVE)
     for (const task of full) {
       head.push(headerOf(task))
       const notes = windowNotesOf(task, input.entries)
@@ -799,6 +811,14 @@ export const renderHome = (
     }
     if (short.length > 0) {
       head.push(`（还有 ${short.length} 个较早更新的任务只显示了摘要，完整记录用 ledger_read 按 task_id 查）`)
+    }
+    for (const task of stale) {
+      head.push(`${headerOf(task)} · 最新 #L${task.latest.seq}：${clipText(task.latest.text, STALE_LINE_CHARS)}`)
+    }
+    if (stale.length > 0) {
+      head.push(
+        `（以上 ${stale.length} 个任务很久没有实质更新，只列一行：可能已在别处做完。确认做完的标 done 或 superseded；要接着做先用 ledger_read 按 task_id 看全文）`,
+      )
     }
   }
 

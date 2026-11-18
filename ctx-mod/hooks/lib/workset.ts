@@ -131,8 +131,94 @@ const closingParen = (code: string, open: number): number => {
   return code.length
 }
 
-/** The path one call names: the first `path:` string literal in its own arguments, never in a nested call. */
-const pathInArgs = (args: string): string | undefined => {
+/** The names a program binds to a fixed string (`const f = "C:/a.ts"`), so `path: f` still names a file. */
+const bindingsOf = (code: string): Map<string, string> => {
+  const out = new Map<string, string>()
+  const decl = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/g
+  let found: RegExpExecArray | null
+  while ((found = decl.exec(code)) !== null) {
+    const name = found[1]
+    if (name === undefined) continue
+    const value = expressionAt(code, decl.lastIndex, out)
+    // A name bound twice to different text is not one file: it is dropped rather than guessed.
+    if (value === undefined || (out.has(name) && out.get(name) !== value)) {
+      if (value !== undefined) out.set(name, '\u0000')
+      continue
+    }
+    out.set(name, value)
+  }
+  for (const [name, value] of out) if (value === '\u0000') out.delete(name)
+
+  return out
+}
+
+/** A template literal whose `${…}` parts are all bound names; undefined when any part is not. */
+const templateAt = (text: string, at: number, names: ReadonlyMap<string, string>): string | undefined => {
+  if (text.charAt(at) !== '`') return undefined
+  let value = ''
+  let i = at + 1
+  while (i < text.length) {
+    const ch = text.charAt(i)
+    if (ch === '\\') {
+      value += text.charAt(i + 1)
+      i += 2
+      continue
+    }
+    if (ch === '`') return value.trim() === '' ? undefined : value
+    if (ch === '$' && text.charAt(i + 1) === '{') {
+      const end = text.indexOf('}', i + 2)
+      if (end === -1) return undefined
+      const bound = names.get(text.slice(i + 2, end).trim())
+      if (bound === undefined) return undefined
+      value += bound
+      i = end + 1
+      continue
+    }
+    value += ch
+    i += 1
+  }
+
+  return undefined
+}
+
+/**
+ * The text an expression starting at `at` stands for, when it is built only from string literals and
+ * bound names joined by `+` (`dir + "/a.ts"`, `\`${dir}/a.ts\``); undefined for anything else.
+ */
+const expressionAt = (text: string, at: number, names: ReadonlyMap<string, string>): string | undefined => {
+  let value = ''
+  let i = at
+  for (;;) {
+    while (i < text.length && /\s/.test(text.charAt(i))) i += 1
+    const ch = text.charAt(i)
+    if (ch === '`') {
+      const part = templateAt(text, i, names)
+      if (part === undefined) return undefined
+      value += part
+      i = afterString(text, i)
+    } else if (QUOTES.includes(ch)) {
+      const part = literalAt(text, i)
+      if (part === undefined) return undefined
+      value += part
+      i = afterString(text, i)
+    } else {
+      const name = /^[A-Za-z_$][\w$]*/.exec(text.slice(i))?.[0]
+      if (name === undefined) return undefined
+      const bound = names.get(name)
+      if (bound === undefined) return undefined
+      value += bound
+      i += name.length
+      // `dir.length`, `f(x)`, `a[0]`: not a plain name, so not a path this can know.
+      if (/^[.([]/.test(text.charAt(i))) return undefined
+    }
+    while (i < text.length && /[ \t]/.test(text.charAt(i))) i += 1
+    if (text.charAt(i) !== '+') return value.trim() === '' ? undefined : value
+    i += 1
+  }
+}
+
+/** The path one call names: the first `path:` argument in its own arguments, never in a nested call. */
+const pathInArgs = (args: string, names: ReadonlyMap<string, string> = new Map()): string | undefined => {
   let i = 0
   while (i < args.length) {
     const ch = args.charAt(i)
@@ -145,8 +231,11 @@ const pathInArgs = (args: string): string | undefined => {
       while (j < args.length && /\s/.test(args.charAt(j))) j += 1
       if (args.charAt(j) === ':') {
         j += 1
-        while (j < args.length && /\s/.test(args.charAt(j))) j += 1
-        const path = literalAt(args, j)
+        const path = expressionAt(args, j, names)
+        if (path !== undefined) return path
+      } else if (args.charAt(j) === ',' || args.charAt(j) === '}') {
+        // The shorthand `{ path, old, new }`: the value is whatever `path` was bound to.
+        const path = names.get('path')
         if (path !== undefined) return path
       }
     }
@@ -178,6 +267,7 @@ const codeActivities = (
   const code = field(input, 'code')
   if (typeof code !== 'string') return []
   const root = field(input, 'root')
+  const names = bindingsOf(code)
   const call = /tools\.(write|edit|replace)\s*\(/y
   const out: FileActivity[] = []
   let i = 0
@@ -205,7 +295,7 @@ const codeActivities = (
       continue
     }
     const open = i + (found[0] ?? '').length - 1
-    const path = pathInArgs(code.slice(open + 1, closingParen(code, open)))
+    const path = pathInArgs(code.slice(open + 1, closingParen(code, open)), names)
     if (path !== undefined) {
       out.push(base(withRoot(path, root), found[1] === 'write' ? 'write' : 'edit'))
     }
@@ -213,6 +303,35 @@ const codeActivities = (
   }
 
   return out
+}
+
+/** The heading ptc-run puts over the writes a program really made. */
+const WRITES_HEADING = '本程序已生效的写操作：'
+/** The heading over writes that changed several places at once; on success those are listed only here. */
+const MULTI_HEADING = '注意：以下写操作一次改了多处，确认每处都是有意改的：'
+
+/**
+ * The files a `run_code` result says were written: ptc-run lists every write that took effect
+ * (on failure, on a timeout, and — when any — on success), so this catches what the program text hides.
+ */
+export const writesInResult = (text: string | undefined): string[] => {
+  if (text === undefined) return []
+  const out: string[] = []
+  for (const heading of [WRITES_HEADING, MULTI_HEADING]) {
+  let at = text.indexOf(heading)
+  while (at !== -1) {
+    const lines = text.slice(at + heading.length).split('\n').slice(1)
+    for (const line of lines) {
+      const found = /^- (?:write|edit|replace|copy|move|remove|batch|append)\S* (.+?)(?: ×\d+)?(?:（共 \d+ 处.*）)?\s*$/.exec(line)
+      if (found === null) break
+      const path = found[1]?.trim()
+      if (path !== undefined && path !== '' && !path.startsWith('…')) out.push(path)
+    }
+    at = text.indexOf(heading, at + heading.length)
+  }
+  }
+
+  return [...new Set(out)]
 }
 
 /** One tool call's single activity, for the tools that name one file; null when no file was touched. */
@@ -275,6 +394,8 @@ export const activitiesOf = (
   tool: string,
   input: Readonly<Record<string, unknown>>,
   meta: { seq: number; window: number; isError: boolean },
+  /** The call's result: a `run_code` result lists the writes that really happened. */
+  result?: string,
 ): FileActivity[] => {
   const base = (path: string, op: FileActivity['op']): FileActivity => ({
     path,
@@ -284,7 +405,17 @@ export const activitiesOf = (
     isError: meta.isError,
   })
 
-  if (isRunCode(tool)) return codeActivities(input, base)
+  if (isRunCode(tool)) {
+    const root = field(input, 'root')
+    const reported = writesInResult(result).map(path => withRoot(path, root))
+    // A failed program's writes before the throw did happen: the result's list says which, and
+    // they are kept as writes even though the call failed.
+    const said = reported.map(path => ({ ...base(path, 'edit'), isError: false }))
+    const parsed = meta.isError ? [] : codeActivities(input, base)
+    const seen = new Set(said.map(activity => pathKey(activity.path)))
+
+    return [...said, ...parsed.filter(activity => !seen.has(pathKey(activity.path)))]
+  }
   const one = singleActivity(tool, input, meta, base)
 
   return one === null ? [] : [one]
