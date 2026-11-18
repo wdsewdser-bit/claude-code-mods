@@ -5,6 +5,7 @@
 // throwaway directory, so "before" (the backup) and "after" (this tree) are
 // measured by the same harness. Only the history files count; meta.json does not.
 import { promises as fs } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { performance } from 'node:perf_hooks'
 import { DEFAULTS } from '../hooks/lib/types.ts'
 import { byteLength } from '../hooks/lib/history.ts'
@@ -13,7 +14,7 @@ const sessionPath = process.env.CTX_SESSION ?? new URL('../hooks/lib/session.ts'
 const tag = process.env.CTX_BENCH_TAG ?? 'after'
 const { createSession } = await import(sessionPath)
 
-const ROOT = `C:/Users/yadaz/AppData/Local/Temp/claude/ctx-bench/b01-${tag}`
+const ROOT = `${tmpdir().replace(/\\/g, '/')}/claude/ctx-bench/b01-${tag}`
 
 const textOf = (length, seq) => {
   const head = `#${seq} `

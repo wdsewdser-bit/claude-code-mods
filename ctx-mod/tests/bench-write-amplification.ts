@@ -4,6 +4,7 @@
 // It mirrors what session.record does (clipRecord -> appendRecord -> toJsonl ->
 // queue.push) and writes to a throwaway directory under the system temp folder.
 import { promises as fs } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { performance } from 'node:perf_hooks'
 import {
   MAX_SHARD_BYTES,
@@ -16,7 +17,7 @@ import {
 } from '../hooks/lib/history.ts'
 import { toJsonl } from '../hooks/lib/types.ts'
 
-const ROOT = 'C:/Users/yadaz/AppData/Local/Temp/claude/ctx-bench/a04'
+const ROOT = `${tmpdir().replace(/\\/g, '/')}/claude/ctx-bench/a04`
 const K256 = 256 * 1024
 const K1024 = 1024 * 1024
 const bucketOf = bytes => (bytes <= K256 ? '0-256K' : bytes <= K1024 ? '256K-1M' : '1M-2M')

@@ -6,12 +6,13 @@
 // 1,000,000 characters (the real OVERFLOW_PART_CHARS): a part the reader does
 // not need to materialize is one shared filler string, so 10,000 records fit in
 // memory while the search still scans every byte it would scan on disk.
+import { tmpdir } from 'node:os'
 import { performance } from 'node:perf_hooks'
 import { writeFileSync, mkdirSync } from 'node:fs'
 import { clipRecord, MAX_RECORD_CHARS, OVERFLOW_PART_CHARS, search } from '../hooks/lib/history.ts'
 
 const PART = OVERFLOW_PART_CHARS
-const OUT_DIR = 'C:/Users/yadaz/AppData/Local/Temp/claude/ctx-bench'
+const OUT_DIR = `${tmpdir().replace(/\\/g, '/')}/claude/ctx-bench`
 const MARK_TAIL = 'RAREWORD-ALPHA'
 const MARK_BOUNDARY = 'BOUNDARY-WORD-END'
 const MARK_INLINE = 'INLINEWORD'

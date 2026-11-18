@@ -5,13 +5,14 @@
 // Data goes to a throwaway directory and is removed afterwards; only history files
 // count, meta.json does not.
 import { promises as fs } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { performance } from 'node:perf_hooks'
 import { DEFAULTS } from '../hooks/lib/types.ts'
 import { byteLength } from '../hooks/lib/history.ts'
 
 const NEW = new URL('../hooks/lib/session.ts', import.meta.url).href
 const OLD = 'file:///D:/ptcab/scratch/batchB/ctx-mod.pre/hooks/lib/session.ts'
-const ROOT = 'C:/Users/yadaz/AppData/Local/Temp/claude/ctx-bench/segments'
+const ROOT = `${tmpdir().replace(/\\/g, '/')}/claude/ctx-bench/segments`
 const OUT = 'D:/ptcab/scratch/batchB/bench-segments.json'
 
 /** Deterministic sizes shaped like a real session: mostly small, a few very large. */
