@@ -3,6 +3,7 @@ import {
   DEFAULT_MESSAGE,
   INTERRUPTED_MESSAGE,
   MAX_AGE_MS,
+  STALE_AFTER_MS,
   buildPending,
   digestFromLines,
   judgeTranscript,
@@ -14,6 +15,8 @@ type Any = any
 const DIR = 'C:/virtual/cc-restart'
 const MARKER = `${DIR}/pending.json`
 const WAKE_PLAN = `${DIR}/wake-plan.json`
+const HOME = 'C:/virtual/home'
+const DELEGATE_DIR = `${HOME}/.claude/delegate`
 const LOCAL = 'C:/Users/test/AppData/Local'
 const REGISTRY = `${LOCAL}/Claude-Data/claude_pzs8sxrjxfjjc/claude-code-sessions/acc1/ws1/scheduled-tasks.json`
 const slashed = (path: string): string => path.replace(/\\/g, '/')
@@ -69,6 +72,7 @@ function setup(on: Any) {
       else files.set(MARKER, JSON.stringify(kept))
       return done()
     }
+    if (argv[0] === 'node' && argv[1] === '-p') return done(`${HOME}\n`)
     if (argv.includes('-Discover')) return done(discoverAnswer)
     if (argv.includes('-Tail')) {
       const transcript = argv[argv.indexOf('-Transcript') + 1] ?? ''
@@ -214,6 +218,40 @@ test('真实格式：后台 Bash 有 task-notification，delegate 有完成通�
   const verdict = judgeTranscript(digest)
   expect(verdict.state).toBe('idle')
   expect(verdict.interrupted).toHaveLength(0)
+})
+
+test('delegate 没有终态文件时，终态通知算完成、仍在等待回复的请示不算', () => {
+  for (const [label, state] of [
+    ['已取消', 'idle'],
+    ['取消', 'idle'],
+    ['以请示结束，需要你回复', 'idle'],
+    ['宿主重启中断：完成通知没送到，补在这里', 'idle'],
+    ['请示', 'working'],
+  ]) {
+    const digest = digestFromLines([
+      assistantTool('toolu_del1', 'mcp__delegate__delegate_pro', { task: '审查代码' }),
+      userResult('toolu_del1', DELEGATE_START),
+      wakeMessage(`The delegate plugin sent a message: 【delegate 后台任务 bg-mvfeek2b ${label}】`),
+      assistantText('收到。'),
+    ])
+    expect(judgeTranscript(digest, undefined, new Set()).state).toBe(state)
+  }
+})
+
+test('delegate 同一个工具结果补发多条终态通知 → 都不唤醒', () => {
+  const digest = digestFromLines([
+    assistantTool('toolu_del1', 'mcp__delegate__delegate_pro', { task: '任务一' }),
+    userResult('toolu_del1', DELEGATE_START),
+    assistantTool('toolu_del2', 'mcp__delegate__delegate_pro', { task: '任务二' }),
+    userResult('toolu_del2', DELEGATE_START.replace('bg-mvfeek2b', 'bg-other')),
+    assistantTool('toolu_del3', 'mcp__delegate__delegate_status', {}),
+    userResult('toolu_del3', [
+      '【delegate 后台任务 bg-mvfeek2b 完成：完成通知没送到，补在这里】',
+      '【delegate 后台任务 bg-other 已取消：完成通知没送到，补在这里】',
+    ].join('\n\n')),
+    assistantText('收到。'),
+  ])
+  expect(judgeTranscript(digest).state).toBe('idle')
 })
 
 test('真实格式：后台子代理 run_in_background 未回 → wake', () => {
@@ -412,6 +450,28 @@ test('restart_cc：写一条发起条目，others 列出干活与空闲会话', 
   expect(JSON.stringify(result)).toContain('1 个需要你用 session 工具通知')
 })
 
+for (const [label, resultPath, content] of [
+  ['已取消的 delegate', 'jobs/bg-mvfeek2b/result.json', JSON.stringify({ ok: false, error: 'cancelled', endedAt: 1_700_000_000_000 })],
+  ['只有 Markdown 结果的旧 delegate', 'results/bg-mvfeek2b.md', '作业已完成。'],
+] as const) {
+  test(`restart_cc：${label}，没有通知也不唤醒`, async ($, on) => {
+    const s = setup(on)
+    s.files.set(`${DELEGATE_DIR}/${resultPath}`, content)
+    s.setDiscover(JSON.stringify([{ sessionId: 'session-delegate', transcript: 'C:/t/delegate.jsonl', localId: 'local_delegate' }]))
+    s.setTail('C:/t/delegate.jsonl', [
+      assistantTool('toolu_del1', 'mcp__delegate__delegate_pro', { task: '审查代码' }),
+      userResult('toolu_del1', DELEGATE_START),
+      assistantText('等 delegate 回来。'),
+    ].join('\n'))
+    s.setScheduledTasks([{ id: WAKE_ID, enabled: true }])
+    await $.tool.call({ tool: 'mcp__cc-restart__restart_cc' as never, input: { wakeTaskId: WAKE_ID } })
+    const [entry] = JSON.parse(s.files.get(MARKER) ?? '[]')
+    expect(entry?.others).toHaveLength(1)
+    expect(entry.others[0].wake).toBe(false)
+    expect(entry.others[0].interrupted).toEqual([])
+  })
+}
+
 test('restart_cc：第一步把计划写进 wake-plan.json，只返回定时任务参数、不写标记、不重启', async ($, on) => {
   const s = setup(on)
   s.setDiscover(JSON.stringify([{ sessionId: 'session-a', pid: 9, transcript: '', localId: 'local_self', title: '我' }]))
@@ -521,6 +581,34 @@ test('a session silent for days is not woken, even when its last message is a ha
   expect(judgeTranscript(digest, at + 60 * 1000).state).toBe('working')
   // No clock given: the old judgement.
   expect(judgeTranscript(digest).state).toBe('working')
+})
+
+test('后台子代理超过静默阈值且没有通知 → idle', () => {
+  const timestamp = '2026-11-10T05:00:00.000Z'
+  const digest = digestFromLines([
+    assistantTool('toolu_ag1', 'Agent', { description: '代理A', run_in_background: true }),
+    userResult('toolu_ag1', ''),
+    assistantText('等子代理回来。'),
+    JSON.stringify({ type: 'system', timestamp }),
+  ])
+  const threshold = Date.parse(timestamp) + STALE_AFTER_MS
+  expect(judgeTranscript(digest, threshold).interrupted.map(item => item.type)).toEqual(['agent'])
+  const verdict = judgeTranscript(digest, threshold + 1)
+  expect(verdict.state).toBe('idle')
+  expect(verdict.interrupted).toEqual([])
+})
+
+test('后台 Bash 超过静默阈值且没有通知 → idle', () => {
+  const timestamp = '2026-11-10T05:00:00.000Z'
+  const digest = digestFromLines([
+    assistantTool('toolu_bash1', 'Bash', { command: 'npm test', run_in_background: true }),
+    userResult('toolu_bash1', BASH_BG),
+    assistantText('等测试完成。'),
+    JSON.stringify({ type: 'system', timestamp }),
+  ])
+  const verdict = judgeTranscript(digest, Date.parse(timestamp) + STALE_AFTER_MS + 1)
+  expect(verdict.state).toBe('idle')
+  expect(verdict.interrupted).toEqual([])
 })
 
 test('a stale session with a background job nobody reported on is still listed', () => {

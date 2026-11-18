@@ -91,7 +91,7 @@ export type Digest = {
 //   【delegate 后台任务 bg-mvfeek2b 完成】
 const BACKGROUND_BASH = /Command running in background with ID:\s*([A-Za-z0-9]{6,})\.\s*Output is being written to:/
 const DELEGATE_START = /后台任务\s*\[?\s*(bg-[A-Za-z0-9_-]+)\]?\s*已启动/
-const DELEGATE_DONE = /【delegate 后台任务\s*([^\s】]+)\s*(?:完成|失败)】/
+const DELEGATE_DONE = /【delegate 后台任务\s*(bg-[A-Za-z0-9_-]+)\s*(?:完成|失败|已?取消|以请示结束(?:[，,]\s*需要你回复)?|宿主重启中断)(?:[：:]完成通知没送到，补在这里)?】/g
 // A wake message this mod sent after an earlier restart. Anything started before it died with
 // that restart and was reported then, so a later restart did not interrupt it. Only the head of
 // the message counts: a handoff or a quote further down may repeat the same words.
@@ -150,6 +150,11 @@ export function digestFromLines(lines: readonly string[]): Digest {
   }
   const toolUses = new Map<string, { name: string; input: any; at: number }>()
   const agentIdByUse = new Map<string, string>()
+  const recordDelegateDones = (text: string) => {
+    for (const done of text.matchAll(DELEGATE_DONE)) {
+      if (done[1]) digest.delegateDones.push(done[1])
+    }
+  }
   let index = 0
 
   for (const line of lines) {
@@ -212,6 +217,8 @@ export function digestFromLines(lines: readonly string[]): Digest {
       if (kind === 'tool_result') {
         const toolUse = toolUses.get(String(block.tool_use_id ?? ''))
         const text = blockText(block)
+        // Delegate can append several undelivered completion notices to its next tool result.
+        if (toolUse?.name.startsWith('mcp__delegate__')) recordDelegateDones(text)
         const bash = BACKGROUND_BASH.exec(text)
         if (bash?.[1]) {
           digest.backgroundBash.push({
@@ -245,8 +252,7 @@ export function digestFromLines(lines: readonly string[]): Digest {
           ...(INTERIM_NOTICE.test(recordText) ? { interim: true } : {}),
         })
       }
-      const done = DELEGATE_DONE.exec(recordText)
-      if (done?.[1]) digest.delegateDones.push(done[1])
+      recordDelegateDones(recordText)
     }
   }
 
@@ -286,7 +292,11 @@ export function interruptedLabel(type: string): string {
 export function judgeTranscript(
   digest: Digest,
   now?: number,
+  finishedDelegateJobs?: ReadonlySet<string>,
 ): { state: 'working' | 'idle'; reason: string; interrupted: Interrupted[] } {
+  // A long-silent transcript was not cut off by this restart, even if a window
+  // handoff looks unanswered or a local background task lacks its final notice.
+  const stale = typeof now === 'number' && digest.lastTs > 0 && now - digest.lastTs > STALE_AFTER_MS
   const interrupted: Interrupted[] = []
   const add = (item: Interrupted) => {
     if (!interrupted.some(existing => existing.type === item.type && existing.id === item.id)) interrupted.push(item)
@@ -295,18 +305,18 @@ export function judgeTranscript(
   const restartAt = digest.lastRestartIndex ?? -1
   const old = (item: { at?: number }) => typeof item.at === 'number' && item.at < restartAt
   for (const job of digest.backgroundBash) {
-    if (old(job)) continue
+    if (stale || old(job)) continue
     if (!digest.notifications.some(note => note.taskId === job.id)) add({ type: 'bash', id: job.id, detail: job.detail })
   }
   for (const agent of digest.backgroundAgents) {
-    if (old(agent)) continue
+    if (stale || old(agent)) continue
     // Only the latest notice counts: an interim one means its background work was still running.
     const notes = digest.notifications.filter(note => note.toolUseId === agent.id || (!!agent.agentId && note.taskId === agent.agentId))
     const done = notes.length > 0 && notes[notes.length - 1]?.interim !== true
     if (!done) add({ type: 'agent', id: agent.id, detail: agent.detail })
   }
   for (const job of digest.delegateStarts) {
-    if (old(job)) continue
+    if (old(job) || finishedDelegateJobs?.has(job.id)) continue
     if (!digest.delegateDones.includes(job.id)) add({ type: 'delegate', id: job.id, detail: job.detail })
   }
   for (const monitor of digest.monitors) {
@@ -321,10 +331,6 @@ export function judgeTranscript(
     if (!digest.cronDeletes.includes(cron.id)) add({ type: 'cron', id: cron.id, detail: cron.detail })
   }
 
-  // A transcript nothing has written to for a long while was not cut off by this restart,
-  // whatever its last line looks like: a window switch after a finished turn leaves the
-  // handoff (a user message) as the last message for days.
-  const stale = typeof now === 'number' && digest.lastTs > 0 && now - digest.lastTs > STALE_AFTER_MS
   if (!stale && digest.lastRecordType === 'api-request') {
     return { state: 'working', reason: '最后一条记录是 api-request（正在等模型返回）', interrupted }
   }
@@ -464,6 +470,33 @@ export async function dataDir($: any): Promise<string> {
     // Fall back to a relative directory.
   }
   return '.claude/cc-restart'
+}
+
+async function delegateDir($: any): Promise<string> {
+  // Hook modules cannot import Node built-ins. Delegate already runs on Node;
+  // resolve os.homedir() through the host, without requiring Node for cc-restart.
+  try {
+    const run = await $.process.run(['node', '-p', "require('node:os').homedir()"], { timeoutMs: 2000 })
+    const home = String(run.stdout ?? '').trim()
+    if (run.exitCode === 0 && home) return `${home.replace(/[\\/]+$/, '')}/.claude/delegate`
+  } catch {
+    // If Node is unavailable, try the same environment variables as delegate.
+  }
+  const profile = await $.env.get('USERPROFILE').catch(() => undefined)
+  const home = profile || (await $.env.get('HOME').catch(() => undefined))
+  return home ? `${home.replace(/[\\/]+$/, '')}/.claude/delegate` : ''
+}
+
+async function finishedDelegates($: any, dir: string, starts: Digest['delegateStarts']): Promise<Set<string>> {
+  const finished = new Set<string>()
+  if (!dir) return finished
+  for (const id of new Set(starts.map(job => job.id))) {
+    // Both are terminal artifacts, regardless of outcome. A cancel marker is only a request.
+    const ended = (await $.fs.exists(`${dir}/jobs/${id}/result.json`).catch(() => false)) ||
+      (await $.fs.exists(`${dir}/results/${id}.md`).catch(() => false))
+    if (ended) finished.add(id)
+  }
+  return finished
 }
 
 export function markerPath(dir: string): string {
@@ -873,6 +906,7 @@ async function restartTool($: any, e: any): Promise<{ result: any; text: string 
     }
 
     const discovered: SessionInfo[] = []
+    let delegateRoot: string | undefined
     let selfLocalId = ''
     try {
       for (const session of await discoverSessions($, script)) {
@@ -889,7 +923,10 @@ async function restartTool($: any, e: any): Promise<{ result: any; text: string 
           }
         }
         const digest = digestFromLines(tail.split(/\r?\n/))
-        const verdict = judgeTranscript(digest, Date.now())
+        const finished = digest.delegateStarts.length > 0
+          ? await finishedDelegates($, delegateRoot ??= await delegateDir($), digest.delegateStarts)
+          : undefined
+        const verdict = judgeTranscript(digest, Date.now(), finished)
         discovered.push({
           sessionId: session.sessionId,
           localId: session.localId ? String(session.localId) : null,
