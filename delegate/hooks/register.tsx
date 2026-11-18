@@ -1362,11 +1362,15 @@ const callTool = async (
   if (gptModel !== undefined && typeof gptModel !== 'string') {
     return { result: `delegate: ${gptModel.error}`, isError: true }
   }
-  // agy：模型由这次调用决定（默认 4h），resume 没传 model/effort 时沿用原作业的模型。
+  // agy：模型由这次调用决定（默认 4h）。resume 没传 model 时沿用原作业的模型系列：
+  // 只传 effort 就在原系列上换档（4a 续用不会悄悄变成 4h），两者都没传则原样沿用。
+  const oldAgyModel = old?.tier === 'agy' && typeof old.model === 'string' && old.model !== '' ? old.model : undefined
   const agyModel =
     target === 'agy'
-      ? input.model === undefined && input.effort === undefined && old?.tier === 'agy' && old.model !== ''
-        ? old.model
+      ? input.model === undefined && oldAgyModel !== undefined
+        ? input.effort === undefined
+          ? oldAgyModel
+          : agyModelOf(/^gemini-4-(hydrogen|argon|carbon)-/.exec(oldAgyModel)?.[1] ?? oldAgyModel, input.effort)
         : agyModelOf(input.model, input.effort)
       : undefined
   if (agyModel !== undefined && typeof agyModel !== 'string') {
