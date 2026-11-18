@@ -13,6 +13,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRootsEnv, readRootsOf, readRootsPromptArg } from './read-roots.mjs'
 import { createErrorNote } from './error-note.mjs'
+import { composedPromptFile } from './ptc-rules.mjs'
 import { createOutputTracker } from './stream-usage.mjs'
 import { startKeepaliveProxy } from './keepalive-proxy.mjs'
 import { spawnDaemon as spawnKeepaliveDaemon } from './keepalive.mjs'
@@ -788,7 +789,7 @@ const main = async () => {
       only ? tools : ptc ? `${tools},${PTC_TOOL}` : tools,
       '--tools',
       tools,
-      ...(only ? ['--system-prompt-file', roOnly ? PTC_RO_PROMPT : PTC_ONLY_PROMPT, '--settings', PTC_ONLY_SETTINGS, '--exclude-dynamic-system-prompt-sections'] : []),
+      ...(only ? ['--system-prompt-file', roOnly ? composedPromptFile(PTC_RO_PROMPT, 'dshRo', !!process.env.DELEGATE_PTC_RO_PROMPT) : composedPromptFile(PTC_ONLY_PROMPT, 'dsh', !!process.env.DELEGATE_PTC_PROMPT), '--settings', PTC_ONLY_SETTINGS, '--exclude-dynamic-system-prompt-sections'] : []),
       // The read-only prompt is shared, so the extra readable directories go in as an appended line (one arg, no shell).
       ...readRootsPromptArg(readRoots),
       // clean: 原生 CC 对照用，保留内置工具，关掉全部插件、输出风格和 CLAUDE.md（A/B 测试专用）。

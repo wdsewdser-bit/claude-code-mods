@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { hardRules, reportRules } from './ptc-rules.mjs'
 import { fileURLToPath } from 'node:url'
 
 // 由 launch.mjs 脱离插件进程树启动时：任务在 --input 文件里（附带宿主的环境变量），最终结果另写一份到 --reply 文件。
@@ -140,20 +141,12 @@ const COMMON_RULES = [
   '用 call_mcp_tool 调用，ServerName 填 "ptc"，ToolName 填 "run_code"，Arguments 是 {"description": "<一句中文，说明这个程序要做什么>", "code": "<异步函数体>"}，可选 timeoutMs、root、maxChars。description 必填，用户靠它看你在做什么。',
   '程序里只有 console.log 的输出和 return 的值会回来。相对路径以任务给的工作目录为准。',
   '',
-  '## 工作方式（硬规则）',
-  '- 每一轮只调用一次 run_code。一块内容（定位→读→改→验证）写在同一个程序里完成，程序内用变量和 if 判断衔接，不要拆成多轮。',
-  '- 骨架示例（一块内容一个程序）：const hit = tools.grep({...}); const s = tools.read({path, offset, limit}); tools.edit({...}); const t = tools.sh("pytest ...", {tail: 40}); console.log(只打印需要的摘录)。',
-  '- 信息不够时，在同一个程序里继续查，不要停下来一次只问一个。',
+  ...hardRules('sync'),
   '',
   '## SDK',
   '@@SDK@@',
   '',
-  '## 规则',
-  '- 先 grep/glob 定位，再按行号范围读需要的片段，不整读大文件。',
-  '- 不提交、不推送、不加依赖、不为让测试通过而削弱测试；不做任务没要求的重构和格式化。',
-  '- 遇到这些情况先停下，在报告里写清现状和可选做法，用 TASK_TERMINAL: blocked 结束：改动会超出任务给的范围或路径；有几种做法会实质改变结果而任务没指定；任务前提不成立；要做难以撤销的操作（删除、覆盖、发布）。',
-  '- 做完给最终报告（中文，简洁）：结论、改了哪些文件（绝对路径）、怎么验证的（命令和真实输出）、还有什么没验证。只报真实结果，没跑过的检查写明没跑。',
-  '- 报告最后单独一行：TASK_TERMINAL: completed（目标完成且必要验证做过）、TASK_TERMINAL: blocked（缺信息或权限）或 TASK_TERMINAL: failed（尝试后失败）。',
+  ...reportRules,
 ]
 // 不带 ptc 的 native agent 的规则：用 agy 自带工具干活，不提 run_code。
 const NATIVE_RULES = [
